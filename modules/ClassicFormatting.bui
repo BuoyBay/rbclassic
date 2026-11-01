@@ -1,0 +1,403 @@
+Import RBFoundation
+Import ClassicData
+
+
+' The fixed format and bounded precision need at most 329 ASCII digits/separators
+' for a finite Double. sprintf is in the shipped libc/MSVCRT import surfaces.
+#If TargetWindows Then
+Private Declare Function CFPrint Lib "msvcrt" Alias "sprintf" (buffer As Ptr, fmt As String, ...) As Int32
+#Else
+Private Declare Function CFPrint Lib "c" Alias "sprintf" (buffer As Ptr, fmt As String, ...) As Int32
+#End If
+
+Private Function CFDecimal(n As Double, precision As Integer, scientific As Boolean) As String
+    CFFinite(n)
+    If precision < 0 Or precision > 18 Then Throw New InvalidArgumentException("Decimal precision outside supported range")
+    Dim buffer As New Bytes()
+    For i As Integer = 1 To 768
+        buffer.Append(0)
+    Next
+    Dim fmt As String = "%.*f"
+    If scientific Then fmt = "%.*e"
+    Dim count As Int32 = CFPrint(buffer.DataPtr(), fmt, precision, n)
+    If count < 0 Or count >= 768 Then Throw New OverflowException("Numeric formatting exceeds buffer")
+    Dim copied As New Bytes()
+    copied.Append(buffer.DataPtr(), count)
+    Dim text As String = copied.ToString(Text.Encodings.UTF8)
+    ' printf uses ASCII digits without the I flag. Recover the fractional digits
+    ' by their known count, preserving any process locale without changing it.
+    Dim exponent As String = ""
+    If scientific Then
+        Dim expAt As Integer = -1
+        For i As Integer = text.Len() - 1 To 0 Step -1
+            If text.Substring(i, 1) = "e" Then
+                expAt = i
+                Exit For
+            End If
+        Next
+        exponent = text.Substring(expAt)
+        text = text.Left(expAt)
+    End If
+    If precision > 0 Then
+        Dim wholeLength As Integer = 0
+        While wholeLength < text.Len()
+            Dim ch As String = text.Substring(wholeLength, 1)
+            If (ch < "0" Or ch > "9") And ch <> "-" And ch <> "+" Then Exit While
+            wholeLength += 1
+        End While
+        text = text.Left(wholeLength) + "." + text.Right(precision)
+    End If
+    Return text + exponent
+End Function
+
+Private Sub CFFinite(n As Double)
+    If n.IsInfinite() Or n.IsNotANumber() Then Throw New InvalidArgumentException("Classic numeric formatting requires a finite value")
+End Sub
+
+Private Function CFTrimFraction(text As String, minimum As Integer) As String
+    Dim point As Integer = text.IndexOf(".")
+    If point < 0 Then Return text
+    While text.Len() > point + 1 + minimum And text.Right(1) = "0"
+        text = text.Left(text.Len() - 1)
+    End While
+    If text.Right(1) = "." Then text = text.Left(text.Len() - 1)
+    Return text
+End Function
+
+Private Function CFCurrentLocale() As Locale
+#If TargetLinux Then
+    ' The installed Locale.Current snapshot stays C before setlocale has run.
+    ' Honor the POSIX numeric preference without changing global native state.
+    Dim identifier As String = System.EnvironmentVariable("LC_ALL").Or("")
+    If identifier.Len() = 0 Then identifier = System.EnvironmentVariable("LC_NUMERIC").Or("")
+    If identifier.Len() = 0 Then identifier = System.EnvironmentVariable("LANG").Or("")
+    If identifier.Len() > 0 Then
+        Dim suffix As Integer = identifier.IndexOf(".")
+        If suffix >= 0 Then identifier = identifier.Left(suffix)
+        suffix = identifier.IndexOf("@")
+        If suffix >= 0 Then identifier = identifier.Left(suffix)
+        Return New Locale(identifier)
+    End If
+#End If
+    Return Locale.Current()
+End Function
+
+Public Function ClassicCStr(n As Double, loc As Locale) As String
+    If loc Is Nil Then Throw New InvalidArgumentException("ClassicCStr requires a locale")
+    CFFinite(n)
+    If n = 0.0 Then Return "0"
+    Dim negative As Boolean = n < 0.0
+    Dim scientific As String = CFDecimal(Math.Abs(n), 6, True)
+    Dim expAt As Integer = scientific.IndexOf("e")
+    Dim exponent As Integer = Integer.Parse(scientific.Substring(expAt + 1)).Value
+    Dim mantissa As String = CFTrimFraction(scientific.Left(expAt), 0)
+    Dim text As String = ""
+    ' Explicit adapter notation policy, analogous to printf %.7g.
+    If exponent < -4 Or exponent >= 7 Then
+        Dim sign As String = "+"
+        If exponent < 0 Then sign = "-"
+        text = mantissa + "e" + sign + String.From(Math.Abs(exponent))
+    Else
+        Dim digits As String = mantissa.Replace(".", "")
+        Dim places As Integer = exponent + 1
+        If places <= 0 Then
+            text = "0."
+            For i As Integer = 1 To -places
+                text += "0"
+            Next
+            text += digits
+        ElseIf places >= digits.Len() Then
+            text = digits
+            While text.Len() < places
+                text += "0"
+            End While
+        Else
+            text = digits.Left(places) + "." + digits.Substring(places)
+        End If
+    End If
+    text = text.Replace(".", loc.DecimalSeparator)
+    If negative Then text = "-" + text
+    Return text
+End Function
+
+Public Function ClassicCStr(n As Double) As String
+    Return ClassicCStr(n, CFCurrentLocale())
+End Function
+
+Public Function ClassicCStr(n As Single, loc As Locale) As String
+    Dim widened As Double = n
+    Return ClassicCStr(widened, loc)
+End Function
+
+Public Function ClassicCStr(n As Single) As String
+    Return ClassicCStr(n, CFCurrentLocale())
+End Function
+
+Public Function ClassicCStr(n As Integer) As String
+    Return String.From(n)
+End Function
+
+Public Function ClassicCStr(n As Integer, loc As Locale) As String
+    If loc Is Nil Then Throw New InvalidArgumentException("ClassicCStr requires a locale")
+    Return String.From(n)
+End Function
+
+Public Function ClassicCStr(n As UInt64) As String
+    Return n.ToString()
+End Function
+
+Public Function ClassicCStr(n As UInt64, loc As Locale) As String
+    If loc Is Nil Then Throw New InvalidArgumentException("ClassicCStr requires a locale")
+    Return n.ToString()
+End Function
+
+Public Function ClassicCStr(n As Boolean) As String
+    If n Then Return "True"
+    Return "False"
+End Function
+
+Public Function ClassicCStr(n As String) As String
+    Return n
+End Function
+
+Public Function ClassicCStr(n As ClassicDate) As String
+    If n Is Nil Then Return ""
+    Return n.SQLDateTime
+End Function
+
+Public Function ClassicCStr(n As Variant, loc As Locale) As String
+    If loc Is Nil Then Throw New InvalidArgumentException("ClassicCStr requires a locale")
+    If n.IsNull() Then Return ""
+    If n.IsDouble() Then Return ClassicCStr(n.DoubleValue(), loc)
+    If n.Kind = Variant.KindUInt64 Then Return n.AsUInt64().Value.ToString()
+    If n.IsBoolean() Then Return ClassicCStr(n.BooleanValue())
+    If n.IsString() Then Return n.AsString().Value
+    If n.IsObject() Then Throw New TypeMismatchException("Object string conversion requires an explicit overload")
+    Return String.From(n.IntegerValue())
+End Function
+
+Public Function ClassicCStr(n As Variant) As String
+    Return ClassicCStr(n, CFCurrentLocale())
+End Function
+
+' Unique name: parent may route ClassicCore.ClassicFormat through this function.
+Public Function ClassicFormatMask(n As Double, mask As String) As String
+    Return ClassicFormatMask(n, mask, CFCurrentLocale())
+End Function
+
+Public Function ClassicFormatMask(n As Double, mask As String, loc As Locale) As String
+    Return CFMask(n, mask, loc, "")
+End Function
+
+Public Function ClassicFormatMask(n As Integer, mask As String) As String
+    Return ClassicFormatMask(n, mask, CFCurrentLocale())
+End Function
+
+Public Function ClassicFormatMask(n As Integer, mask As String, loc As Locale) As String
+    Dim exactDigits As String = String.From(n)
+    If exactDigits.Left(1) = "-" Then exactDigits = exactDigits.Substring(1)
+    Dim sign As Double = 0.0
+    If n > 0 Then sign = 1.0
+    If n < 0 Then sign = -1.0
+    Return CFMask(sign, mask, loc, exactDigits)
+End Function
+
+Public Function ClassicFormatMask(n As UInt64, mask As String) As String
+    Return ClassicFormatMask(n, mask, CFCurrentLocale())
+End Function
+
+Public Function ClassicFormatMask(n As UInt64, mask As String, loc As Locale) As String
+    Dim sign As Double = 0.0
+    If n > 0 Then sign = 1.0
+    Return CFMask(sign, mask, loc, n.ToString())
+End Function
+
+Private Function CFMask(n As Double, mask As String, loc As Locale, exactDigits As String) As String
+    If loc Is Nil Then Throw New InvalidArgumentException("ClassicFormatMask requires a locale")
+    CFFinite(n)
+    If mask.Len() > 1024 Then Throw New InvalidArgumentException("Mask too long")
+    Dim sections As Array Of String = []
+    Dim section As String = ""
+    Dim escaped As Boolean = False
+    For i As Integer = 0 To mask.Len() - 1
+        Dim ch As String = mask.Substring(i, 1)
+        If escaped Then
+            section += "\\" + ch
+            escaped = False
+        ElseIf ch = "\\" Then
+            escaped = True
+        ElseIf ch = ";" Then
+            sections.Append(section)
+            section = ""
+        Else
+            section += ch
+        End If
+    Next
+    If escaped Then Throw New InvalidArgumentException("Trailing mask escape")
+    sections.Append(section)
+    If sections.Count > 3 Then Throw New InvalidArgumentException("At most three mask sections")
+    Dim chosen As Integer = 0
+    If n < 0.0 And sections.Count >= 2 Then chosen = 1
+    If n = 0.0 And sections.Count = 3 Then chosen = 2
+    section = sections(chosen)
+    Dim pattern As String = ""
+    Dim prefix As String = ""
+    Dim suffix As String = ""
+    Dim started As Boolean = False
+    Dim ended As Boolean = False
+    Dim forceSign As Boolean = False
+    Dim minusSign As Boolean = False
+    Dim percentage As Boolean = False
+    escaped = False
+    For i As Integer = 0 To section.Len() - 1
+        Dim ch As String = section.Substring(i, 1)
+        If escaped Then
+            If started Then
+                suffix += ch
+                ended = True
+            Else
+                prefix += ch
+            End If
+            escaped = False
+        ElseIf ch = "\\" Then
+            escaped = True
+        ElseIf ch = "0" Or ch = "#" Or ch = "." Or ch = "," Or ch = "e" Then
+            If ended Then Throw New InvalidArgumentException("Mask must have one contiguous numeric field")
+            started = True
+            pattern += ch
+        ElseIf ch = "+" Or ch = "-" Then
+            If started Then Throw New InvalidArgumentException("Sign must precede the numeric field")
+            If forceSign Or minusSign Then Throw New InvalidArgumentException("Repeated sign token")
+            If ch = "+" Then forceSign = True
+            If ch = "-" Then minusSign = True
+        ElseIf ch = "%" Then
+            If percentage Then Throw New InvalidArgumentException("Repeated percent token")
+            percentage = True
+            suffix += "%"
+            If started Then ended = True
+        ElseIf ch = "(" Or ch = ")" Then
+            If started Then
+                suffix += ch
+                ended = True
+            Else
+                prefix += ch
+            End If
+        Else
+            Throw New InvalidArgumentException("Escape literal mask characters with backslash")
+        End If
+    Next
+    If Not started Then Return prefix + suffix
+    Dim exponentLetter As String = pattern.Right(1)
+    If pattern.IndexOf("0") < 0 And pattern.IndexOf("#") < 0 Then Throw New InvalidArgumentException("Numeric mask needs a digit placeholder")
+    Dim scientific As Boolean = False
+    If pattern.Right(1) = "e" Then
+        scientific = True
+        pattern = pattern.Left(pattern.Len() - 1)
+    End If
+    If pattern.IndexOf("e") >= 0 Then Throw New InvalidArgumentException("Exponent must end numeric field")
+    Dim point As Integer = pattern.IndexOf(".")
+    Dim integerPattern As String = pattern
+    Dim fraction As String = ""
+    If point >= 0 Then
+        integerPattern = pattern.Left(point)
+        fraction = pattern.Substring(point + 1)
+    End If
+    Dim requiredWhole As Integer = 0
+    Dim grouped As Boolean = integerPattern.IndexOf(",") >= 0
+    For i As Integer = 0 To integerPattern.Len() - 1
+        Dim ch As String = integerPattern.Substring(i, 1)
+        If ch = "0" Then requiredWhole += 1
+        If ch <> "0" And ch <> "#" And ch <> "," Then Throw New InvalidArgumentException("Invalid integer mask")
+    Next
+    Dim requiredFraction As Integer = 0
+    For i As Integer = 0 To fraction.Len() - 1
+        Dim ch As String = fraction.Substring(i, 1)
+        If ch = "0" Then requiredFraction = i + 1
+        If ch <> "0" And ch <> "#" Then Throw New InvalidArgumentException("Invalid fraction mask")
+    Next
+    If fraction.Len() > 18 Or requiredWhole > 320 Then Throw New InvalidArgumentException("Mask precision exceeds supported limits")
+    Dim value As Double = Math.Abs(n)
+    If percentage Then value *= 100.0
+    CFFinite(value)
+    Dim text As String = ""
+    If exactDigits.Len() > 0 Then
+        If percentage And exactDigits <> "0" Then exactDigits += "00"
+        text = exactDigits
+        If scientific Then
+            ' Round decimal digits directly; no Integer-to-Double precision loss.
+            Dim exponent As Integer = exactDigits.Len() - 1
+            Dim keep As Integer = fraction.Len() + 1
+            If exactDigits.Len() > keep Then
+                text = exactDigits.Left(keep)
+                Dim nextDigit As String = exactDigits.Substring(keep, 1)
+                Dim roundUp As Boolean = nextDigit > "5"
+                If nextDigit = "5" Then
+                    Dim tailNonzero As Boolean = False
+                    For i As Integer = keep + 1 To exactDigits.Len() - 1
+                        If exactDigits.Substring(i, 1) <> "0" Then tailNonzero = True
+                    Next
+                    roundUp = tailNonzero Or (String.Asc(text.Right(1)) - 48) Mod 2 = 1
+                End If
+                If roundUp Then
+                    Dim carry As Integer = 1
+                    Dim rounded As String = ""
+                    For i As Integer = text.Len() - 1 To 0 Step -1
+                        Dim digit As Integer = String.Asc(text.Substring(i, 1)) - 48 + carry
+                        carry = digit \ 10
+                        rounded = String.Chr(48 + digit Mod 10) + rounded
+                    Next
+                    text = rounded
+                    If carry = 1 Then
+                        text = "1" + text
+                        exponent += 1
+                        text = text.Left(keep)
+                    End If
+                End If
+            End If
+            While text.Len() < keep
+                text += "0"
+            End While
+            If fraction.Len() > 0 Then text = text.Left(1) + "." + text.Substring(1)
+            text += "e+" + String.From(exponent)
+        ElseIf fraction.Len() > 0 Then
+            text += "."
+            For i As Integer = 1 To fraction.Len()
+                text += "0"
+            Next
+        End If
+    Else
+        text = CFDecimal(value, fraction.Len(), scientific)
+    End If
+    Dim expText As String = ""
+    If scientific Then
+        Dim expAt As Integer = text.IndexOf("e")
+        Dim exponent As Integer = Integer.Parse(text.Substring(expAt + 1)).Value
+        Dim sign As String = "+"
+        If exponent < 0 Then sign = "-"
+        expText = exponentLetter + sign + String.From(Math.Abs(exponent))
+        text = text.Left(expAt)
+    End If
+    text = CFTrimFraction(text, requiredFraction)
+    point = text.IndexOf(".")
+    Dim whole As String = text
+    Dim tail As String = ""
+    If point >= 0 Then
+        whole = text.Left(point)
+        tail = loc.DecimalSeparator + text.Substring(point + 1)
+    End If
+    While whole.Len() < requiredWhole
+        whole = "0" + whole
+    End While
+    If grouped Then
+        Dim rendered As String = ""
+        For i As Integer = 0 To whole.Len() - 1
+            If i > 0 And (whole.Len() - i) Mod 3 = 0 Then rendered += loc.GroupingSeparator
+            rendered += whole.Substring(i, 1)
+        Next
+        whole = rendered
+    End If
+    Dim leading As String = ""
+    If n < 0.0 And (forceSign Or minusSign) Then leading = "-"
+    If n >= 0.0 And forceSign Then leading = "+"
+    Return prefix + leading + whole + tail + expText + suffix
+End Function

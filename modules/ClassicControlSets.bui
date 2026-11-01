@@ -1,0 +1,927 @@
+' ClassicControlSets — REALbasic / legacy API 1 control sets (control arrays)
+' over Buoy's native controls.
+'
+' An API 1 control set is a group of same-named controls distinguished by an
+' Index. Every member shares one set of event handlers, which receive the
+' member's index as their first parameter. Members can be created while the
+' app runs (`Dim b As New PushButton1`) and removed with `Close`.
+'
+' Buoy has no control-set syntax and no indexed event handlers, so converted
+' code uses a set object instead:
+'
+'   API 1                                  Converted
+'   PushButton1(i)                         set.Item(i)
+'   PushButton1(i).Index                   member.Index
+'   Sub Action(index As Integer)           Handle Action(index As Integer)
+'     (on PushButton1)                       (in a ClassicPushButtonSet subclass)
+'   Dim b As New PushButton1               Dim b As ClassicPushButtonMember = set.NewMember()
+'   b.Close / PushButton1(i).Close         b.Close() / set.Remove(i)
+'
+' Members are the ClassicXxxMember classes below; a set only holds members of
+' its own type. Removal really detaches the native control (GTK
+' gtk_widget_unparent, Win32 SetParent(HWND_MESSAGE), AppKit
+' removeFromSuperview); when that is not possible the call raises
+' UnsupportedOperationException and nothing changes. See notes/controlsets.md
+' for the platforms on which each piece was executed.
+
+Import RBFoundation
+Import ClassicDesktop
+Import ClassicControls
+
+' ── Native bindings ─────────────────────────────────────────────────────────
+
+#If TargetLinux Then
+    Private Optional Declare Function CSGtkParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+    Private Optional Declare Sub CSGtkUnparent Lib "libgtk-4.so.1" Alias "gtk_widget_unparent" (widget As Ptr)
+    Private Optional Declare Function CSGObjectRef Lib "libgtk-4.so.1" Alias "g_object_ref" (instance As Ptr) As Ptr
+    Private Optional Declare Sub CSGObjectUnref Lib "libgtk-4.so.1" Alias "g_object_unref" (instance As Ptr)
+    Private Optional Declare Function CSGTypeIsA Lib "libgtk-4.so.1" Alias "g_type_check_instance_is_a" (instance As Ptr, gtype As UInt64) As Int32
+    Private Optional Declare Function CSGtkFixedType Lib "libgtk-4.so.1" Alias "gtk_fixed_get_type" () As UInt64
+#ElseIf TargetWindows Then
+    ' Same signature as ClassicDesktop's ShowWindow binding: Buoy 0.72 merges
+    ' Optional Declares of one export, so the signatures must agree.
+    Private Optional Declare Function CSWinShowWindow Lib "user32" Alias "ShowWindow" (window As Ptr, command As Int32) As Int32
+    Private Optional Declare Function CSWinGetParent Lib "user32" Alias "GetParent" (window As Ptr) As Ptr
+    Private Optional Declare Function CSWinSetParent Lib "user32" Alias "SetParent" (window As Ptr, newParent As Ptr) As Ptr
+#ElseIf TargetMac Then
+    Private Declare Function CSMacSuperview Lib "AppKit" Selector "superview" (view As Ptr) As Ptr
+    Private Declare Sub CSMacRemoveFromSuperview Lib "AppKit" Selector "removeFromSuperview" (view As Ptr)
+    Private Declare Function CSMacRetain Lib "Foundation" Selector "retain" (instance As Ptr) As Ptr
+#End If
+
+' Native handles of removed controls. Each holds one extra native reference
+' (GObject ref / -retain) for the rest of the process: the Buoy runtime still
+' owns the control object and may touch its handle when it is destroyed, so the
+' handle must never be freed underneath it.
+Private Class ClassicDetachedHandles
+    Public Shared Property Handles As Array Of Ptr = []
+End Class
+
+' Why the control cannot be detached natively, or "" when it can.
+Private Function ClassicDetachProblem(control As UIControl) As String
+    Dim widget As Ptr = control.NativeWidget
+    If widget = Nil Then Return "the control has no native widget yet; show its window first"
+    #If TargetLinux Then
+        Dim parent As Ptr = CSGtkParent(widget)
+        If parent = Nil Then Return "the control is not placed in a container"
+        If CSGTypeIsA(parent, CSGtkFixedType()) = 0 Then Return "the control's native parent is not a plain View/Window container"
+        Return ""
+    #ElseIf TargetWindows Then
+        If CSWinGetParent(widget) = Nil Then Return "the control is not placed in a container"
+        Return ""
+    #ElseIf TargetMac Then
+        If CSMacSuperview(widget) = Nil Then Return "the control is not placed in a container"
+        Return ""
+    #Else
+        Return "native control removal is not available on this target"
+    #End If
+End Function
+
+' Detaches the control's native widget from its container. Raises before any
+' change when that is not possible.
+Private Sub ClassicDetachNative(control As UIControl)
+    Dim problem As String = ClassicDetachProblem(control)
+    If problem <> "" Then Throw New UnsupportedOperationException("ClassicControlSet: cannot remove the control: " + problem)
+    Dim widget As Ptr = control.NativeWidget
+    #If TargetLinux Then
+        ClassicDetachedHandles.Handles.Append(CSGObjectRef(widget))
+        CSGtkUnparent(widget)
+    #ElseIf TargetWindows Then
+        ' A message-only parent (HWND_MESSAGE) takes the control out of the
+        ' window tree; such a window is never shown and gets no input.
+        CSWinShowWindow(widget, 0)
+        If CSWinSetParent(widget, CType(-3, Ptr)) = Nil Then Throw New UnsupportedOperationException("ClassicControlSet: SetParent failed; the control was hidden but not removed")
+        ClassicDetachedHandles.Handles.Append(widget)
+    #ElseIf TargetMac Then
+        ClassicDetachedHandles.Handles.Append(CSMacRetain(widget))
+        CSMacRemoveFromSuperview(widget)
+    #End If
+End Sub
+
+' ── Member state ────────────────────────────────────────────────────────────
+
+''' Bookkeeping every control-set member carries. Its members are Internal:
+''' only the set changes it.
+Public Class ClassicControlSetState
+    Internal Property Owner As Weak ClassicControlSet
+    Internal Property Placed As Boolean = False
+    Internal Property Closed As Boolean = False
+    Internal Property Closing As Boolean = False
+
+    ''' True once the control was removed with Close/Remove. A closed control
+    ''' is detached natively and can never rejoin a set.
+    Public ReadOnly Property IsClosed As Boolean
+        Get
+            Return Me.Closed
+        End Get
+    End Property
+End Class
+
+''' Implemented by every ClassicXxxMember class. User code does not call
+''' these members; they let the set reach the concrete control type.
+Public Interface ClassicControlSetMember
+    Function ControlSetState() As ClassicControlSetState
+    Function ControlSetControl() As UIControl
+    Sub ControlSetAttach(host As Window)
+    Sub ControlSetAttachToView(host As View)
+End Interface
+
+''' How indexes change when a member is removed.
+Public Enum ClassicControlSetRenumbering As Integer
+    ''' API 1 `Control.Close`: "the indexes for the remaining controls will
+    ''' shift downward so that the indexes start with zero and are consecutive."
+    Compact = 0
+    ''' The legacy user guide's control-set topic: removing a member leaves a
+    ''' hole, and that index reads as Nil.
+    KeepHoles = 1
+End Enum
+
+''' A handler for every event of a set, as an alternative to subclassing it:
+''' eventName is the API 1 event name ("Action", "Open", "Close", ...).
+Public Closure Sub ClassicControlSetHandler(eventName As String, index As Integer)
+
+' Shared member operations; each member class forwards to these.
+Private Function ClassicMemberIndex(state As ClassicControlSetState, control As UIControl) As Integer
+    Dim owner As ClassicControlSet = state.Owner
+    If owner = Nil Or state.Closed Then Return -1
+    Return owner.IndexOf(control)
+End Function
+
+Private Sub ClassicMemberRoute(state As ClassicControlSetState, member As ClassicControlSetMember, eventName As String)
+    If state.Closed Then Return
+    Dim owner As ClassicControlSet = state.Owner
+    If owner = Nil Then Return
+    owner.RouteEvent(member, eventName)
+End Sub
+
+Private Sub ClassicMemberClose(state As ClassicControlSetState, member As ClassicControlSetMember)
+    If state.Closed Or state.Closing Then Return
+    Dim owner As ClassicControlSet = state.Owner
+    If owner <> Nil Then
+        owner.RemoveMember(member)
+        Return
+    End If
+    ClassicDetachNative(member.ControlSetControl())
+    state.Closed = True
+End Sub
+
+' ── The set ─────────────────────────────────────────────────────────────────
+
+''' Base class of the typed sets. Indexes are kept in ascending order and may
+''' be sparse. The set holds its members strongly; a member refers back to its
+''' set weakly, so dropping the set stops event routing without a cycle.
+Public Class ClassicControlSet
+    Private Property mIndexes As Array Of Integer = []
+    Private Property mMembers As Array Of ClassicControlSetMember = []
+    Private Property mHostWindow As Weak Window
+    Private Property mHostView As Weak View
+
+    ''' What Close/Remove does to the remaining indexes. Defaults to API 1's
+    ''' Control.Close behavior.
+    Public Property Renumbering As ClassicControlSetRenumbering = ClassicControlSetRenumbering.Compact
+
+    ''' Optional handler called for every event after the typed event.
+    Public Property Handler As ClassicControlSetHandler
+
+    ''' A new member was attached (API 1 `Open(index)` for a control created at
+    ''' run time). Registered existing controls do not raise it.
+    Event Open(index As Integer)
+    ''' A member is about to be removed (API 1 `Close(index)`); the member is
+    ''' still in the set and attached while this runs.
+    Event Close(index As Integer)
+
+    ''' Members created by NewMember/Attach are added to this window.
+    Public Sub Constructor(host As Window)
+        If host = Nil Then Throw New NilObjectException("ClassicControlSet: host window is Nil")
+        Me.mHostWindow = host
+    End Sub
+
+    ''' Members created by NewMember/Attach are added to this container.
+    Public Sub Constructor(host As View)
+        If host = Nil Then Throw New NilObjectException("ClassicControlSet: host container is Nil")
+        Me.mHostView = host
+    End Sub
+
+    ''' True where Close/Remove can detach a native control (a removal can
+    ''' still raise for one control, for example before its window exists).
+    Public Shared ReadOnly Property NativeRemovalAvailable As Boolean
+        Get
+            #If TargetLinux Or TargetWindows Or TargetMac Then
+                Return True
+            #Else
+                Return False
+            #End If
+        End Get
+    End Property
+
+    ''' True where Reparent can move a member to another container.
+    Public Shared ReadOnly Property ReparentAvailable As Boolean
+        Get
+            #If TargetLinux Then
+                Return True
+            #Else
+                Return False
+            #End If
+        End Get
+    End Property
+
+    ''' Number of members.
+    Public ReadOnly Property Count As Integer
+        Get
+            Return Me.mMembers.Count
+        End Get
+    End Property
+
+    ''' Highest index in use, or -1 for an empty set.
+    Public ReadOnly Property LastIndex As Integer
+        Get
+            If Me.mIndexes.Count = 0 Then Return -1
+            Return Me.mIndexes(Me.mIndexes.Count - 1)
+        End Get
+    End Property
+
+    ''' The indexes in use, ascending (a copy).
+    Public Function Indexes() As Array Of Integer
+        Dim copy As Array Of Integer = []
+        For Each i As Integer In Me.mIndexes
+            copy.Append(i)
+        Next
+        Return copy
+    End Function
+
+    ''' True when a member has this index.
+    Public Function Contains(index As Integer) As Boolean
+        Return Me.Position(index) >= 0
+    End Function
+
+    ''' The member's index, or -1 when the control is not in this set.
+    Public Function IndexOf(control As UIControl) As Integer
+        If control = Nil Then Return -1
+        For i As Integer = 0 To Me.mMembers.Count - 1
+            If Me.mMembers(i).ControlSetControl() Is control Then Return Me.mIndexes(i)
+        Next
+        Return -1
+    End Function
+
+    Private Function Position(index As Integer) As Integer
+        For i As Integer = 0 To Me.mIndexes.Count - 1
+            If Me.mIndexes(i) = index Then Return i
+            If Me.mIndexes(i) > index Then Return -1
+        Next
+        Return -1
+    End Function
+
+    Private Function PositionOf(member As ClassicControlSetMember) As Integer
+        Dim control As UIControl = member.ControlSetControl()
+        For i As Integer = 0 To Me.mMembers.Count - 1
+            If Me.mMembers(i).ControlSetControl() Is control Then Return i
+        Next
+        Return -1
+    End Function
+
+    ''' The member with this index, or Nil (API 1: a missing index is Nil).
+    Protected Function MemberAt(index As Integer) As ClassicControlSetMember
+        Dim p As Integer = Me.Position(index)
+        If p < 0 Then Return Nil
+        Return Me.mMembers(p)
+    End Function
+
+    ''' The member new controls are cloned from: the lowest index.
+    Protected Function TemplateMember() As ClassicControlSetMember
+        If Me.mMembers.Count = 0 Then Throw New UnsupportedOperationException("ClassicControlSet: a new member is cloned from an existing one, and the set is empty; use Attach")
+        Return Me.mMembers(0)
+    End Function
+
+    Private Sub CheckJoin(member As ClassicControlSetMember)
+        If member = Nil Then Throw New NilObjectException("ClassicControlSet: member is Nil")
+        Dim state As ClassicControlSetState = member.ControlSetState()
+        If state.Closed Then Throw New UnsupportedOperationException("ClassicControlSet: a closed control cannot rejoin a control set")
+        Dim owner As ClassicControlSet = state.Owner
+        If owner Is Me Then Throw New InvalidArgumentException("ClassicControlSet: the control is already in this set")
+        If owner <> Nil Then Throw New InvalidArgumentException("ClassicControlSet: the control belongs to another control set")
+    End Sub
+
+    Private Sub Insert(member As ClassicControlSetMember, index As Integer)
+        Dim p As Integer = Me.mIndexes.Count
+        For i As Integer = 0 To Me.mIndexes.Count - 1
+            If Me.mIndexes(i) > index Then
+                p = i
+                Exit For
+            End If
+        Next
+        Me.mIndexes.Insert(p, index)
+        Me.mMembers.Insert(p, member)
+        member.ControlSetState().Owner = Me
+    End Sub
+
+    ''' Adds a control that is already placed (a design-time member) at an
+    ''' explicit index. Indexes may be sparse; a used index is an error.
+    Protected Sub RegisterMember(member As ClassicControlSetMember, index As Integer)
+        Me.CheckJoin(member)
+        If index < 0 Then Throw New OutOfBoundsException("ClassicControlSet: index " + RBFoundation.Str(index) + " is negative")
+        If Me.Position(index) >= 0 Then Throw New InvalidArgumentException("ClassicControlSet: index " + RBFoundation.Str(index) + " is already used")
+        Me.Insert(member, index)
+    End Sub
+
+    ''' Places a new control in the set's host at LastIndex + 1 and raises Open.
+    Protected Function AttachMember(member As ClassicControlSetMember, copyLocksFrom As UIControl) As Integer
+        Me.CheckJoin(member)
+        Dim state As ClassicControlSetState = member.ControlSetState()
+        If state.Placed Or member.ControlSetControl().ParentWindow <> Nil Then Throw New InvalidArgumentException("ClassicControlSet: the control is already placed; use Register")
+        Dim hostWindow As Window = Me.mHostWindow
+        Dim hostView As View = Me.mHostView
+        If hostWindow <> Nil Then
+            member.ControlSetAttach(hostWindow)
+        ElseIf hostView <> Nil Then
+            member.ControlSetAttachToView(hostView)
+        Else
+            Throw New NilObjectException("ClassicControlSet: the host container no longer exists")
+        End If
+        If copyLocksFrom <> Nil Then
+            Dim control As UIControl = member.ControlSetControl()
+            control.LockLeft = copyLocksFrom.LockLeft
+            control.LockRight = copyLocksFrom.LockRight
+            control.LockTop = copyLocksFrom.LockTop
+            control.LockBottom = copyLocksFrom.LockBottom
+        End If
+        state.Placed = True
+        Dim index As Integer = Me.LastIndex + 1
+        Me.Insert(member, index)
+        RaiseEvent Open(index)
+        Me.CallHandler("Open", index)
+        Return index
+    End Function
+
+    ''' API 1 `Close` for the member with this index.
+    Public Sub Remove(index As Integer)
+        Dim member As ClassicControlSetMember = Me.MemberAt(index)
+        If member = Nil Then Throw New OutOfBoundsException("ClassicControlSet: no member has index " + RBFoundation.Str(index))
+        Me.RemoveMember(member)
+    End Sub
+
+    ''' Raises Close, detaches the control natively and removes it. If it
+    ''' cannot be detached, raises UnsupportedOperationException before Close
+    ''' and nothing changes.
+    Public Sub RemoveMember(member As ClassicControlSetMember)
+        If member = Nil Then Throw New NilObjectException("ClassicControlSet: member is Nil")
+        Dim state As ClassicControlSetState = member.ControlSetState()
+        If state.Closing Then Return
+        If Me.PositionOf(member) < 0 Then Throw New InvalidArgumentException("ClassicControlSet: the control is not in this set")
+        Dim control As UIControl = member.ControlSetControl()
+        Dim problem As String = ClassicDetachProblem(control)
+        If problem <> "" Then Throw New UnsupportedOperationException("ClassicControlSet: cannot remove the control: " + problem)
+        state.Closing = True
+        Try
+            Dim index As Integer = Me.mIndexes(Me.PositionOf(member))
+            RaiseEvent Close(index)
+            Me.CallHandler("Close", index)
+        Catch e As Exception
+            ' A Throw from Catch skips Finally in Buoy 0.72, so reset here.
+            state.Closing = False
+            Throw e
+        End Try
+        ' The Close handler may have changed the set; find the member again.
+        Dim p As Integer = Me.PositionOf(member)
+        If p < 0 Then
+            state.Closing = False
+            Return
+        End If
+        Try
+            ClassicDetachNative(control)
+        Catch e As Exception
+            state.Closing = False
+            Throw e
+        End Try
+        Me.mIndexes.RemoveAt(p)
+        Me.mMembers.RemoveAt(p)
+        state.Owner = Nil
+        state.Closed = True
+        state.Closing = False
+        If Me.Renumbering = ClassicControlSetRenumbering.Compact Then
+            For i As Integer = 0 To Me.mIndexes.Count - 1
+                Me.mIndexes(i) = i
+            Next
+        End If
+    End Sub
+
+    ''' Moves a member natively into another container; its index is kept.
+    ''' Linux only (ReparentAvailable); elsewhere raises
+    ''' UnsupportedOperationException without changing anything.
+    Public Sub Reparent(member As ClassicControlSetMember, newHost As View)
+        If newHost = Nil Then Throw New NilObjectException("ClassicControlSet: new container is Nil")
+        Me.CheckReparent(member)
+        #If TargetLinux Then
+            Dim control As UIControl = member.ControlSetControl()
+            If control.NativeWidget = newHost.NativeWidget Then Throw New InvalidArgumentException("ClassicControlSet: a container cannot contain itself")
+            ClassicDetachNative(control)
+            member.ControlSetAttachToView(newHost)
+            CSGObjectUnref(control.NativeWidget)
+        #End If
+    End Sub
+
+    ''' Moves a member natively into a window's content; see the View overload.
+    Public Sub Reparent(member As ClassicControlSetMember, newHost As Window)
+        If newHost = Nil Then Throw New NilObjectException("ClassicControlSet: new window is Nil")
+        Me.CheckReparent(member)
+        #If TargetLinux Then
+            ClassicDetachNative(member.ControlSetControl())
+            member.ControlSetAttach(newHost)
+            CSGObjectUnref(member.ControlSetControl().NativeWidget)
+        #End If
+    End Sub
+
+    Private Sub CheckReparent(member As ClassicControlSetMember)
+        If member = Nil Then Throw New NilObjectException("ClassicControlSet: member is Nil")
+        If Not ClassicControlSet.ReparentAvailable Then Throw New UnsupportedOperationException("ClassicControlSet: moving a control to another container is not available on this platform")
+        If Me.PositionOf(member) < 0 Then Throw New InvalidArgumentException("ClassicControlSet: the control is not in this set")
+        Dim problem As String = ClassicDetachProblem(member.ControlSetControl())
+        If problem <> "" Then Throw New UnsupportedOperationException("ClassicControlSet: cannot move the control: " + problem)
+    End Sub
+
+    ''' Called by a member when its native event fires. Events of controls that
+    ''' were removed, or that belong to another set, are dropped.
+    Public Sub RouteEvent(member As ClassicControlSetMember, eventName As String)
+        If member = Nil Then Return
+        Dim state As ClassicControlSetState = member.ControlSetState()
+        If state.Closed Then Return
+        Dim owner As ClassicControlSet = state.Owner
+        If Not (owner Is Me) Then Return
+        Dim p As Integer = Me.PositionOf(member)
+        If p < 0 Then Return
+        Dim index As Integer = Me.mIndexes(p)
+        Me.DispatchEvent(eventName, index)
+        Me.CallHandler(eventName, index)
+    End Sub
+
+    ''' Typed sets override this to raise their own indexed events.
+    Protected Sub DispatchEvent(eventName As String, index As Integer)
+    End Sub
+
+    Private Sub CallHandler(eventName As String, index As Integer)
+        Dim h As ClassicControlSetHandler = Me.Handler
+        If h IsNot Nil Then h(eventName, index)
+    End Sub
+End Class
+
+' ── Members ─────────────────────────────────────────────────────────────────
+
+''' A PushButton control-set member (Default/Cancel from ClassicPushButton).
+Public Class ClassicPushButtonMember Inherits ClassicPushButton Implements ClassicControlSetMember
+    Private Property mState As ClassicControlSetState
+
+    Public Function ControlSetState() As ClassicControlSetState
+        If Me.mState = Nil Then Me.mState = New ClassicControlSetState()
+        Return Me.mState
+    End Function
+
+    Public Function ControlSetControl() As UIControl
+        Return Me
+    End Function
+
+    Public Sub ControlSetAttach(host As Window)
+        host.AddSubview(Me)
+    End Sub
+
+    Public Sub ControlSetAttachToView(host As View)
+        host.AddSubview(Me)
+    End Sub
+
+    ''' API 1 `Index`: the position in the set, or -1 when not in a set.
+    Public ReadOnly Property Index As Integer
+        Get
+            Return ClassicMemberIndex(Me.ControlSetState(), Me)
+        End Get
+    End Property
+
+    ''' API 1 `Close`: removes the control (see ClassicControlSet.RemoveMember).
+    Public Sub Close()
+        ClassicMemberClose(Me.ControlSetState(), Me)
+    End Sub
+
+    Handle Action()
+        ClassicMemberRoute(Me.ControlSetState(), Me, "Action")
+    End Handle
+End Class
+
+''' A CheckBox control-set member (API 1 Value/State from ClassicCheckBox).
+Public Class ClassicCheckBoxMember Inherits ClassicCheckBox Implements ClassicControlSetMember
+    Private Property mState As ClassicControlSetState
+
+    Public Function ControlSetState() As ClassicControlSetState
+        If Me.mState = Nil Then Me.mState = New ClassicControlSetState()
+        Return Me.mState
+    End Function
+
+    Public Function ControlSetControl() As UIControl
+        Return Me
+    End Function
+
+    Public Sub ControlSetAttach(host As Window)
+        host.AddSubview(Me)
+    End Sub
+
+    Public Sub ControlSetAttachToView(host As View)
+        host.AddSubview(Me)
+    End Sub
+
+    ''' API 1 `Index`: the position in the set, or -1 when not in a set.
+    Public ReadOnly Property Index As Integer
+        Get
+            Return ClassicMemberIndex(Me.ControlSetState(), Me)
+        End Get
+    End Property
+
+    ''' API 1 `Close`: removes the control.
+    Public Sub Close()
+        ClassicMemberClose(Me.ControlSetState(), Me)
+    End Sub
+
+    Handle Action()
+        ClassicMemberRoute(Me.ControlSetState(), Me, "Action")
+    End Handle
+End Class
+
+''' A TextField control-set member.
+Public Class ClassicTextFieldMember Inherits TextField Implements ClassicControlSetMember
+    Private Property mState As ClassicControlSetState
+
+    Public Function ControlSetState() As ClassicControlSetState
+        If Me.mState = Nil Then Me.mState = New ClassicControlSetState()
+        Return Me.mState
+    End Function
+
+    Public Function ControlSetControl() As UIControl
+        Return Me
+    End Function
+
+    Public Sub ControlSetAttach(host As Window)
+        host.AddSubview(Me)
+    End Sub
+
+    Public Sub ControlSetAttachToView(host As View)
+        host.AddSubview(Me)
+    End Sub
+
+    ''' API 1 `Index`: the position in the set, or -1 when not in a set.
+    Public ReadOnly Property Index As Integer
+        Get
+            Return ClassicMemberIndex(Me.ControlSetState(), Me)
+        End Get
+    End Property
+
+    ''' API 1 `Close`: removes the control.
+    Public Sub Close()
+        ClassicMemberClose(Me.ControlSetState(), Me)
+    End Sub
+
+    Private Property mNativeChanges As Integer = 0
+
+    ''' API 1 `Text`. API 1 raises TextChange for a programmatic change too;
+    ''' Buoy's TextField raises TextChanged only for edits, so an assignment
+    ''' that changes the text routes TextChange itself (once: not when the
+    ''' native event already fired during the assignment). Assigning through
+    ''' a plain TextField reference reaches Buoy's own property and raises
+    ''' nothing.
+    @Shadows
+    Public Property Text As String
+        Get
+            Return Super.Text
+        End Get
+        Set
+            If String.Compare(Super.Text, value, True) = 0 Then Return
+            Dim before As Integer = Me.mNativeChanges
+            Super.Text = value
+            If Me.mNativeChanges = before Then ClassicMemberRoute(Me.ControlSetState(), Me, "TextChange")
+        End Set
+    End Property
+
+    Handle TextChanged()
+        Me.mNativeChanges += 1
+        ClassicMemberRoute(Me.ControlSetState(), Me, "TextChange")
+    End Handle
+
+    Handle FocusGained()
+        ClassicMemberRoute(Me.ControlSetState(), Me, "GotFocus")
+    End Handle
+
+    Handle FocusLost()
+        ClassicMemberRoute(Me.ControlSetState(), Me, "LostFocus")
+    End Handle
+End Class
+
+''' A StaticText (Label) control-set member. It has no events.
+Public Class ClassicLabelMember Inherits Label Implements ClassicControlSetMember
+    Private Property mState As ClassicControlSetState
+
+    Public Function ControlSetState() As ClassicControlSetState
+        If Me.mState = Nil Then Me.mState = New ClassicControlSetState()
+        Return Me.mState
+    End Function
+
+    Public Function ControlSetControl() As UIControl
+        Return Me
+    End Function
+
+    Public Sub ControlSetAttach(host As Window)
+        host.AddSubview(Me)
+    End Sub
+
+    Public Sub ControlSetAttachToView(host As View)
+        host.AddSubview(Me)
+    End Sub
+
+    ''' API 1 `Index`: the position in the set, or -1 when not in a set.
+    Public ReadOnly Property Index As Integer
+        Get
+            Return ClassicMemberIndex(Me.ControlSetState(), Me)
+        End Get
+    End Property
+
+    ''' API 1 `Close`: removes the control.
+    Public Sub Close()
+        ClassicMemberClose(Me.ControlSetState(), Me)
+    End Sub
+End Class
+
+''' A Slider control-set member.
+Public Class ClassicSliderMember Inherits Slider Implements ClassicControlSetMember
+    Private Property mState As ClassicControlSetState
+
+    Public Function ControlSetState() As ClassicControlSetState
+        If Me.mState = Nil Then Me.mState = New ClassicControlSetState()
+        Return Me.mState
+    End Function
+
+    Public Function ControlSetControl() As UIControl
+        Return Me
+    End Function
+
+    Public Sub ControlSetAttach(host As Window)
+        host.AddSubview(Me)
+    End Sub
+
+    Public Sub ControlSetAttachToView(host As View)
+        host.AddSubview(Me)
+    End Sub
+
+    ''' API 1 `Index`: the position in the set, or -1 when not in a set.
+    Public ReadOnly Property Index As Integer
+        Get
+            Return ClassicMemberIndex(Me.ControlSetState(), Me)
+        End Get
+    End Property
+
+    ''' API 1 `Close`: removes the control.
+    Public Sub Close()
+        ClassicMemberClose(Me.ControlSetState(), Me)
+    End Sub
+
+    Handle ValueChanged()
+        ClassicMemberRoute(Me.ControlSetState(), Me, "ValueChanged")
+    End Handle
+End Class
+
+' ── Typed sets ──────────────────────────────────────────────────────────────
+
+' Properties every cloned member copies from the template.
+Private Sub ClassicCopyFrame(source As UIControl, target As UIControl)
+    target.Move(source.X, source.Y, source.Width, source.Height)
+    target.Visible = source.Visible
+    target.Enabled = source.Enabled
+End Sub
+
+''' A PushButton control set: `Action(index)`.
+Public Class ClassicPushButtonSet Inherits ClassicControlSet
+    Event Action(index As Integer)
+
+    Public Sub Constructor(host As Window)
+        Super.Constructor(host)
+    End Sub
+
+    Public Sub Constructor(host As View)
+        Super.Constructor(host)
+    End Sub
+
+    ''' The member with this index, or Nil.
+    Public Function Item(index As Integer) As ClassicPushButtonMember
+        Dim m As ClassicControlSetMember = Me.MemberAt(index)
+        If m = Nil Then Return Nil
+        Return CType(m, ClassicPushButtonMember)
+    End Function
+
+    ''' Adds an already-placed button at an explicit index.
+    Public Sub Register(member As ClassicPushButtonMember, index As Integer)
+        Me.RegisterMember(member, index)
+    End Sub
+
+    ''' Places a new button at LastIndex + 1 and raises Open.
+    Public Function Attach(member As ClassicPushButtonMember) As Integer
+        Return Me.AttachMember(member, Nil)
+    End Function
+
+    ''' API 1 `New PushButton1`: a copy of the lowest-index member (frame,
+    ''' Visible, Enabled, Caption) at LastIndex + 1. Default/Cancel are not
+    ''' copied: a window has one default and one cancel button.
+    Public Function NewMember() As ClassicPushButtonMember
+        Dim template As ClassicPushButtonMember = CType(Me.TemplateMember(), ClassicPushButtonMember)
+        Dim m As New ClassicPushButtonMember()
+        ClassicCopyFrame(template, m)
+        m.Caption = template.Caption
+        Me.AttachMember(m, template)
+        Return m
+    End Function
+
+    Protected Overrides Sub DispatchEvent(eventName As String, index As Integer)
+        If eventName = "Action" Then RaiseEvent Action(index)
+    End Sub
+End Class
+
+''' A CheckBox control set: `Action(index)`.
+Public Class ClassicCheckBoxSet Inherits ClassicControlSet
+    Event Action(index As Integer)
+
+    Public Sub Constructor(host As Window)
+        Super.Constructor(host)
+    End Sub
+
+    Public Sub Constructor(host As View)
+        Super.Constructor(host)
+    End Sub
+
+    ''' The member with this index, or Nil.
+    Public Function Item(index As Integer) As ClassicCheckBoxMember
+        Dim m As ClassicControlSetMember = Me.MemberAt(index)
+        If m = Nil Then Return Nil
+        Return CType(m, ClassicCheckBoxMember)
+    End Function
+
+    ''' Adds an already-placed checkbox at an explicit index.
+    Public Sub Register(member As ClassicCheckBoxMember, index As Integer)
+        Me.RegisterMember(member, index)
+    End Sub
+
+    ''' Places a new checkbox at LastIndex + 1 and raises Open.
+    Public Function Attach(member As ClassicCheckBoxMember) As Integer
+        Return Me.AttachMember(member, Nil)
+    End Function
+
+    ''' API 1 `New CheckBox1`: copies frame, Visible, Enabled, Caption and
+    ''' State from the lowest-index member. Setting the copied State raises
+    ''' no Action: the member is not in the set yet.
+    Public Function NewMember() As ClassicCheckBoxMember
+        Dim template As ClassicCheckBoxMember = CType(Me.TemplateMember(), ClassicCheckBoxMember)
+        Dim m As New ClassicCheckBoxMember()
+        ClassicCopyFrame(template, m)
+        m.Caption = template.Caption
+        m.State = template.State
+        Me.AttachMember(m, template)
+        Return m
+    End Function
+
+    Protected Overrides Sub DispatchEvent(eventName As String, index As Integer)
+        If eventName = "Action" Then RaiseEvent Action(index)
+    End Sub
+End Class
+
+''' A TextField control set: `TextChange(index)`, `GotFocus(index)`,
+''' `LostFocus(index)`.
+Public Class ClassicTextFieldSet Inherits ClassicControlSet
+    Event TextChange(index As Integer)
+    Event GotFocus(index As Integer)
+    Event LostFocus(index As Integer)
+
+    Public Sub Constructor(host As Window)
+        Super.Constructor(host)
+    End Sub
+
+    Public Sub Constructor(host As View)
+        Super.Constructor(host)
+    End Sub
+
+    ''' The member with this index, or Nil.
+    Public Function Item(index As Integer) As ClassicTextFieldMember
+        Dim m As ClassicControlSetMember = Me.MemberAt(index)
+        If m = Nil Then Return Nil
+        Return CType(m, ClassicTextFieldMember)
+    End Function
+
+    ''' Adds an already-placed field at an explicit index.
+    Public Sub Register(member As ClassicTextFieldMember, index As Integer)
+        Me.RegisterMember(member, index)
+    End Sub
+
+    ''' Places a new field at LastIndex + 1 and raises Open.
+    Public Function Attach(member As ClassicTextFieldMember) As Integer
+        Return Me.AttachMember(member, Nil)
+    End Function
+
+    ''' API 1 `New TextField1`: copies frame, Visible, Enabled, Text,
+    ''' Placeholder (API 1 CueText) and IsReadOnly (API 1 ReadOnly).
+    Public Function NewMember() As ClassicTextFieldMember
+        Dim template As ClassicTextFieldMember = CType(Me.TemplateMember(), ClassicTextFieldMember)
+        Dim m As New ClassicTextFieldMember()
+        ClassicCopyFrame(template, m)
+        m.Text = template.Text
+        m.Placeholder = template.Placeholder
+        m.IsReadOnly = template.IsReadOnly
+        Me.AttachMember(m, template)
+        Return m
+    End Function
+
+    Protected Overrides Sub DispatchEvent(eventName As String, index As Integer)
+        Select Case eventName
+        Case "TextChange"
+            RaiseEvent TextChange(index)
+        Case "GotFocus"
+            RaiseEvent GotFocus(index)
+        Case "LostFocus"
+            RaiseEvent LostFocus(index)
+        End Select
+    End Sub
+End Class
+
+''' A StaticText (Label) control set. Labels have no events.
+Public Class ClassicLabelSet Inherits ClassicControlSet
+    Public Sub Constructor(host As Window)
+        Super.Constructor(host)
+    End Sub
+
+    Public Sub Constructor(host As View)
+        Super.Constructor(host)
+    End Sub
+
+    ''' The member with this index, or Nil.
+    Public Function Item(index As Integer) As ClassicLabelMember
+        Dim m As ClassicControlSetMember = Me.MemberAt(index)
+        If m = Nil Then Return Nil
+        Return CType(m, ClassicLabelMember)
+    End Function
+
+    ''' Adds an already-placed label at an explicit index.
+    Public Sub Register(member As ClassicLabelMember, index As Integer)
+        Me.RegisterMember(member, index)
+    End Sub
+
+    ''' Places a new label at LastIndex + 1 and raises Open.
+    Public Function Attach(member As ClassicLabelMember) As Integer
+        Return Me.AttachMember(member, Nil)
+    End Function
+
+    ''' API 1 `New Label1`: copies frame, Visible, Enabled and Text.
+    Public Function NewMember() As ClassicLabelMember
+        Dim template As ClassicLabelMember = CType(Me.TemplateMember(), ClassicLabelMember)
+        Dim m As New ClassicLabelMember()
+        ClassicCopyFrame(template, m)
+        m.Text = template.Text
+        Me.AttachMember(m, template)
+        Return m
+    End Function
+End Class
+
+''' A Slider control set: `ValueChanged(index)`.
+Public Class ClassicSliderSet Inherits ClassicControlSet
+    Event ValueChanged(index As Integer)
+
+    Public Sub Constructor(host As Window)
+        Super.Constructor(host)
+    End Sub
+
+    Public Sub Constructor(host As View)
+        Super.Constructor(host)
+    End Sub
+
+    ''' The member with this index, or Nil.
+    Public Function Item(index As Integer) As ClassicSliderMember
+        Dim m As ClassicControlSetMember = Me.MemberAt(index)
+        If m = Nil Then Return Nil
+        Return CType(m, ClassicSliderMember)
+    End Function
+
+    ''' Adds an already-placed slider at an explicit index.
+    Public Sub Register(member As ClassicSliderMember, index As Integer)
+        Me.RegisterMember(member, index)
+    End Sub
+
+    ''' Places a new slider at LastIndex + 1 and raises Open.
+    Public Function Attach(member As ClassicSliderMember) As Integer
+        Return Me.AttachMember(member, Nil)
+    End Function
+
+    ''' API 1 `New Slider1`: copies frame, Visible, Enabled, Minimum, Maximum
+    ''' and Value. The copied Value is set before the member joins the set, so
+    ''' it raises no ValueChanged.
+    Public Function NewMember() As ClassicSliderMember
+        Dim template As ClassicSliderMember = CType(Me.TemplateMember(), ClassicSliderMember)
+        Dim m As New ClassicSliderMember()
+        ClassicCopyFrame(template, m)
+        m.Minimum = template.Minimum
+        m.Maximum = template.Maximum
+        m.Value = template.Value
+        Me.AttachMember(m, template)
+        Return m
+    End Function
+
+    Protected Overrides Sub DispatchEvent(eventName As String, index As Integer)
+        If eventName = "ValueChanged" Then RaiseEvent ValueChanged(index)
+    End Sub
+End Class

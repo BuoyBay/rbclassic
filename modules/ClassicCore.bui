@@ -1,0 +1,69 @@
+Import RBFoundation
+
+''' Classic character count (Unicode codepoints in Buoy).
+Public Function Len(text As String) As Integer
+    Return String.Len(text)
+End Function
+
+''' Classic one-based substring, with the native String.Mid boundary rules.
+Public Function Mid(text As String, start As Integer) As String
+    Return String.Mid(text, start)
+End Function
+
+Public Function Mid(text As String, start As Integer, count As Integer) As String
+    Return String.Mid(text, start, count)
+End Function
+
+''' Classic one-based search; zero means not found. ASCII case folding.
+Public Function InStr(text As String, target As String) As Integer
+    Return String.InStr(text, target)
+End Function
+
+Public Function InStr(start As Integer, text As String, target As String) As Integer
+    Return String.InStr(text, target, start)
+End Function
+
+''' Last index of a one-dimensional array, including -1 for an empty array.
+Public Extension Function UBound Of T(items As Array Of T) As Integer
+    Return Array.LastIndex(items)
+End Function
+
+''' Convert a classic inclusive upper bound into a Buoy extent.
+Public Function ClassicExtent(upperBound As Integer) As Integer
+    If upperBound < -1 Or upperBound = 9223372036854775807 Then
+        Throw New InvalidArgumentException("Classic array upper bound is outside the supported range")
+    End If
+    Return upperBound + 1
+End Function
+
+''' Resize a resizable one-dimensional array using a classic inclusive bound.
+Public Extension Sub ClassicRedim Of T(items As Array Of T, upperBound As Integer)
+    Array.ResizeTo(items, ClassicExtent(upperBound))
+End Sub
+
+''' First-only replacement; an empty target leaves the source unchanged.
+''' Named explicitly because native String.Replace already means replace-all.
+Public Function ClassicReplace(text As String, target As String, replacement As String) As String
+    If String.Len(target) = 0 Then Return text
+    Return String.Replace(text, target, replacement, 1)
+End Function
+
+''' Locale-sensitive numeric mask, using the bundled legacy mask subset.
+''' Explicit name avoids replacing the existing invariant foundation Format.
+Public Function ClassicFormat(number As Double, mask As String) As String
+    Return number.ToString(Locale.Current(), mask)
+End Function
+
+Public Function ClassicFormat(number As Integer, mask As String) As String
+    Return number.ToString(Locale.Current(), mask)
+End Function
+
+Public Function ClassicFormat(number As Double, mask As String, loc As Locale) As String
+    If loc Is Nil Then Throw New InvalidArgumentException("ClassicFormat requires a locale")
+    Return number.ToString(loc, mask)
+End Function
+
+Public Function ClassicFormat(number As Integer, mask As String, loc As Locale) As String
+    If loc Is Nil Then Throw New InvalidArgumentException("ClassicFormat requires a locale")
+    Return number.ToString(loc, mask)
+End Function

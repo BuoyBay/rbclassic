@@ -1,0 +1,268 @@
+' External compatibility boundary: the toolchain ships this package as Xojo.
+' Keep that import literal; RBClassic owns all authored package/module names.
+' Forwarded globals retain the installed compatibility semantics, not native equivalence.
+Public Import Xojo
+
+Public Function CDbl(s As String) As Double
+    Return XojoCore.CDbl(s)
+End Function
+
+Public Function Chr(value As Integer) As String
+    Return XojoCore.Chr(value)
+End Function
+
+Public Function Hex(n As Integer) As String
+    Return XojoCore.Hex(n)
+End Function
+
+Public Function Oct(n As Integer) As String
+    Return XojoCore.Oct(n)
+End Function
+
+Public Function Bin(n As Integer) As String
+    Return XojoCore.Bin(n)
+End Function
+
+Public Function Abs(value As Double) As Double
+    Return XojoCore.Abs(value)
+End Function
+
+Public Function Abs(value As Integer) As Integer
+    Return XojoCore.Abs(value)
+End Function
+
+Public Function Round(value As Double) As Double
+    Return XojoCore.Round(value)
+End Function
+
+Public Function Ceiling(value As Double) As Double
+    Return XojoCore.Ceiling(value)
+End Function
+
+Public Function Floor(value As Double) As Double
+    Return XojoCore.Floor(value)
+End Function
+
+Public Function Sqrt(value As Double) As Double
+    Return XojoCore.Sqrt(value)
+End Function
+
+Public Function Pow(baseValue As Double, exponent As Double) As Double
+    Return XojoCore.Pow(baseValue, exponent)
+End Function
+
+Public Function Exp(value As Double) As Double
+    Return XojoCore.Exp(value)
+End Function
+
+Public Function Log(value As Double) As Double
+    Return XojoCore.Log(value)
+End Function
+
+Public Function Sin(value As Double) As Double
+    Return XojoCore.Sin(value)
+End Function
+
+Public Function Cos(value As Double) As Double
+    Return XojoCore.Cos(value)
+End Function
+
+Public Function Tan(value As Double) As Double
+    Return XojoCore.Tan(value)
+End Function
+
+Public Function Asin(value As Double) As Double
+    Return XojoCore.Asin(value)
+End Function
+
+Public Function Acos(value As Double) As Double
+    Return XojoCore.Acos(value)
+End Function
+
+Public Function Atan(value As Double) As Double
+    Return XojoCore.Atan(value)
+End Function
+
+Public Function Atan2(y As Double, x As Double) As Double
+    Return XojoCore.Atan2(y, x)
+End Function
+
+Public Function Sign(value As Double) As Integer
+    Return XojoCore.Sign(value)
+End Function
+
+Public Function Min(v1 As Double, v2 As Double, ParamArray rest As Double) As Double
+    Dim extreme As Double = Math.Min(v1, v2)
+    For Each value As Double In rest
+        extreme = Math.Min(extreme, value)
+    Next
+    Return extreme
+End Function
+
+Public Function Max(v1 As Double, v2 As Double, ParamArray rest As Double) As Double
+    Dim extreme As Double = Math.Max(v1, v2)
+    For Each value As Double In rest
+        extreme = Math.Max(extreme, value)
+    Next
+    Return extreme
+End Function
+
+Public Function Rnd() As Double
+    Return XojoCore.Rnd()
+End Function
+
+Public Function Microseconds() As Integer
+    Return XojoCore.Microseconds()
+End Function
+
+Public Function CoreCount() As Integer
+    Return XojoCore.CoreCount()
+End Function
+
+Public Sub DebugLog(msg As String)
+    XojoCore.DebugLog(msg)
+End Sub
+
+Public Function Str(v As Integer) As String
+    Return XojoCore.Str(v)
+End Function
+
+Public Function Str(v As Double) As String
+    Return XojoCore.Str(v)
+End Function
+
+Public Function Str(v As Boolean) As String
+    Return XojoCore.Str(v)
+End Function
+
+Public Function Str(v As Double, formatSpec As String) As String
+    Return XojoCore.Str(v, formatSpec)
+End Function
+
+Public Function CStr(v As Integer) As String
+    Return XojoCore.CStr(v)
+End Function
+
+Public Function CStr(v As Double) As String
+    Return XojoCore.CStr(v)
+End Function
+
+Public Function CStr(v As Boolean) As String
+    Return XojoCore.CStr(v)
+End Function
+
+Public Function Format(n As Double, formatSpec As String) As String
+    Return XojoCore.Format(n, formatSpec)
+End Function
+
+Public Function EncodeHex(s As String, insertSpaces As Boolean = False) As String
+    Return XojoCore.EncodeHex(s, insertSpaces)
+End Function
+
+Public Function EncodeHex(data As MemoryBlock, insertSpaces As Boolean = False) As String
+    Return XojoCore.EncodeHex(data, insertSpaces)
+End Function
+
+Public Function EncodeBase64(data As MemoryBlock, lineWrap As Integer = 0) As String
+    Return XojoCore.EncodeBase64(data, lineWrap)
+End Function
+
+Public Function DecodeHex(s As String) As String
+    Return XojoCore.DecodeHex(s)
+End Function
+
+Public Function EncodeBase64(s As String, lineWrap As Integer = 0) As String
+    Return XojoCore.EncodeBase64(s, lineWrap)
+End Function
+
+Public Function DecodeBase64(s As String) As String
+    Return XojoCore.DecodeBase64(s)
+End Function
+
+Public Function EncodeURLComponent(s As String) As String
+    Return XojoCore.EncodeURLComponent(s)
+End Function
+
+Public Function DecodeURLComponent(s As String, encoding As Text.Encodings = Text.Encodings.UTF8) As String
+    Return XojoCore.DecodeURLComponent(s, encoding)
+End Function
+
+Public Function ParseJSON(value As String) As JSONItem
+    Return XojoData.ParseJSON(value)
+End Function
+
+Public Function GenerateJSON(value As JSONItem, expanded As Boolean = False) As String
+    Return XojoData.GenerateJSON(value, expanded)
+End Function
+
+Public Function GenerateJSON(value As JSONItem, options As JSONOptions) As String
+    Return XojoData.GenerateJSON(value, options)
+End Function
+
+Public Function ParseJSONTree(value As String) As Variant
+    Return XojoData.ParseJSONTree(value)
+End Function
+
+Public Function GenerateJSON(value As Variant, expanded As Boolean = False) As String
+    Return XojoData.GenerateJSON(value, expanded)
+End Function
+
+Public Function GenerateJSON(value As Variant, options As JSONOptions) As String
+    Return XojoData.GenerateJSON(value, options)
+End Function
+
+Public Sub DoEvents(ms As Integer = 10)
+    XojoFiles.DoEvents(ms)
+End Sub
+
+Public Function XojoMessageBox(message As String) As Boolean
+    Return XojoDesktop.XojoMessageBox(message)
+End Function
+
+Public Function WindowCount() As Integer
+    Return XojoDesktop.WindowCount()
+End Function
+
+Public Sub Quit(exitCode As Integer = 0)
+    XojoDesktop.Quit(exitCode)
+End Sub
+
+Public Sub SleepCurrent(ms As Integer)
+    XojoThreading.SleepCurrent(ms)
+End Sub
+
+Public Sub YieldToNext()
+    XojoThreading.YieldToNext()
+End Sub
+
+Public Function StartMethod(action As XojoThreadAction) As Thread
+    Return XojoThreading.StartMethod(action)
+End Function
+
+Public Function CallLater(delayMs As Integer, action As TimerAction) As Timer
+    Return XojoThreading.CallLater(delayMs, action)
+End Function
+
+Public Sub CancelCallLater(t As Timer)
+    XojoThreading.CancelCallLater(t)
+End Sub
+
+Public Sub CancelCallLater(action As TimerAction)
+    XojoThreading.CancelCallLater(action)
+End Sub
+
+Public Function XojoKeyNameForMacKeyCode(code As Integer) As KeyName
+    Return XojoKeyboard.XojoKeyNameForMacKeyCode(code)
+End Function
+
+Public Function Val(text As String) As Double
+    Return XojoCore.Val(text)
+End Function
+
+Public Function FoundationMessageBox(message As String) As Boolean
+    Return XojoDesktop.XojoMessageBox(message)
+End Function
+
+Public Function FoundationKeyNameForMacKeyCode(code As Integer) As KeyName
+    Return XojoKeyboard.XojoKeyNameForMacKeyCode(code)
+End Function

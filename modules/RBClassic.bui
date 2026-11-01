@@ -1,0 +1,32 @@
+' Maintained REALbasic-compatible API 1 adapters; see RBFoundation for the vendor boundary.
+Public Import RBFoundation
+Public Import RBFoundation.{ CDbl, Chr, Hex, Oct, Bin, Abs, Round, Ceiling, Floor, Sqrt, Pow, Exp, Log, Sin, Cos, Tan, Asin, Acos, Atan, Atan2, Sign, Min, Max, Rnd, Microseconds, CoreCount, DebugLog, Str, CStr, Format, EncodeHex, EncodeBase64, DecodeHex, DecodeBase64, EncodeURLComponent, DecodeURLComponent, ParseJSON, GenerateJSON, ParseJSONTree, DoEvents, XojoMessageBox, WindowCount, Quit, SleepCurrent, YieldToNext, StartMethod, CallLater, CancelCallLater, XojoKeyNameForMacKeyCode, Val }
+Public Import ClassicCore
+Public Import ClassicCore.{ Len, Mid, InStr, ClassicExtent, ClassicReplace, ClassicFormat }
+Public Import ClassicData
+Public Import ClassicInterop
+Public Import ClassicInterop.{ BoxClassicValue, TryUnboxClassicValue }
+Public Import ClassicData.{ IsNumeric }
+Public Import ClassicFormatting
+Public Import ClassicFormatting.{ ClassicCStr, ClassicFormatMask }
+Public Import ClassicDatabase
+Public Import ClassicSystem
+Public Import ClassicSerial
+Public Import ClassicAsyncNet
+Public Import ClassicClipboard
+Public Import ClassicClipboard.{ ClassicClipboardFormat }
+Public Import ClassicGraphics
+Public Import ClassicGraphics.{ ClassicRGB, ClassicHSV, ClassicCMY }
+Public Import ClassicControls
+Public Import ClassicListNative
+Public Import ClassicControlSets
+Public Import ClassicPrinting
+Public Import ClassicPrinting.{ OpenPrinter, OpenPrinterDialog, ClassicOpenPDFPrinter }
+Public Import ClassicFiles
+Public Import ClassicFiles.{ GetFolderItem, GetOpenFolderItem, GetSaveFolderItem, GetTemporaryFolderItem, SelectFolder, RegisterClassicFileType, ClearClassicFileTypes, ResolveClassicFileTypes }
+Public Import ClassicEncoding
+Public Import ClassicDesktop
+Public Import ClassicDesktop.{ ClassicCloseWindowsForQuit, ClassicQuit, ClassicAddPage, ClassicAddTab, ClassicRegisterPanelPage, ClassicExitCode, ClassicSetCallbackErrorHandler, ClassicHasFocus, ClassicEditCommandEnabled, ClassicPerformEditCommand, ClassicAddEditMenuItems, ClassicOpenDocuments, ClassicDefaultButtonCount, ClassicPanelPageCount }
+
+Public Import RBAliases
+Public Import RBAliases.{ Lowercase, Uppercase, Replace, ArrayExtent, ShowMessageBox, KeyNameForMacKeyCode }

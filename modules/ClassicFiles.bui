@@ -1,0 +1,597 @@
+' Classic API 1 file adapters; see ../notes/files.md for scoped contracts.
+Import RBFoundation
+
+' Shared extension getters preserve the old spelling, but are not ConstExprs.
+Public Extension Shared Function FolderItem.PathTypeAbsolute() As Integer
+    Return 0
+End Function
+Public Extension Shared Function FolderItem.PathTypeShell() As Integer
+    Return 1
+End Function
+Public Extension Shared Function FolderItem.PathTypeURL() As Integer
+    Return 2
+End Function
+Public Extension Shared Function FolderItem.PathTypeNative() As Integer
+    Return 3
+End Function
+
+Private Function ClassicAbsolutePath(aPath As String) As Boolean
+    #If TargetWindows Then
+        If String.Left(aPath, 2) = "\\\\" Or String.Left(aPath, 2) = "//" Then
+            Return True
+        End If
+        Return String.Len(aPath) >= 3 And String.Mid(aPath, 2, 1) = ":" And _
+            (String.Mid(aPath, 3, 1) = "\\" Or String.Mid(aPath, 3, 1) = "/")
+    #Else
+        Return String.Left(aPath, 1) = "/"
+    #End If
+End Function
+
+Private Sub ClassicCheckPath(aPath As String)
+    Dim raw As Bytes = Bytes.FromString(aPath, Text.Encodings.UTF8)
+    For i As Integer = 0 To raw.Count - 1
+        If raw.Item(i) = 0 Then
+            Throw New UnsupportedFormatException("A filesystem path cannot contain NUL")
+        End If
+    Next
+End Sub
+
+Private Function ClassicApplicationFolder() As FolderItem
+    Dim exe As FileSystemItem = Application.Executable
+    If exe = Nil Then
+        Throw New IOException("Cannot locate the application executable")
+    End If
+    Dim dir As FileSystemItem = exe.Parent
+    #If TargetMac Then
+        ' legacy returns the directory containing a .app bundle, not MacOS/.
+        If dir <> Nil And dir.Name() = "MacOS" Then
+            Dim contents As FileSystemItem = dir.Parent
+            If contents <> Nil And contents.Name() = "Contents" Then
+                Dim bundle As FileSystemItem = contents.Parent
+                If bundle <> Nil And String.Right(bundle.Name(), 4) = ".app" Then
+                    dir = bundle.Parent
+                End If
+            End If
+        End If
+    #End If
+    If dir = Nil Then
+        Throw New IOException("Cannot locate the application directory")
+    End If
+    Return New FolderItem(dir)
+End Function
+
+''' Empty and relative paths are relative to the executable/bundle directory.
+''' Alias files and shortcuts are NOT resolved by the foundation.
+Public Function GetFolderItem(aPath As String = "", pathMode As Integer = 0) As FolderItem
+    If pathMode < 0 Or pathMode > 3 Then
+        Throw New UnsupportedFormatException("Unknown classic FolderItem path mode")
+    End If
+    ClassicCheckPath(aPath)
+    If aPath = "" Then
+        Return ClassicApplicationFolder()
+    End If
+    Dim mode As FolderItem.PathModes = FolderItem.PathModes.Native
+    If pathMode = 1 Then
+        mode = FolderItem.PathModes.Shell
+    ElseIf pathMode = 2 Then
+        If Not String.StartsWith(aPath, "file:///") Then
+            Throw New UnsupportedFormatException("A file URL must begin with file:///")
+        End If
+        ' The foundation preserves malformed percent escapes; reject them here.
+        Dim i As Integer = 1
+        While i <= String.Len(aPath)
+            If String.Mid(aPath, i, 1) = "%" Then
+                If i + 2 > String.Len(aPath) Then
+                    Throw New UnsupportedFormatException("Incomplete file URL escape")
+                End If
+                Dim pair As String = String.Mid(aPath, i + 1, 2)
+                If Bytes.FromHex(pair).IsErr Or pair = "00" Then
+                    Throw New UnsupportedFormatException("Invalid file URL escape")
+                End If
+                i = i + 2
+            End If
+            i = i + 1
+        End While
+        mode = FolderItem.PathModes.URL
+    End If
+    #If TargetMac Then
+        If pathMode = 0 And String.InStr(aPath, ":") > 0 Then
+            Throw New UnsupportedFormatException("Classic macOS HFS absolute paths are unsupported; use PathTypeNative, Shell or URL")
+        End If
+    #End If
+    Dim item As New FolderItem(aPath, mode)
+    ClassicCheckPath(item.NativePath)
+    If pathMode = 1 And Not ClassicAbsolutePath(item.NativePath) Then
+        Throw New UnsupportedFormatException("A shell path must be absolute")
+    End If
+    If Not ClassicAbsolutePath(item.NativePath) Then
+        Return New FolderItem(Path.Join(ClassicApplicationFolder().NativePath, item.NativePath))
+    End If
+    Return item
+End Function
+
+Public Function GetTemporaryFolderItem() As FolderItem
+    Return FolderItem.TemporaryFile()
+End Function
+
+' Explicit application-owned registry; names are exact and case-sensitive.
+Private Class ClassicFileTypes
+    Public Shared Property Names As Array Of String = []
+    Public Shared Property Types As Array Of FileType = []
+End Class
+
+Public Sub RegisterClassicFileType(name As String, value As FileType)
+    If name = "" Or String.InStr(name, ";") > 0 Then Throw New InvalidArgumentException("FileType registry name must be nonempty and contain no semicolon")
+    If value = Nil Then Throw New NilObjectException("FileType is Nil")
+    For i As Integer = 0 To Array.Count(ClassicFileTypes.Names) - 1
+        If String.Compare(ClassicFileTypes.Names(i), name, True) = 0 Then
+            ClassicFileTypes.Types(i) = value
+            Return
+        End If
+    Next
+    Array.Append(ClassicFileTypes.Names, name)
+    Array.Append(ClassicFileTypes.Types, value)
+End Sub
+
+Public Sub ClearClassicFileTypes()
+    ClassicFileTypes.Names = []
+    ClassicFileTypes.Types = []
+End Sub
+
+Public Function ResolveClassicFileTypes(filter As String) As Array Of FileType
+    Dim outcome As Array Of FileType = []
+    If filter = "" Then Return outcome
+    For Each name As String In String.Split(filter, ";")
+        Dim found As Boolean = False
+        For i As Integer = 0 To Array.Count(ClassicFileTypes.Names) - 1
+            If String.Compare(ClassicFileTypes.Names(i), name, True) = 0 Then
+                Array.Append(outcome, ClassicFileTypes.Types(i))
+                found = True
+                Exit For
+            End If
+        Next
+        If Not found Then Throw New UnsupportedFormatException("Unregistered classic FileType name: " + name)
+    Next
+    Return outcome
+End Function
+
+Public Function GetOpenFolderItem(filter As String) As FolderItem
+    Dim filters As Array Of FileType = ResolveClassicFileTypes(filter)
+    Dim dlg As New OpenFileDialog
+    For Each value As FileType In filters
+        dlg.AddFilter(value)
+    Next
+    If dlg.Show(Nil) Then Return FolderItem.WrapOrNil(dlg.SelectedItem)
+    Return Nil
+End Function
+
+Public Function GetOpenFolderItem(filter As FileType) As FolderItem
+    If filter = Nil Then
+        Throw New NilObjectException("FileType is Nil")
+    End If
+    Dim dlg As New OpenFileDialog
+    dlg.AddFilter(filter)
+    If dlg.Show(Nil) Then
+        Return FolderItem.WrapOrNil(dlg.SelectedItem)
+    End If
+    Return Nil
+End Function
+
+Public Function GetSaveFolderItem(filter As String, defaultName As String) As FolderItem
+    Dim filters As Array Of FileType = ResolveClassicFileTypes(filter)
+    Dim dlg As New SaveFileDialog
+    For Each value As FileType In filters
+        dlg.AddFilter(value)
+    Next
+    dlg.SuggestedFileName = defaultName
+    If dlg.Show(Nil) Then Return FolderItem.WrapOrNil(dlg.SelectedItem)
+    Return Nil
+End Function
+
+Public Function GetSaveFolderItem(filter As FileType, defaultName As String) As FolderItem
+    If filter = Nil Then
+        Throw New NilObjectException("FileType is Nil")
+    End If
+    Dim dlg As New SaveFileDialog
+    dlg.AddFilter(filter)
+    dlg.SuggestedFileName = defaultName
+    If dlg.Show(Nil) Then
+        Return FolderItem.WrapOrNil(dlg.SelectedItem)
+    End If
+    Return Nil
+End Function
+
+Public Function SelectFolder() As FolderItem
+    Dim selected As FolderItem = FolderItem.ShowSelectFolderDialog()
+    If selected <> Nil Then
+        If Not selected.IsFolder Then
+            Throw New IOException("Native folder chooser returned a non-directory")
+        End If
+    End If
+    Return selected
+End Function
+
+Public Extension Function Directory(item As FolderItem) As Boolean
+    If item = Nil Then
+        Throw New NilObjectException("FolderItem is Nil")
+    End If
+    Return item.IsFolder
+End Function
+
+''' One-based; invalid index, non-directory, missing/unlistable path => Nil.
+''' Native symlinks follow OS behavior; Finder aliases/.lnk are unresolved.
+Public Extension Function Item(folder As FolderItem, index As Integer) As FolderItem
+    If folder = Nil Then
+        Throw New NilObjectException("FolderItem is Nil")
+    End If
+    If index < 1 Or Not folder.IsFolder Then
+        Return Nil
+    End If
+    Dim kids As Array Of FolderItem = folder.Children()
+    If index > Array.Count(kids) Then
+        Return Nil
+    End If
+    Return kids(index - 1)
+End Function
+
+''' Legacy Nil-on-open-failure equivalent; UTF-8, with no encoding sniffing.
+Public Extension Function OpenAsTextFile(item As FolderItem) As TextInputStream
+    If item = Nil Then
+        Throw New NilObjectException("FolderItem is Nil")
+    End If
+    If item.IsFolder Then
+        Return Nil
+    End If
+    Dim opened As Result Of TextInputStream, IOError = TextInputStream.Open(item.ToFileSystemItem())
+    If opened.IsErr Then
+        Return Nil
+    End If
+    Return opened.Value
+End Function
+
+''' Creates/truncates; Nil on failure. Does not set Mac type/creator metadata.
+Public Extension Function CreateTextFile(item As FolderItem) As TextOutputStream
+    If item = Nil Then
+        Throw New NilObjectException("FolderItem is Nil")
+    End If
+    Dim opened As Result Of TextOutputStream, IOError = TextOutputStream.Create(item.ToFileSystemItem())
+    If opened.IsErr Then
+        Return Nil
+    End If
+    Return opened.Value
+End Function
+
+' A separate wrapper owns the error state; base FolderItem.Remove remains unchanged.
+#If TargetWindows Then
+Private Declare Function ClassicAllocate Lib "msvcrt" Alias "calloc" (count As Integer, size As Integer) As Ptr
+Private Declare Sub ClassicFree Lib "msvcrt" Alias "free" (buffer As Ptr)
+Private Declare Function ClassicWide Lib "kernel32" Alias "MultiByteToWideChar" (codepage As UInt32, nativeOptions As UInt32, input As String, length As Int32, output As Ptr, capacity As Int32) As Int32
+Private Declare Function ClassicDeleteFile Lib "kernel32" Alias "DeleteFileW" (aPath As Ptr) As Int32
+Private Declare Function ClassicRemoveDirectory Lib "kernel32" Alias "RemoveDirectoryW" (aPath As Ptr) As Int32
+Private Optional Declare Function ClassicAttributes Lib "kernel32" Alias "GetFileAttributesW" (aPath As Ptr) As UInt32
+Private Declare Function ClassicNativeError Lib "kernel32" Alias "GetLastError" () As UInt32
+#Else
+#If TargetLinux Then
+Private Optional Declare Function ClassicRemove Lib "c" Alias "remove" (aPath As String) As Int32
+#Else
+Private Declare Function ClassicFindSymbol Lib "c" Alias "dlsym" (handle As Ptr, name As String) As Ptr
+Private Delegate Function ClassicRemoveCall(aPath As String) As Int32
+Private Function ClassicLoadSymbol(name As String) As Ptr
+    Dim symbol As Ptr = ClassicFindSymbol(CType(-2, Ptr), name)
+    If symbol = Nil Then Throw New LibraryUnavailableException("System filesystem symbol is unavailable: " + name)
+    Return symbol
+End Function
+Private Function ClassicRemove(aPath As String) As Int32
+    Dim invokeNative As ClassicRemoveCall = CType(ClassicLoadSymbol("remove"), ClassicRemoveCall)
+    Return invokeNative(aPath)
+End Function
+#End If
+#If TargetLinux Then
+Private Optional Declare Function ClassicRealPath Lib "c" Alias "realpath" (aPath As String, output As Ptr) As Ptr
+#Else
+Private Declare Function ClassicRealPath Lib "c" Alias "realpath" (aPath As String, output As Ptr) As Ptr
+#End If
+Private Declare Sub ClassicFree Lib "c" Alias "free" (buffer As Ptr)
+Private Declare Function ClassicCopyError Lib "c" Alias "memcpy" (ByRef code As Int32, source As Ptr, count As Integer) As Ptr
+#If TargetMac Then
+Private Declare Function ClassicErrnoPointer Lib "c" Alias "__error" () As Ptr
+#Else
+Private Declare Function ClassicErrnoPointer Lib "c" Alias "__errno_location" () As Ptr
+#End If
+Private Function ClassicNativeError() As Integer
+    Dim code As Int32 = 0
+    Dim ignored As Ptr = ClassicCopyError(code, ClassicErrnoPointer(), 4)
+    Return code
+End Function
+#End If
+
+Private Function ClassicLegacyError(code As Integer) As Integer
+    #If TargetWindows Then
+        Select Case code
+        Case 2, 3
+            Return 101
+        Case 5
+            Return 102
+        Case 8, 14
+            Return 103
+        Case 32, 33
+            Return 104
+        Case 123
+            Return 105
+        End Select
+    #Else
+        Select Case code
+        Case 2
+            Return 101
+        Case 1, 13
+            Return 102
+        Case 12
+            Return 103
+        Case 16
+            Return 104
+        Case 22, 36
+            Return 105
+        End Select
+    #End If
+    Return code
+End Function
+
+Public Class ClassicFolderItem Inherits FolderItem
+    Private Property mLastError As Integer = 0
+    Private Property mNativeError As Integer = 0
+    Public Sub Constructor(aPath As String)
+        ClassicCheckPath(aPath)
+        Super.Constructor(aPath)
+    End Sub
+    Public Sub Constructor(item As FolderItem)
+        If item = Nil Then Throw New NilObjectException("FolderItem is Nil")
+        Super.Constructor(item)
+    End Sub
+    Public Property LastErrorCode As Integer
+        Get
+            Return mLastError
+        End Get
+    End Property
+    ' Exact errno/GetLastError, before classic error mapping.
+    Public Property NativeErrorCode As Integer
+        Get
+            Return mNativeError
+        End Get
+    End Property
+    ' Removes a file/link or EMPTY directory. Never recurses or follows a link to delete its target.
+    Public Sub Delete()
+        mNativeError = 0
+        mLastError = 0
+        #If TargetWindows Then
+            Dim count As Int32 = ClassicWide(65001, 8, Me.NativePath, -1, Nil, 0)
+            If count = 0 Then
+                mNativeError = ClassicNativeError()
+            Else
+                Dim wide As Ptr = ClassicAllocate(count, 2)
+                If wide = Nil Then
+                    mNativeError = 8
+                Else
+                    If ClassicWide(65001, 8, Me.NativePath, -1, wide, count) = 0 Then
+                        mNativeError = ClassicNativeError()
+                    Else
+                        Dim outcome As Int32 = ClassicDeleteFile(wide)
+                        If outcome = 0 Then
+                            Dim fileError As Integer = ClassicNativeError()
+                            Dim attributes As UInt32 = ClassicAttributes(wide)
+                            If attributes <> 4294967295 And (attributes And 16) <> 0 Then
+                                If ClassicRemoveDirectory(wide) = 0 Then mNativeError = ClassicNativeError()
+                            Else
+                                mNativeError = fileError
+                            End If
+                        End If
+                    End If
+                    ClassicFree(wide)
+                End If
+            End If
+        #Else
+            If ClassicRemove(Me.NativePath) <> 0 Then mNativeError = ClassicNativeError()
+        #End If
+        mLastError = ClassicLegacyError(mNativeError)
+    End Sub
+End Class
+
+' POSIX realpath resolves a complete chain of symbolic links and dot components.
+' Finder alias files and Windows .lnk files are distinct formats and are not followed.
+Public Extension Function ResolveSymbolicLinks(item As FolderItem) As FolderItem
+    If item = Nil Then Throw New NilObjectException("FolderItem is Nil")
+    #If TargetWindows Then
+        Throw New UnsupportedFormatException("ResolveSymbolicLinks is currently available on POSIX targets only; Windows shortcuts are unsupported")
+    #Else
+        Dim resolved As Ptr = ClassicRealPath(item.NativePath, Nil)
+        If resolved = Nil Then Throw New IOException("realpath failed", ClassicNativeError())
+        ' Copy before releasing the C allocation; CType alone borrows its storage.
+        Dim copy As Bytes = Bytes.FromString(CType(resolved, String), Text.Encodings.UTF8)
+        ClassicFree(resolved)
+        Return New FolderItem(copy.ToString(Text.Encodings.UTF8))
+    #End If
+End Function
+
+
+Public Extension Shared Function SpecialFolder.Pictures() As FolderItem
+    Return FolderItem.WrapOrNil(System.Folders.Pictures())
+End Function
+Public Extension Shared Function SpecialFolder.Music() As FolderItem
+    Return FolderItem.WrapOrNil(System.Folders.Music())
+End Function
+Public Extension Shared Function SpecialFolder.Movies() As FolderItem
+    Return FolderItem.WrapOrNil(System.Folders.Movies())
+End Function
+
+''' Raw one-byte unsigned read. EOF/short read returns zero, as in legacy.
+Public Extension Function ReadUInt8(stream As BinaryStream) As UInt8
+    Dim raw As Bytes = stream.Read(1)
+    If raw.Count = 0 Then
+        Return 0
+    End If
+    Return raw.Item(0)
+End Function
+
+Public Extension Function ReadInt8(stream As BinaryStream) As Int8
+    Dim value As Integer = stream.ReadUInt8()
+    If value >= 128 Then
+        value = value - 256
+    End If
+    Return value
+End Function
+
+Private Sub ClassicCheckWrite(stream As BinaryStream)
+    If stream.LastError.HasValue Then
+        Throw New IOException(stream.LastError.Value.Message)
+    End If
+End Sub
+
+Public Extension Sub WriteUInt8(stream As BinaryStream, value As UInt8)
+    Dim raw As New Bytes
+    raw.Append(value)
+    stream.Write(raw)
+    ClassicCheckWrite(stream)
+End Sub
+Public Extension Sub WriteInt8(stream As BinaryStream, value As Int8)
+    Dim n As Integer = value
+    If n < 0 Then
+        n = n + 256
+    End If
+    stream.WriteUInt8(n)
+End Sub
+
+''' One-byte length followed by raw bytes; consumes short payload, returns empty.
+Public Extension Function ReadPStringBytes(stream As BinaryStream) As Bytes
+    Dim header As Bytes = stream.Read(1)
+    If header.Count = 0 Then
+        Return New Bytes
+    End If
+    Dim size As Integer = header.Item(0)
+    If size = 0 Then
+        Return New Bytes
+    End If
+    Dim raw As Bytes = stream.Read(size)
+    If raw.Count <> size Then
+        Return New Bytes
+    End If
+    Return raw
+End Function
+
+Private Function ClassicDecodeBytes(raw As Bytes, encoding As TextEncoding) As String
+    Dim selected As Text.Encodings = encoding.Value
+    If selected = Text.Encodings.Auto Then
+        selected = raw.DetectEncoding()
+    End If
+    Dim unit As Integer = 1
+    If selected = Text.Encodings.UTF16 Or selected = Text.Encodings.UTF16BE Or selected = Text.Encodings.UTF16LE Then
+        unit = 2
+    ElseIf selected = Text.Encodings.UTF32 Then
+        unit = 4
+    End If
+    Dim i As Integer = 0
+    While i + unit <= raw.Count
+        Dim isZero As Boolean = True
+        For offset As Integer = 0 To unit - 1
+            If raw.Item(i + offset) <> 0 Then
+                isZero = False
+            End If
+        Next
+        If isZero Then
+            Throw New UnsupportedFormatException("Buoy String cannot preserve U+0000; use raw Bytes")
+        End If
+        i = i + unit
+    End While
+    Return raw.ToString(selected)
+End Function
+
+''' Buoy cannot represent a Nil-encoded String: require explicit decoding.
+Public Extension Function ReadPString(stream As BinaryStream) As String
+    Throw New UnsupportedFormatException("Nil-encoded strings are unsupported; pass Encodings.UTF8 or use ReadPStringBytes")
+End Function
+
+Public Extension Function ReadPString(stream As BinaryStream, encoding As TextEncoding) As String
+    If encoding = Nil Then
+        Throw New UnsupportedFormatException("Nil-encoded strings are unsupported; pass Encodings.UTF8 or use ReadPStringBytes")
+    End If
+    Return ClassicDecodeBytes(stream.ReadPStringBytes(), encoding)
+End Function
+
+''' Reject oversized values before writing anything; never split UTF-8 bytes.
+Public Extension Sub WritePString(stream As BinaryStream, value As Bytes)
+    If value = Nil Then
+        Throw New NilObjectException("PString bytes are Nil")
+    End If
+    If value.Count > 255 Then
+        Throw New InvalidArgumentException("A PString payload is limited to 255 bytes")
+    End If
+    Dim framed As New Bytes
+    framed.Append(value.Count)
+    framed.Append(value)
+    stream.Write(framed)
+    ClassicCheckWrite(stream)
+End Sub
+
+''' Buoy strings always encode as UTF-8; prefix counts bytes, not characters.
+Public Extension Sub WritePString(stream As BinaryStream, value As String)
+    stream.WritePString(Bytes.FromString(value, Text.Encodings.UTF8))
+End Sub
+
+''' Explicit text decoding overload; Read(count) remains the native Bytes API.
+Public Extension Function Read(stream As BinaryStream, count As Integer, encoding As TextEncoding) As String
+    If encoding = Nil Then
+        Throw New UnsupportedFormatException("Nil-encoded strings are unsupported; use Read(count) As Bytes")
+    End If
+    If count < 0 Then
+        Throw New InvalidArgumentException("Read byte count must be nonnegative")
+    End If
+    Return ClassicDecodeBytes(stream.Read(count), encoding)
+End Function
+
+Public Extension Sub Write(stream As BinaryStream, value As String)
+    stream.Write(Bytes.FromString(value, Text.Encodings.UTF8))
+    ClassicCheckWrite(stream)
+End Sub
+
+#If Not TargetWindows Then
+Sequential Structure ClassicFileTimes
+    AccessSeconds As Integer
+    AccessNanoseconds As Integer
+    ModifiedSeconds As Integer
+    ModifiedNanoseconds As Integer
+End Structure
+#If TargetLinux Then
+Private Optional Declare Function ClassicSetTimes Lib "c" Alias "utimensat" (descriptor As Int32, aPath As String, ByRef times As ClassicFileTimes, nativeOptions As Int32) As Int32
+#Else
+Private Delegate Function ClassicSetTimesCall(descriptor As Int32, aPath As String, times As Ptr, nativeOptions As Int32) As Int32
+Private Function ClassicSetTimes(descriptor As Int32, aPath As String, ByRef times As ClassicFileTimes, nativeOptions As Int32) As Int32
+    Dim invokeNative As ClassicSetTimesCall = CType(ClassicLoadSymbol("utimensat"), ClassicSetTimesCall)
+    Return invokeNative(descriptor, aPath, CType(times, Ptr), nativeOptions)
+End Function
+#End If
+#End If
+
+''' Sets modification time with millisecond precision, preserving access time.
+''' Creation-time mutation and legacy Date objects are outside this adapter.
+Public Extension Sub SetModificationDateTime(item As FolderItem, instant As DateTime)
+    If item = Nil Then Throw New NilObjectException("FolderItem is Nil")
+    If instant = Nil Then Throw New NilObjectException("DateTime is Nil")
+    #If TargetWindows Then
+        Throw New UnsupportedFormatException("SetModificationDateTime is currently available on POSIX targets only")
+    #Else
+        Dim seconds As Integer = instant.MillisFrom1970 \ 1000
+        Dim millis As Integer = instant.MillisFrom1970 Mod 1000
+        If millis < 0 Then
+            seconds = seconds - 1
+            millis = millis + 1000
+        End If
+        Dim currentDirectory As Int32 = -100
+        Dim omit As Integer = 1073741822
+        #If TargetMac Then
+            currentDirectory = -2
+            omit = -2
+        #End If
+        Dim times As ClassicFileTimes = {AccessSeconds: 0, AccessNanoseconds: omit, ModifiedSeconds: seconds, ModifiedNanoseconds: millis * 1000000}
+        If ClassicSetTimes(currentDirectory, item.NativePath, times, 0) <> 0 Then
+            Throw New IOException("utimensat failed", ClassicNativeError())
+        End If
+    #End If
+End Sub

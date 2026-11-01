@@ -1,0 +1,242 @@
+' API 1 serial facade; requires the opt-in serialio 1.0.0 package.
+Import RBFoundation
+Import Serialio.Serial
+
+Public Class Serial
+    Public Const Baud300 As Integer = 0
+    Public Const Baud600 As Integer = 1
+    Public Const Baud1200 As Integer = 2
+    Public Const Baud1800 As Integer = 3
+    Public Const Baud2400 As Integer = 4
+    Public Const Baud3600 As Integer = 5
+    Public Const Baud4800 As Integer = 6
+    Public Const Baud7200 As Integer = 7
+    Public Const Baud9600 As Integer = 8
+    Public Const Baud14400 As Integer = 9
+    Public Const Baud19200 As Integer = 10
+    Public Const Baud28800 As Integer = 11
+    Public Const Baud38400 As Integer = 12
+    Public Const Baud57600 As Integer = 13
+    Public Const Baud115200 As Integer = 14
+    Public Const Baud230400 As Integer = 15
+    Public Const Bits5 As Integer = 0
+    Public Const Bits6 As Integer = 1
+    Public Const Bits7 As Integer = 2
+    Public Const Bits8 As Integer = 3
+    Public Const ParityNone As Integer = 0
+    Public Const ParityOdd As Integer = 1
+    Public Const ParityEven As Integer = 2
+    Public Const StopBits1 As Integer = 0
+    Public Const StopBits15 As Integer = 1
+    Public Const StopBits2 As Integer = 2
+    Public Const NoError As Integer = 0
+    Public Const AccessDenied As Integer = 100
+    Public Const PortNotFound As Integer = 101
+    Public Const InvalidOptions As Integer = 102
+
+    Public Property Baud As Integer = 8
+    Public Property Bits As Integer = 3
+    Public Property Parity As Integer = 0
+    Public Property Stop As Integer = 0
+    Public Property CTS As Boolean = False
+    Public Property XON As Boolean = False
+    Public Property LastErrorCode As Integer = 0
+    Public Property NativeErrorCode As Integer = 0
+    Public Property SerialPort As SerialPort
+    ' Explicit device-path extension, useful for devices absent from enumeration.
+    Public Property DevicePath As String = ""
+    Private Property Connection As SerialConnection
+    Private Property Buffer As Bytes
+
+    Public Sub Constructor()
+        Me.Buffer = New Bytes()
+    End Sub
+
+    Public Property IsOpen As Boolean
+        Get
+            If Me.Connection = Nil Then Return False
+            Return Me.Connection.IsOpen
+        End Get
+    End Property
+
+    Private Function BaudRate() As Integer
+        Dim rates As Array Of Integer = [300, 600, 1200, 1800, 2400, 3600, 4800, 7200, 9600, 14400, 19200, 28800, 38400, 57600, 115200, 230400]
+        Return rates(Me.Baud)
+    End Function
+
+    Public Function Open() As Boolean
+        If Me.IsOpen Then Return True
+        Me.LastErrorCode = Serial.NoError
+        Me.NativeErrorCode = 0
+        If Me.Baud < 0 Or Me.Baud > 15 Or Me.Bits < 0 Or Me.Bits > 3 Or Me.Parity < 0 Or Me.Parity > 2 Or Me.Stop < 0 Or Me.Stop > 2 Or (Me.CTS And Me.XON) Then
+            Me.LastErrorCode = Serial.InvalidOptions
+            Return False
+        End If
+        #If Not TargetWindows Then
+        ' POSIX termios has no 1.5-stop-bit setting; do not approximate it.
+        If Me.Stop = Serial.StopBits15 Then
+            Me.LastErrorCode = Serial.InvalidOptions
+            Return False
+        End If
+        #End If
+        Dim deviceName As String = Me.DevicePath
+        If deviceName = "" And Me.SerialPort <> Nil Then deviceName = Me.SerialPort.DevicePath
+        If deviceName = "" Then
+            Me.LastErrorCode = Serial.PortNotFound
+            Return False
+        End If
+        Dim config As SerialConfig = SerialPort.StandardConfig(Me.BaudRate())
+        config.DataBits = Me.Bits + 5
+        config.Parity = CType(Me.Parity, SerialParity)
+        config.StopBits = CType(Me.Stop, SerialStopBits)
+        If Me.CTS Then config.FlowControl = SerialFlowControl.RTSCTS
+        If Me.XON Then config.FlowControl = SerialFlowControl.XONXOFF
+        Try
+            Me.Connection = SerialPort.Open(deviceName, config)
+        Catch e As SerialException
+            Me.NativeErrorCode = e.ErrorCode
+            Me.LastErrorCode = e.ErrorCode
+            #If TargetWindows Then
+            If e.ErrorCode = 2 Or e.ErrorCode = 3 Then Me.LastErrorCode = Serial.PortNotFound
+            If e.ErrorCode = 5 Then Me.LastErrorCode = Serial.AccessDenied
+            If e.ErrorCode = 87 Then Me.LastErrorCode = Serial.InvalidOptions
+            #Else
+            If e.ErrorCode = 2 Or e.ErrorCode = 6 Then Me.LastErrorCode = Serial.PortNotFound
+            If e.ErrorCode = 13 Or e.ErrorCode = 1 Then Me.LastErrorCode = Serial.AccessDenied
+            If e.ErrorCode = 22 Then Me.LastErrorCode = Serial.InvalidOptions
+            #End If
+            If Me.LastErrorCode = 0 Then Me.LastErrorCode = Serial.InvalidOptions
+            Me.Connection = Nil
+            Return False
+        End Try
+        Me.Buffer = New Bytes()
+        Return True
+    End Function
+
+    Public Sub Close()
+        If Me.Connection <> Nil Then Me.Connection.Close()
+        Me.Connection = Nil
+        Me.Buffer = New Bytes()
+    End Sub
+
+    Private Sub Collect()
+        If Me.Connection <> Nil Then Me.Buffer.Append(Me.Connection.ReadAll())
+    End Sub
+
+    Public Property BytesAvailable As Integer
+        Get
+            Me.Collect()
+            Return Me.Buffer.Count
+        End Get
+    End Property
+
+    Public Function EndOfFile() As Boolean
+        Return Me.BytesAvailable = 0
+    End Function
+
+    ' Copies so that a caller cannot mutate the unread input.
+    Public Function LookAheadBytes() As Bytes
+        Me.Collect()
+        Dim output As New Bytes()
+        output.Append(Me.Buffer)
+        Return output
+    End Function
+
+    Private Sub Consume(count As Integer)
+        Dim remaining As New Bytes()
+        For i As Integer = count To Me.Buffer.Count - 1
+            remaining.Append(Me.Buffer.Item(i))
+        Next
+        Me.Buffer = remaining
+    End Sub
+
+    Public Function ReadBytes(count As Integer) As Bytes
+        If count < 0 Then Throw New InvalidArgumentException("Read count must be nonnegative")
+        Me.Collect()
+        If count > Me.Buffer.Count Then count = Me.Buffer.Count
+        Dim output As New Bytes()
+        For i As Integer = 0 To count - 1
+            output.Append(Me.Buffer.Item(i))
+        Next
+        Me.Consume(count)
+        Return output
+    End Function
+
+    Public Function ReadAllBytes() As Bytes
+        Return Me.ReadBytes(Me.BytesAvailable)
+    End Function
+
+    Private Function Decode(data As Bytes, encoding As Text.Encodings) As String
+        ' Reject before consuming: Buoy String cannot preserve embedded NUL.
+        For i As Integer = 0 To data.Count - 1
+            If data.Item(i) = 0 Then Throw New InvalidArgumentException("Use ReadBytes for NUL-containing serial input")
+        Next
+        If encoding <> Text.Encodings.UTF8 And encoding <> Text.Encodings.ASCII And encoding <> Text.Encodings.Latin1 And encoding <> Text.Encodings.WindowsANSI Then
+            Throw New InvalidArgumentException("Serial string reads support UTF8, ASCII, Latin1, WindowsANSI; use Bytes for other encodings")
+        End If
+        Return data.ToString(encoding)
+    End Function
+
+    Public Function LookAhead(encoding As Text.Encodings = Text.Encodings.UTF8) As String
+        Return Me.Decode(Me.LookAheadBytes(), encoding)
+    End Function
+
+    Public Function Read(count As Integer, encoding As Text.Encodings = Text.Encodings.UTF8) As String
+        If count < 0 Then Throw New InvalidArgumentException("Read count must be nonnegative")
+        Dim snapshot As Bytes = Me.LookAheadBytes()
+        If count > snapshot.Count Then count = snapshot.Count
+        Dim prefix As New Bytes()
+        For i As Integer = 0 To count - 1
+            prefix.Append(snapshot.Item(i))
+        Next
+        Dim output As String = Me.Decode(prefix, encoding)
+        Me.Consume(count)
+        Return output
+    End Function
+
+    Public Function ReadAll(encoding As Text.Encodings = Text.Encodings.UTF8) As String
+        Return Me.Read(Me.BytesAvailable, encoding)
+    End Function
+
+    Public Sub Write(data As Bytes)
+        If data = Nil Then Throw New InvalidArgumentException("Serial Write requires Bytes")
+        If Not Me.IsOpen Then
+            Me.LastErrorCode = 9
+            Throw New IOException("Serial port is closed", 9)
+        End If
+        Try
+            Me.Connection.Write(data)
+        Catch e As SerialException
+            Me.NativeErrorCode = e.ErrorCode
+            Me.LastErrorCode = e.ErrorCode
+            Throw New IOException(e.Message, e.ErrorCode)
+        End Try
+    End Sub
+
+    Public Sub Write(data As String)
+        Me.Write(Bytes.FromString(data, Text.Encodings.UTF8))
+    End Sub
+
+    ' These are output line states, NOT the legacy DTR flow-control switch.
+    Public Property DataTerminalReady As Boolean
+        Get
+            If Not Me.IsOpen Then Throw New IOException("Serial port is closed")
+            Return Me.Connection.DTR
+        End Get
+        Set
+            If Not Me.IsOpen Then Throw New IOException("Serial port is closed")
+            Me.Connection.DTR = value
+        End Set
+    End Property
+
+    Public Property RequestToSend As Boolean
+        Get
+            If Not Me.IsOpen Then Throw New IOException("Serial port is closed")
+            Return Me.Connection.RTS
+        End Get
+        Set
+            If Not Me.IsOpen Then Throw New IOException("Serial port is closed")
+            Me.Connection.RTS = value
+        End Set
+    End Property
+End Class

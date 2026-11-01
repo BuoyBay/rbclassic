@@ -1,0 +1,633 @@
+' Native hooks for ClassicListBox that Buoy's ListBox does not expose:
+' row activation, key presses, header clicks and sort indicators, header
+' visibility, column titles/widths/visibility and multiple selection.
+'
+' Linux only: Buoy's ListBox is a GtkScrolledWindow around a GtkColumnView,
+' reached through public GTK 4 calls (no private structure offsets). The
+' macOS NSTableView and the Windows custom grid are not bridged yet, so
+' Attach returns False there and every native request reports failure.
+' See notes/list-native.md for the exact boundary.
+Import RBFoundation
+
+''' Receives native list events. ClassicListBox implements it; the bridge
+''' holds its client weakly.
+Public Interface ClassicListNativeClient
+    ''' A row was activated by the mouse (GTK double-click). Keyboard
+    ''' activation (Return/Enter) is filtered out and arrives as a key.
+    Sub ClassicListNativeActivated(row As Integer)
+    ''' A key was pressed while the list has focus. Return True to consume it
+    ''' before the native list handles it.
+    Function ClassicListNativeKey(keyval As Integer, codepoint As Integer, modifiers As Integer) As Boolean
+    ''' The user clicked the header of `column`.
+    Sub ClassicListNativeHeader(column As Integer)
+    ''' The native multiple-selection set changed.
+    Sub ClassicListNativeSelection()
+    ''' The visible width of the list changed.
+    Sub ClassicListNativeResized(width As Integer)
+End Interface
+
+''' Window-level key handling for a key a focused list declined. API 1
+''' raises the focused control's KeyDown before the window's Default/Cancel
+''' button acts, so a window-level handler (ClassicDesktop's push buttons)
+''' lets keys reach a focused list first and registers here to receive
+''' Return/Enter/Escape that the list's KeyDown did not consume. Return True
+''' when the key was used; the list then does not handle it natively.
+Public Interface ClassicDeclinedKeyHandler
+    Function ClassicDeclinedKey(listWidget As Ptr, keyval As Integer) As Boolean
+End Interface
+
+Private Class ClassicListNativeRef
+    Public Property Bridge As Weak ClassicListNativeBridge
+End Class
+
+Private Class ClassicListNativeTable
+    Public Shared Property Items As Map Of Integer, ClassicListNativeRef = New Map Of Integer, ClassicListNativeRef()
+    Public Shared Property NextKey As Integer = 1
+    Public Shared Property DeclinedKeys As ClassicDeclinedKeyHandler = Nil
+End Class
+
+''' Installs (Nil removes) the handler for Return/Enter/Escape a focused
+''' native list declined. One handler; a later call replaces it.
+Public Sub ClassicListNativeSetDeclinedKeyHandler(handler As ClassicDeclinedKeyHandler)
+    ClassicListNativeTable.DeclinedKeys = handler
+End Sub
+
+''' True when `focus` (a native focus widget) is inside an attached list, so
+''' the list's KeyDown sees keys before any window-level handler should act.
+''' Always False where the bridge is not implemented (macOS, Windows).
+Public Function ClassicListNativeOwnsKeys(focus As Ptr) As Boolean
+    If focus = Nil Then Return False
+    For Each entry As ClassicListNativeRef In ClassicListNativeTable.Items.Values()
+        Dim bridge As ClassicListNativeBridge = entry.Bridge
+        If bridge <> Nil Then
+            If bridge.Contains(focus) Then Return True
+        End If
+    Next
+    Return False
+End Function
+
+Private Function ClassicListNativeFind(data As Ptr) As ClassicListNativeBridge
+    Dim found As Optional Of ClassicListNativeRef = ClassicListNativeTable.Items.Get(CType(data, Integer))
+    If Not found.HasValue Then Return Nil
+    Return found.Value.Bridge
+End Function
+
+#If TargetLinux Then
+    Private Optional Declare Function LnScrollChild Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_child" (scrolled As Ptr) As Ptr
+    Private Optional Declare Function LnScrollHAdjust Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_hadjustment" (scrolled As Ptr) As Ptr
+    Private Optional Declare Function LnTypeIsA Lib "libgobject-2.0.so.0" Alias "g_type_check_instance_is_a" (instance As Ptr, gtype As UInt64) As Int32
+    Private Optional Declare Function LnColumnViewType Lib "libgtk-4.so.1" Alias "gtk_column_view_get_type" () As UInt64
+    Private Optional Declare Function LnScrolledType Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_type" () As UInt64
+    Private Optional Declare Function LnConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, handler As Ptr, data As Ptr, destroyNotify As Ptr, connectFlags As Int32) As UInt64
+    Private Optional Declare Function LnRef Lib "libgobject-2.0.so.0" Alias "g_object_ref" (obj As Ptr) As Ptr
+    Private Optional Declare Sub LnUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+    Private Optional Declare Function LnFirstChild Lib "libgtk-4.so.1" Alias "gtk_widget_get_first_child" (widget As Ptr) As Ptr
+    Private Optional Declare Function LnNextSibling Lib "libgtk-4.so.1" Alias "gtk_widget_get_next_sibling" (widget As Ptr) As Ptr
+    Private Optional Declare Function LnCssName Lib "libgtk-4.so.1" Alias "gtk_widget_get_css_name" (widget As Ptr) As Ptr
+    Private Optional Declare Sub LnSetVisible Lib "libgtk-4.so.1" Alias "gtk_widget_set_visible" (widget As Ptr, visible As Int32)
+    Private Optional Declare Function LnGetVisible Lib "libgtk-4.so.1" Alias "gtk_widget_get_visible" (widget As Ptr) As Int32
+    Private Optional Declare Function LnWidgetWidth Lib "libgtk-4.so.1" Alias "gtk_widget_get_width" (widget As Ptr) As Int32
+    Private Optional Declare Function LnIsAncestor Lib "libgtk-4.so.1" Alias "gtk_widget_is_ancestor" (widget As Ptr, ancestor As Ptr) As Int32
+    Private Optional Declare Sub LnAddController Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (widget As Ptr, controller As Ptr)
+    Private Optional Declare Function LnKeyController Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_new" () As Ptr
+    Private Optional Declare Sub LnControllerPhase Lib "libgtk-4.so.1" Alias "gtk_event_controller_set_propagation_phase" (controller As Ptr, phase As Int32)
+    Private Optional Declare Function LnKeyvalUnicode Lib "libgtk-4.so.1" Alias "gdk_keyval_to_unicode" (keyval As UInt32) As UInt32
+    Private Optional Declare Function LnShortcutModifierMask Lib "libgtk-4.so.1" Alias "gtk_accelerator_get_default_mod_mask" () As UInt32
+    Private Optional Declare Function LnViewModel Lib "libgtk-4.so.1" Alias "gtk_column_view_get_model" (view As Ptr) As Ptr
+    Private Optional Declare Sub LnViewSetModel Lib "libgtk-4.so.1" Alias "gtk_column_view_set_model" (view As Ptr, model As Ptr)
+    Private Optional Declare Function LnViewColumns Lib "libgtk-4.so.1" Alias "gtk_column_view_get_columns" (view As Ptr) As Ptr
+    Private Optional Declare Function LnViewSorter Lib "libgtk-4.so.1" Alias "gtk_column_view_get_sorter" (view As Ptr) As Ptr
+    Private Optional Declare Sub LnViewSortBy Lib "libgtk-4.so.1" Alias "gtk_column_view_sort_by_column" (view As Ptr, column As Ptr, direction As Int32)
+    Private Optional Declare Function LnSorterPrimary Lib "libgtk-4.so.1" Alias "gtk_column_view_sorter_get_primary_sort_column" (sorter As Ptr) As Ptr
+    Private Optional Declare Function LnCustomSorter Lib "libgtk-4.so.1" Alias "gtk_custom_sorter_new" (compare As Ptr, data As Ptr, destroyNotify As Ptr) As Ptr
+    Private Optional Declare Sub LnColumnSetSorter Lib "libgtk-4.so.1" Alias "gtk_column_view_column_set_sorter" (column As Ptr, sorter As Ptr)
+    Private Optional Declare Function LnColumnGetSorter Lib "libgtk-4.so.1" Alias "gtk_column_view_column_get_sorter" (column As Ptr) As Ptr
+    Private Optional Declare Sub LnColumnSetTitle Lib "libgtk-4.so.1" Alias "gtk_column_view_column_set_title" (column As Ptr, title As String)
+    Private Optional Declare Function LnColumnGetTitle Lib "libgtk-4.so.1" Alias "gtk_column_view_column_get_title" (column As Ptr) As Ptr
+    Private Optional Declare Sub LnColumnSetWidth Lib "libgtk-4.so.1" Alias "gtk_column_view_column_set_fixed_width" (column As Ptr, width As Int32)
+    Private Optional Declare Function LnColumnGetWidth Lib "libgtk-4.so.1" Alias "gtk_column_view_column_get_fixed_width" (column As Ptr) As Int32
+    Private Optional Declare Sub LnColumnSetVisible Lib "libgtk-4.so.1" Alias "gtk_column_view_column_set_visible" (column As Ptr, visible As Int32)
+    Private Optional Declare Function LnColumnGetVisible Lib "libgtk-4.so.1" Alias "gtk_column_view_column_get_visible" (column As Ptr) As Int32
+    Private Optional Declare Sub LnColumnSetResizable Lib "libgtk-4.so.1" Alias "gtk_column_view_column_set_resizable" (column As Ptr, resizable As Int32)
+    Private Optional Declare Function LnColumnGetResizable Lib "libgtk-4.so.1" Alias "gtk_column_view_column_get_resizable" (column As Ptr) As Int32
+    Private Optional Declare Function LnListCount Lib "libgio-2.0.so.0" Alias "g_list_model_get_n_items" (model As Ptr) As UInt32
+    Private Optional Declare Function LnListItem Lib "libgio-2.0.so.0" Alias "g_list_model_get_item" (model As Ptr, position As UInt32) As Ptr
+    Private Optional Declare Function LnSingleModel Lib "libgtk-4.so.1" Alias "gtk_single_selection_get_model" (selection As Ptr) As Ptr
+    Private Optional Declare Function LnSingleType Lib "libgtk-4.so.1" Alias "gtk_single_selection_get_type" () As UInt64
+    Private Optional Declare Function LnMultiNew Lib "libgtk-4.so.1" Alias "gtk_multi_selection_new" (model As Ptr) As Ptr
+    Private Optional Declare Function LnSelIsSelected Lib "libgtk-4.so.1" Alias "gtk_selection_model_is_selected" (model As Ptr, position As UInt32) As Int32
+    Private Optional Declare Function LnSelSelectItem Lib "libgtk-4.so.1" Alias "gtk_selection_model_select_item" (model As Ptr, position As UInt32, unselectRest As Int32) As Int32
+    Private Optional Declare Function LnSelUnselectAll Lib "libgtk-4.so.1" Alias "gtk_selection_model_unselect_all" (model As Ptr) As Int32
+
+    ' GDK keyvals for Return and keypad Enter (gdk/gdkkeysyms.h).
+    Const LnKeyReturn As Integer = &HFF0D
+    Const LnKeyEnter As Integer = &HFF8D
+    Const LnKeyEscape As Integer = &HFF1B
+
+    Private Sub ClassicListNativeOnActivate(view As Ptr, position As UInt32, data As Ptr)
+        Dim bridge As ClassicListNativeBridge = ClassicListNativeFind(data)
+        If bridge <> Nil Then bridge.NativeActivated(position)
+    End Sub
+
+    Private Function ClassicListNativeOnKey(controller As Ptr, keyval As UInt32, keycode As UInt32, state As UInt32, data As Ptr) As Int32
+        Dim bridge As ClassicListNativeBridge = ClassicListNativeFind(data)
+        If bridge = Nil Then Return 0
+        If bridge.NativeKey(keyval, state) Then Return 1
+        Return 0
+    End Function
+
+    Private Sub ClassicListNativeOnKeyUp(controller As Ptr, keyval As UInt32, keycode As UInt32, state As UInt32, data As Ptr)
+        Dim bridge As ClassicListNativeBridge = ClassicListNativeFind(data)
+        If bridge <> Nil Then bridge.NativeKeyReleased()
+    End Sub
+
+    Private Sub ClassicListNativeOnSorter(sorter As Ptr, change As Int32, data As Ptr)
+        Dim bridge As ClassicListNativeBridge = ClassicListNativeFind(data)
+        If bridge <> Nil Then bridge.NativeSorterChanged()
+    End Sub
+
+    Private Sub ClassicListNativeOnSelection(model As Ptr, position As UInt32, count As UInt32, data As Ptr)
+        Dim bridge As ClassicListNativeBridge = ClassicListNativeFind(data)
+        If bridge <> Nil Then bridge.NativeSelectionChanged(model)
+    End Sub
+
+    Private Sub ClassicListNativeOnAdjust(adjustment As Ptr, data As Ptr)
+        Dim bridge As ClassicListNativeBridge = ClassicListNativeFind(data)
+        If bridge <> Nil Then bridge.NativeResized()
+    End Sub
+#End If
+
+''' Connects one Buoy ListBox's native widget to a ClassicListNativeClient.
+''' Every setter returns False (and changes nothing) when the native
+''' operation is unavailable, so callers can raise a truthful error.
+Public Class ClassicListNativeBridge
+    ' Interfaces cannot be Weak, so the client object is held weakly.
+    Private Property mClient As Weak Object
+    Private Property mKey As Integer = 0
+    Private Property mScrolled As Ptr = Nil
+    Private Property mView As Ptr = Nil
+    Private Property mSingle As Ptr = Nil
+    Private Property mMulti As Ptr = Nil
+    Private Property mQuiet As Integer = 0
+    Private Property mKeyActivation As Boolean = False
+    Private Property mLastWidth As Integer = -1
+
+    Private Function Client() As ClassicListNativeClient
+        Dim owner As Object = Me.mClient
+        If owner = Nil Then Return Nil
+        Return TryCast(owner, ClassicListNativeClient)
+    End Function
+
+    ''' `owner` must implement ClassicListNativeClient. It is passed as
+    ''' Object because CType(interfaceRef, Object) raises IllegalCastException
+    ''' in Buoy 0.72 (upstream-issues/classic-wave2-listbox LISTBOX-001).
+    Public Sub Constructor(owner As Object)
+        If TryCast(owner, ClassicListNativeClient) = Nil Then
+            Throw New InvalidArgumentException("ClassicListNativeBridge owner must implement ClassicListNativeClient")
+        End If
+        Me.mClient = owner
+    End Sub
+
+    ''' True after a successful Attach on a platform this bridge supports.
+    Public ReadOnly Property Attached As Boolean
+        Get
+            Return Me.mView <> Nil
+        End Get
+    End Property
+
+    ''' Bind to a ListBox's NativeWidget. Returns False when the widget is
+    ''' not the expected native structure or the platform is not bridged.
+    Public Function Attach(nativeWidget As Ptr) As Boolean
+        If Me.mView <> Nil Then Return True
+        If nativeWidget = Nil Then Return False
+        #If TargetLinux Then
+            If LnTypeIsA(nativeWidget, LnScrolledType()) = 0 Then Return False
+            Dim view As Ptr = LnScrollChild(nativeWidget)
+            If view = Nil Then Return False
+            If LnTypeIsA(view, LnColumnViewType()) = 0 Then Return False
+            Dim model As Ptr = LnViewModel(view)
+            If model = Nil Or LnTypeIsA(model, LnSingleType()) = 0 Then Return False
+            Me.mScrolled = nativeWidget
+            Me.mView = view
+            Me.mSingle = LnRef(model)
+            Me.mKey = ClassicListNativeTable.NextKey
+            ClassicListNativeTable.NextKey = ClassicListNativeTable.NextKey + 1
+            Dim entry As New ClassicListNativeRef()
+            entry.Bridge = Me
+            ClassicListNativeTable.Items.Set(Me.mKey, entry)
+            Dim data As Ptr = CType(Me.mKey, Ptr)
+            Dim ignored As UInt64 = LnConnect(view, "activate", CType(AddressOf ClassicListNativeOnActivate, Ptr), data, Nil, 0)
+            ' Capture phase: KeyDown sees a key before the list navigates.
+            Dim keys As Ptr = LnKeyController()
+            LnControllerPhase(keys, 1)
+            ignored = LnConnect(keys, "key-pressed", CType(AddressOf ClassicListNativeOnKey, Ptr), data, Nil, 0)
+            ignored = LnConnect(keys, "key-released", CType(AddressOf ClassicListNativeOnKeyUp, Ptr), data, Nil, 0)
+            LnAddController(view, keys)
+            Dim sorter As Ptr = LnViewSorter(view)
+            If sorter <> Nil Then ignored = LnConnect(sorter, "changed", CType(AddressOf ClassicListNativeOnSorter, Ptr), data, Nil, 0)
+            Dim adjust As Ptr = LnScrollHAdjust(nativeWidget)
+            If adjust <> Nil Then ignored = LnConnect(adjust, "changed", CType(AddressOf ClassicListNativeOnAdjust, Ptr), data, Nil, 0)
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public Sub Destructor()
+        If Me.mKey <> 0 Then ClassicListNativeTable.Items.Remove(Me.mKey)
+        #If TargetLinux Then
+            If Me.mSingle <> Nil Then LnUnref(Me.mSingle)
+            If Me.mMulti <> Nil Then LnUnref(Me.mMulti)
+        #End If
+    End Sub
+
+    ' ── Inbound (called from the native callbacks) ─────────────────────
+
+    Public Sub NativeActivated(row As Integer)
+        If Me.mKeyActivation Then
+            Me.mKeyActivation = False
+            Return
+        End If
+        Dim client As ClassicListNativeClient = Me.Client()
+        If client <> Nil Then client.ClassicListNativeActivated(row)
+    End Sub
+
+    Public Function NativeKey(keyval As Integer, modifiers As Integer) As Boolean
+        Me.mKeyActivation = False
+        Dim client As ClassicListNativeClient = Me.Client()
+        If client = Nil Then Return False
+        Dim codepoint As Integer = 0
+        #If TargetLinux Then
+            codepoint = LnKeyvalUnicode(keyval)
+        #End If
+        If client.ClassicListNativeKey(keyval, codepoint, modifiers) Then Return True
+        #If TargetLinux Then
+            ' KeyDown declined: a window-level Default/Cancel button acts now.
+            ' Not inside a Try: the handler presses a button through its
+            ' native signal (see ClassicDesktop notes, CWD-001).
+            If keyval = LnKeyReturn Or keyval = LnKeyEnter Or keyval = LnKeyEscape Then
+                Dim declined As ClassicDeclinedKeyHandler = ClassicListNativeTable.DeclinedKeys
+                If declined <> Nil And (modifiers And LnShortcutModifierMask()) = 0 Then
+                    If declined.ClassicDeclinedKey(Me.mView, keyval) Then Return True
+                End If
+            End If
+            ' An unconsumed Return/Enter makes GTK activate the row; that is
+            ' not a double-click, so the next activate is dropped.
+            If keyval = LnKeyReturn Or keyval = LnKeyEnter Then Me.mKeyActivation = True
+        #End If
+        Return False
+    End Function
+
+    ''' True when `widget` is this list's view or inside it.
+    Public Function Contains(widget As Ptr) As Boolean
+        If Me.mView = Nil Or widget = Nil Then Return False
+        If widget = Me.mView Then Return True
+        #If TargetLinux Then
+            Return LnIsAncestor(widget, Me.mView) <> 0
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public Sub NativeKeyReleased()
+        Me.mKeyActivation = False
+    End Sub
+
+    Public Sub NativeSorterChanged()
+        If Me.mQuiet > 0 Then Return
+        Dim column As Integer = -1
+        #If TargetLinux Then
+            Dim primary As Ptr = LnSorterPrimary(LnViewSorter(Me.mView))
+            If primary <> Nil Then column = Me.IndexOfColumn(primary)
+        #End If
+        Dim client As ClassicListNativeClient = Me.Client()
+        If client <> Nil Then client.ClassicListNativeHeader(column)
+    End Sub
+
+    Public Sub NativeSelectionChanged(model As Ptr)
+        If Me.mQuiet > 0 Or model <> Me.mMulti Then Return
+        Dim client As ClassicListNativeClient = Me.Client()
+        If client <> Nil Then client.ClassicListNativeSelection()
+    End Sub
+
+    Public Sub NativeResized()
+        Dim width As Integer = Me.VisibleWidth()
+        If width <= 0 Or width = Me.mLastWidth Then Return
+        Me.mLastWidth = width
+        Dim client As ClassicListNativeClient = Me.Client()
+        If client <> Nil Then client.ClassicListNativeResized(width)
+    End Sub
+
+    ' ── Columns ────────────────────────────────────────────────────────
+
+    #If TargetLinux Then
+        Private Function ColumnPtr(index As Integer) As Ptr
+            If Me.mView = Nil Or index < 0 Then Return Nil
+            Dim columns As Ptr = LnViewColumns(Me.mView)
+            Dim count As Integer = LnListCount(columns)
+            If index >= count Then Return Nil
+            Dim position As UInt32 = index
+            Dim column As Ptr = LnListItem(columns, position)
+            ' The column view keeps its own reference; drop the getter's.
+            LnUnref(column)
+            Return column
+        End Function
+
+        Private Function IndexOfColumn(column As Ptr) As Integer
+            Dim columns As Ptr = LnViewColumns(Me.mView)
+            Dim count As Integer = LnListCount(columns)
+            For i As Integer = 0 To count - 1
+                If Me.ColumnPtr(i) = column Then Return i
+            Next
+            Return -1
+        End Function
+    #End If
+
+    ''' Number of native columns (visible or hidden).
+    Public Function NativeColumnCount() As Integer
+        #If TargetLinux Then
+            If Me.mView = Nil Then Return 0
+            Dim count As Integer = LnListCount(LnViewColumns(Me.mView))
+            Return count
+        #Else
+            Return 0
+        #End If
+    End Function
+
+    Public Function SetColumnTitle(index As Integer, title As String) As Boolean
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return False
+            LnColumnSetTitle(column, title)
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public Function ColumnTitle(index As Integer) As String
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return ""
+            Dim title As Ptr = LnColumnGetTitle(column)
+            If title = Nil Then Return ""
+            Return CType(CType(title, CString), String)
+        #Else
+            Return ""
+        #End If
+    End Function
+
+    Public Function SetColumnWidth(index As Integer, width As Integer) As Boolean
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return False
+            Dim value As Int32 = width
+            LnColumnSetWidth(column, value)
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    ''' Native fixed width (GTK updates it when the user drags a resizable
+    ''' column edge); -1 when unavailable.
+    Public Function ColumnWidth(index As Integer) As Integer
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return -1
+            Return LnColumnGetWidth(column)
+        #Else
+            Return -1
+        #End If
+    End Function
+
+    Public Function SetColumnVisible(index As Integer, visible As Boolean) As Boolean
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return False
+            LnColumnSetVisible(column, If(visible, 1, 0))
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public Function ColumnVisible(index As Integer) As Boolean
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return False
+            Return LnColumnGetVisible(column) <> 0
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public Function SetColumnResizable(index As Integer, resizable As Boolean) As Boolean
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return False
+            LnColumnSetResizable(column, If(resizable, 1, 0))
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public Function ColumnResizable(index As Integer) As Boolean
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return False
+            Return LnColumnGetResizable(column) <> 0
+        #Else
+            Return False
+        #End If
+    End Function
+
+    ''' Make a header clickable. The sorter compares nothing: GTK uses it
+    ''' only to toggle the header indicator and report the click, and the
+    ''' Buoy row store is never re-ordered by GTK.
+    Public Function SetColumnClickable(index As Integer, clickable As Boolean) As Boolean
+        #If TargetLinux Then
+            Dim column As Ptr = Me.ColumnPtr(index)
+            If column = Nil Then Return False
+            Me.mQuiet = Me.mQuiet + 1
+            If clickable Then
+                If LnColumnGetSorter(column) = Nil Then
+                    Dim sorter As Ptr = LnCustomSorter(Nil, Nil, Nil)
+                    LnColumnSetSorter(column, sorter)
+                    LnUnref(sorter)
+                End If
+            Else
+                LnColumnSetSorter(column, Nil)
+            End If
+            Me.mQuiet = Me.mQuiet - 1
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    ''' Show the header sort indicator: direction 1 ascending, -1 descending;
+    ''' column -1 or direction 0 clears it.
+    Public Function SetSortIndicator(column As Integer, direction As Integer) As Boolean
+        #If TargetLinux Then
+            If Me.mView = Nil Then Return False
+            Me.mQuiet = Me.mQuiet + 1
+            If column < 0 Or direction = 0 Then
+                LnViewSortBy(Me.mView, Nil, 0)
+            Else
+                Dim target As Ptr = Me.ColumnPtr(column)
+                If target <> Nil Then
+                    If direction < 0 Then
+                        LnViewSortBy(Me.mView, target, 1)
+                    Else
+                        LnViewSortBy(Me.mView, target, 0)
+                    End If
+                End If
+            End If
+            Me.mQuiet = Me.mQuiet - 1
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    ''' Header indicator state read back from GTK: the primary sorted column
+    ''' (-1 none) and its direction (1 ascending, -1 descending).
+    Public Function SortIndicatorColumn() As Integer
+        #If TargetLinux Then
+            If Me.mView = Nil Then Return -1
+            Dim primary As Ptr = LnSorterPrimary(LnViewSorter(Me.mView))
+            If primary = Nil Then Return -1
+            Return Me.IndexOfColumn(primary)
+        #Else
+            Return -1
+        #End If
+    End Function
+
+    ' ── Header ─────────────────────────────────────────────────────────
+
+    #If TargetLinux Then
+        ''' The column view's header row: its child whose CSS name is
+        ''' "header" (public widget-tree API, no offsets).
+        Private Function HeaderWidget() As Ptr
+            If Me.mView = Nil Then Return Nil
+            Dim child As Ptr = LnFirstChild(Me.mView)
+            While child <> Nil
+                Dim css As Ptr = LnCssName(child)
+                If css <> Nil Then
+                    If CType(CType(css, CString), String) = "header" Then Return child
+                End If
+                child = LnNextSibling(child)
+            Wend
+            Return Nil
+        End Function
+    #End If
+
+    Public Function SetHeaderVisible(visible As Boolean) As Boolean
+        #If TargetLinux Then
+            Dim header As Ptr = Me.HeaderWidget()
+            If header = Nil Then Return False
+            LnSetVisible(header, If(visible, 1, 0))
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public Function HeaderVisible() As Boolean
+        #If TargetLinux Then
+            Dim header As Ptr = Me.HeaderWidget()
+            If header = Nil Then Return False
+            Return LnGetVisible(header) <> 0
+        #Else
+            Return False
+        #End If
+    End Function
+
+    ''' Current width of the scrolled list (0 before it is allocated).
+    Public Function VisibleWidth() As Integer
+        #If TargetLinux Then
+            If Me.mScrolled = Nil Then Return 0
+            Return LnWidgetWidth(Me.mScrolled)
+        #Else
+            Return 0
+        #End If
+    End Function
+
+    ' ── Multiple selection ─────────────────────────────────────────────
+
+    ''' Swap the column view between the runtime's GtkSingleSelection and a
+    ''' GtkMultiSelection over the same row store. The runtime keeps reading
+    ''' its single selection, so the client owns the multiple-selection set.
+    Public Function SetMultiple(multiple As Boolean) As Boolean
+        #If TargetLinux Then
+            If Me.mView = Nil Then Return False
+            Me.mQuiet = Me.mQuiet + 1
+            If multiple Then
+                If Me.mMulti = Nil Then
+                    Dim store As Ptr = LnSingleModel(Me.mSingle)
+                    If store = Nil Then
+                        Me.mQuiet = Me.mQuiet - 1
+                        Return False
+                    End If
+                    ' gtk_multi_selection_new takes ownership of its model.
+                    Me.mMulti = LnMultiNew(LnRef(store))
+                    Dim ignored As UInt64 = LnConnect(Me.mMulti, "selection-changed", CType(AddressOf ClassicListNativeOnSelection, Ptr), CType(Me.mKey, Ptr), Nil, 0)
+                End If
+                LnViewSetModel(Me.mView, Me.mMulti)
+            Else
+                LnViewSetModel(Me.mView, Me.mSingle)
+            End If
+            Me.mQuiet = Me.mQuiet - 1
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+
+    Public ReadOnly Property Multiple As Boolean
+        Get
+            #If TargetLinux Then
+                If Me.mView = Nil Or Me.mMulti = Nil Then Return False
+                Return LnViewModel(Me.mView) = Me.mMulti
+            #Else
+                Return False
+            #End If
+        End Get
+    End Property
+
+    ''' Selected native positions in ascending order (multiple mode only).
+    Public Function SelectedRows() As Array Of Integer
+        Dim rows As Array Of Integer = []
+        #If TargetLinux Then
+            If Not Me.Multiple Then Return rows
+            Dim count As Integer = LnListCount(Me.mMulti)
+            For i As Integer = 0 To count - 1
+                Dim position As UInt32 = i
+                If LnSelIsSelected(Me.mMulti, position) <> 0 Then rows.Append(i)
+            Next
+        #End If
+        Return rows
+    End Function
+
+    ''' Replace the native multiple selection without notifying the client.
+    Public Function SelectRows(rows As Array Of Integer) As Boolean
+        #If TargetLinux Then
+            If Not Me.Multiple Then Return False
+            Me.mQuiet = Me.mQuiet + 1
+            Dim ignored As Int32 = LnSelUnselectAll(Me.mMulti)
+            Dim count As Integer = LnListCount(Me.mMulti)
+            For Each row As Integer In rows
+                If row >= 0 And row < count Then
+                    Dim position As UInt32 = row
+                    ignored = LnSelSelectItem(Me.mMulti, position, 0)
+                End If
+            Next
+            Me.mQuiet = Me.mQuiet - 1
+            Return True
+        #Else
+            Return False
+        #End If
+    End Function
+End Class

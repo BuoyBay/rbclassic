@@ -1,0 +1,1906 @@
+' ClassicGraphics — explicit REALbasic / legacy API 1 drawing adapters.
+'
+' Buoy's `Graphics` takes color, pen width and font on every call, and its
+' `New Picture(w, h, x)` third argument is a HiDPI *scale*, so a ported
+' `New Picture(w, h, 32)` compiles and silently makes a scale-32 picture. This
+' module gives ported code explicit wrapper types instead of guessing:
+'
+'   API 1 source                         rewrite
+'   New Picture(w, h, 32)            ->  New ClassicPicture(w, h, 32)
+'   New Picture(w, h)                ->  New ClassicPicture(w, h)
+'   g As Graphics (Paint parameter)  ->  g As ClassicGraphics
+'   Canvas subclass                  ->  ClassicCanvas subclass
+'   RGB / HSV / CMY(..., alpha)      ->  ClassicRGB / ClassicHSV / ClassicCMY
+'
+' `ClassicGraphics` keeps API 1's ambient state (ForeColor, TextFont,
+' TextSize, PenWidth/PenHeight, Bold/Italic/Underline, Transparency) and draws
+' through the bundled legacy shim's short-form `Graphics` extensions, so pixel
+' geometry matches the shim's probed legacy geometry (fills cover w+1 by h+1
+' pixels; strokes are centered on pixel centers). Shapes the shim cannot
+' express (asymmetric pens, elliptical corners, polygons) are filled paths
+' built on that geometry. Clip children, font metrics checked against the
+' runtime's renderer, wrapped/condensed text, a cached pixel surface,
+' Transform/FloodFill and legacy masks are also provided. Everything Buoy
+' cannot do faithfully raises an exception rather than approximating — see
+' notes/graphics.md.
+'
+' Global functions need a selective import to be callable unqualified:
+'   Public Import ClassicGraphics.{ ClassicRGB, ClassicHSV, ClassicCMY }
+
+Import RBFoundation
+
+' ── Colors ──────────────────────────────────────────────────────────────────
+' API 1 color functions take 0-255 Integer channels (HSV/CMY: 0-1 Doubles) and
+' an alpha where 0 is opaque and 255 fully transparent — the opposite of
+' Buoy's `Color.A`. Out-of-range channels are rejected: legacy does not document
+' what it does with them.
+
+Internal Sub ClassicCheckByte(value As Integer, name As String)
+    If value < 0 Or value > 255 Then
+        Throw New InvalidArgumentException(name + " must be in 0-255, got " + value.ToString())
+    End If
+End Sub
+
+Internal Sub ClassicCheckUnit(value As Double, name As String)
+    If value < 0.0 Or value > 1.0 Then
+        Throw New InvalidArgumentException(name + " must be in 0.0-1.0, got " + value.ToString())
+    End If
+End Sub
+
+''' API 1 `RGB(red, green, blue, [alpha = 0])`: channels 0-255; `alpha` 0 is
+''' opaque, 255 fully transparent. Raises InvalidArgumentException outside 0-255.
+Public Function ClassicRGB(red As Integer, green As Integer, blue As Integer, alpha As Integer = 0) As Color
+    ClassicCheckByte(red, "red")
+    ClassicCheckByte(green, "green")
+    ClassicCheckByte(blue, "blue")
+    ClassicCheckByte(alpha, "alpha")
+    Return Color.RGBA(red / 255.0, green / 255.0, blue / 255.0, 1.0 - alpha / 255.0)
+End Function
+
+''' API 1 `HSV(hue, saturation, value, [alpha = 0])`: hue, saturation and value
+''' are 0-1 (hue 1.0 is red again, as in legacy's `HSV(1.0, 1.0, 1.0)` example);
+''' `alpha` 0 is opaque, 255 fully transparent.
+Public Function ClassicHSV(hue As Double, saturation As Double, value As Double, alpha As Integer = 0) As Color
+    ClassicCheckUnit(hue, "hue")
+    ClassicCheckUnit(saturation, "saturation")
+    ClassicCheckUnit(value, "value")
+    ClassicCheckByte(alpha, "alpha")
+    Dim h As Double = hue * 6.0
+    If h >= 6.0 Then
+        h = 0.0
+    End If
+    Dim sector As Integer = Math.Floor(h)
+    Dim f As Double = h - sector
+    Dim p As Double = value * (1.0 - saturation)
+    Dim q As Double = value * (1.0 - saturation * f)
+    Dim t As Double = value * (1.0 - saturation * (1.0 - f))
+    Dim r As Double = value
+    Dim g As Double = t
+    Dim b As Double = p
+    Select Case sector
+        Case 1
+            r = q
+            g = value
+            b = p
+        Case 2
+            r = p
+            g = value
+            b = t
+        Case 3
+            r = p
+            g = q
+            b = value
+        Case 4
+            r = t
+            g = p
+            b = value
+        Case 5
+            r = value
+            g = p
+            b = q
+    End Select
+    Return Color.RGBA(r, g, b, 1.0 - alpha / 255.0)
+End Function
+
+''' API 1 `CMY(cyan, magenta, yellow, [alpha = 0])`: naive CMY, channels 0-1;
+''' `alpha` 0 is opaque, 255 fully transparent.
+Public Function ClassicCMY(cyan As Double, magenta As Double, yellow As Double, alpha As Integer = 0) As Color
+    ClassicCheckUnit(cyan, "cyan")
+    ClassicCheckUnit(magenta, "magenta")
+    ClassicCheckUnit(yellow, "yellow")
+    ClassicCheckByte(alpha, "alpha")
+    Return Color.RGBA(1.0 - cyan, 1.0 - magenta, 1.0 - yellow, 1.0 - alpha / 255.0)
+End Function
+
+' ── Pixel helpers ───────────────────────────────────────────────────────────
+
+Internal Function ClassicChannel(value As Double) As Integer
+    Dim n As Integer = Math.Round(value * 255.0)
+    If n < 0 Then
+        Return 0
+    End If
+    If n > 255 Then
+        Return 255
+    End If
+    Return n
+End Function
+
+Internal Function ClassicZeroBytes(count As Integer) As Bytes
+    Dim b As New Bytes(count)
+    For i As Integer = 1 To count
+        b.Append(0)
+    Next
+    Return b
+End Function
+
+Internal Function ClassicBacking(p As Picture) As Bytes
+    Dim size As Integer = p.Width * p.Height * 4
+    Dim b As Bytes = ClassicZeroBytes(size)
+    If p.GetBacking(b.DataPtr(), size, 0) <> size Then
+        Throw New UnsupportedOperationException("could not read the picture's pixels")
+    End If
+    Return b
+End Function
+
+Internal Function ClassicFromBacking(b As Bytes, width As Integer, height As Integer, scale As Double = 1.0) As Picture
+    Dim p As Picture = Picture.FromBuffer(b.DataPtr(), b.Count, 0, width, height)
+    If p Is Nil Then
+        Throw New UnsupportedOperationException("could not rebuild the picture's pixels")
+    End If
+    p.Scale = scale
+    Return p
+End Function
+
+' One pixel, read by drawing the source into a transparent 1x1 picture at an
+' integer offset (an exact copy) — avoids copying the whole backing store.
+Internal Function ClassicReadPixel(p As Picture, x As Integer, y As Integer) As Color
+    Dim one As New Picture(1, 1)
+    one.Graphics.DrawPicture(p, 0.0 - x, 0.0 - y)
+    Dim b As Bytes = ClassicBacking(one)
+    Return Color.RGBA(b.Item(0) / 255.0, b.Item(1) / 255.0, b.Item(2) / 255.0, b.Item(3) / 255.0)
+End Function
+
+' A copy of `p` with every pixel's alpha scaled by `factor` (0-1).
+Internal Function ClassicFaded(p As Picture, factor As Double) As Picture
+    Dim b As Bytes = ClassicBacking(p)
+    Dim i As Integer = 3
+    While i < b.Count
+        Dim a As Integer = Math.Round(b.Item(i) * factor)
+        b.SetItem(i, a)
+        i = i + 4
+    Wend
+    Return ClassicFromBacking(b, p.Width, p.Height, p.Scale)
+End Function
+
+' Mask gray level of one RGBA pixel: the rounded mean of its color channels.
+Internal Function ClassicGray(b As Bytes, i As Integer) As Integer
+    Return Math.Round((b.Item(i) + b.Item(i + 1) + b.Item(i + 2)) / 3.0)
+End Function
+
+Internal Sub ClassicCheckMap(map As Array Of Integer, name As String)
+    If map Is Nil Then
+        Throw New NilObjectException(name + " is Nil")
+    End If
+    If Array.Count(map) <> 256 Then
+        Throw New InvalidArgumentException(name + " must have 256 elements (0-255), got " + Array.Count(map).ToString())
+    End If
+    For Each v As Integer In map
+        ClassicCheckByte(v, name + " entry")
+    Next
+End Sub
+
+' ── Text metrics (Linux: Cairo toy fonts, checked against the runtime) ─────
+' On Linux, Buoy 0.72.0 draws Graphics text with Cairo's toy text API and its
+' MeasureStringWidth/MeasureStringHeight return the ink extents of that text.
+' Cairo exposes no font metrics through Buoy's Graphics, so ClassicFontFace
+' selects the same family/size/weight/slant in its own Cairo image context
+' (public libcairo API, never the runtime's NativeHandle — see BUI-001) and
+' reads `cairo_font_extents` and text advances there. Before a face is used,
+' the ink extents of a probe string in that context must equal the runtime's
+' own measurements; otherwise the face is rejected and callers raise
+' UnsupportedOperationException rather than return another font's metrics.
+
+#If TargetLinux Then
+Sequential Structure ClassicCairoFontExtents
+    Ascent As Double
+    Descent As Double
+    Height As Double
+    MaxXAdvance As Double
+    MaxYAdvance As Double
+End Structure
+
+Sequential Structure ClassicCairoTextExtents
+    XBearing As Double
+    YBearing As Double
+    Width As Double
+    Height As Double
+    XAdvance As Double
+    YAdvance As Double
+End Structure
+
+Private Optional Declare Function ClassicCairoSurface Lib "libcairo.so.2" Alias "cairo_image_surface_create" (format As Int32, width As Int32, height As Int32) As Ptr
+Private Optional Declare Function ClassicCairoCreate Lib "libcairo.so.2" Alias "cairo_create" (surface As Ptr) As Ptr
+Private Optional Declare Function ClassicCairoStatus Lib "libcairo.so.2" Alias "cairo_status" (cr As Ptr) As Int32
+Private Optional Declare Sub ClassicCairoSelectFace Lib "libcairo.so.2" Alias "cairo_select_font_face" (cr As Ptr, family As String, slant As Int32, weight As Int32)
+Private Optional Declare Sub ClassicCairoFontSize Lib "libcairo.so.2" Alias "cairo_set_font_size" (cr As Ptr, size As Double)
+Private Optional Declare Sub ClassicCairoFontExtentsOf Lib "libcairo.so.2" Alias "cairo_font_extents" (cr As Ptr, ByRef extents As ClassicCairoFontExtents)
+Private Optional Declare Sub ClassicCairoTextExtentsOf Lib "libcairo.so.2" Alias "cairo_text_extents" (cr As Ptr, text As String, ByRef extents As ClassicCairoTextExtents)
+#End If
+
+''' Font metrics of one TextFont/TextSize/Bold/Italic combination, as drawn
+''' by the native Graphics. Obtain through `ClassicFontFace.Resolve`.
+Internal Class ClassicFontFace
+    Public Shared Property Faces As Map Of String, ClassicFontFace = New Map Of String, ClassicFontFace()
+    Public Shared Property Failures As Map Of String, String = New Map Of String, String()
+    Public Shared Property Context As Ptr = Nil
+
+    Public Property Family As String
+    Public Property Size As Double
+    Public Property Bold As Boolean
+    Public Property Italic As Boolean
+    Public Property Ascent As Double
+    Public Property Descent As Double
+    Public Property LineHeight As Double
+
+    ' Ink-extent probe compared with the runtime: mixed widths, ascenders,
+    ' descenders, digits and accented capitals.
+    Public Shared Function ProbeText() As String
+        Return "Hamburgefonstiv gjpqy 0123 ÅÉ"
+    End Function
+
+    ''' The verified face, or raises UnsupportedOperationException with the
+    ''' reason (non-Linux target, missing libcairo, or a face mismatch).
+    Public Shared Function Resolve(family As String, size As Double, bold As Boolean, italic As Boolean) As ClassicFontFace
+        Dim key As String = family + "|" + size.ToString() + "|" + bold.ToString() + "|" + italic.ToString()
+        Dim found As Optional Of ClassicFontFace = ClassicFontFace.Faces.Get(key)
+        If found.HasValue Then
+            Return found.Value
+        End If
+        Dim failed As Optional Of String = ClassicFontFace.Failures.Get(key)
+        If failed.HasValue Then
+            Throw New UnsupportedOperationException(failed.Value)
+        End If
+        Dim reason As String = ""
+        Dim face As ClassicFontFace = ClassicFontFace.Build(family, size, bold, italic, reason)
+        If face Is Nil Then
+            If ClassicFontFace.Failures.Count > 256 Then
+                ClassicFontFace.Failures.Clear()
+            End If
+            ClassicFontFace.Failures.Set(key, reason)
+            Throw New UnsupportedOperationException(reason)
+        End If
+        If ClassicFontFace.Faces.Count > 256 Then
+            ClassicFontFace.Faces.Clear()
+        End If
+        ClassicFontFace.Faces.Set(key, face)
+        Return face
+    End Function
+
+    ''' True when `Resolve` succeeds for these settings.
+    Public Shared Function Available(family As String, size As Double, bold As Boolean, italic As Boolean) As Boolean
+        Try
+            Dim face As ClassicFontFace = ClassicFontFace.Resolve(family, size, bold, italic)
+            Return face IsNot Nil
+        Catch e As UnsupportedOperationException
+            Return False
+        End Try
+        Return False
+    End Function
+
+    Private Shared Function Build(family As String, size As Double, bold As Boolean, italic As Boolean, ByRef reason As String) As ClassicFontFace
+#If TargetLinux Then
+        If Not System.IsLibraryAvailable("libcairo.so.2") Then
+            reason = "font metrics need libcairo.so.2, which is not available"
+            Return Nil
+        End If
+        If ClassicFontFace.Context = Nil Then
+            Dim surface As Ptr = ClassicCairoSurface(0, 8, 8)
+            Dim cr As Ptr = ClassicCairoCreate(surface)
+            If cr = Nil Or ClassicCairoStatus(cr) <> 0 Then
+                reason = "could not create a Cairo context for font metrics"
+                Return Nil
+            End If
+            ClassicFontFace.Context = cr
+        End If
+        Dim face As New ClassicFontFace()
+        face.Family = family
+        face.Size = size
+        face.Bold = bold
+        face.Italic = italic
+        face.Select()
+        Dim fe As ClassicCairoFontExtents
+        ClassicCairoFontExtentsOf(ClassicFontFace.Context, fe)
+        face.Ascent = fe.Ascent
+        face.Descent = fe.Descent
+        face.LineHeight = fe.Height
+        ' The runtime's own ink measurement of the probe, in a scratch context.
+        Dim scratch As New Picture(1, 1)
+        Dim g As Graphics = scratch.Graphics
+        g.Bold = bold
+        g.Italic = italic
+        Dim runtimeWidth As Double = g.MeasureStringWidth(ClassicFontFace.ProbeText(), family, size)
+        Dim runtimeHeight As Double = g.MeasureStringHeight(ClassicFontFace.ProbeText(), family, size)
+        Dim te As ClassicCairoTextExtents
+        ClassicCairoTextExtentsOf(ClassicFontFace.Context, ClassicFontFace.ProbeText(), te)
+        If ClassicCairoStatus(ClassicFontFace.Context) <> 0 Then
+            reason = "Cairo could not select the font '" + family + "'"
+            Return Nil
+        End If
+        If Math.Abs(te.Width - runtimeWidth) > 0.01 Or Math.Abs(te.Height - runtimeHeight) > 0.01 Then
+            reason = "font metrics for '" + family + "' could not be matched to the face the runtime draws (ink " + te.Width.ToString() + "x" + te.Height.ToString() + " vs runtime " + runtimeWidth.ToString() + "x" + runtimeHeight.ToString() + ")"
+            Return Nil
+        End If
+        Return face
+#Else
+        reason = "font ascent and line height are only available on Linux (no native font-metrics API in this Buoy runtime on this target)"
+        Return Nil
+#End If
+    End Function
+
+#If TargetLinux Then
+    Private Sub Select()
+        Dim slant As Int32 = 0
+        If Me.Italic Then
+            slant = 1
+        End If
+        Dim weight As Int32 = 0
+        If Me.Bold Then
+            weight = 1
+        End If
+        ClassicCairoSelectFace(ClassicFontFace.Context, Me.Family, slant, weight)
+        ClassicCairoFontSize(ClassicFontFace.Context, Me.Size)
+    End Sub
+#End If
+
+    ''' Horizontal advance of `text` (one line) in this face.
+    Public Function Advance(text As String) As Double
+#If TargetLinux Then
+        If String.Len(text) = 0 Then
+            Return 0.0
+        End If
+        Me.Select()
+        Dim te As ClassicCairoTextExtents
+        ClassicCairoTextExtentsOf(ClassicFontFace.Context, text, te)
+        Return te.XAdvance
+#Else
+        Throw New UnsupportedOperationException("text advances are only available on Linux")
+#End If
+    End Function
+End Class
+
+' ── Text clusters ───────────────────────────────────────────────────────────
+' Wrapping and condensing never split a character from the combining marks,
+' variation selectors, emoji modifiers or zero-width-joiner sequence that
+' follow it. This is a deliberately small rule set, not full UAX #29
+' grapheme segmentation (Hangul jamo and Indic conjuncts are not joined).
+
+Internal Function ClassicJoinsPrevious(code As Integer) As Boolean
+    If code >= &H300 And code <= &H36F Then
+        Return True
+    End If
+    If code >= &H1AB0 And code <= &H1AFF Then
+        Return True
+    End If
+    If code >= &H1DC0 And code <= &H1DFF Then
+        Return True
+    End If
+    If code >= &H20D0 And code <= &H20FF Then
+        Return True
+    End If
+    If code >= &HFE00 And code <= &HFE0F Then
+        Return True
+    End If
+    If code >= &HFE20 And code <= &HFE2F Then
+        Return True
+    End If
+    If code = &H200D Then
+        Return True
+    End If
+    If code >= &H1F3FB And code <= &H1F3FF Then
+        Return True
+    End If
+    If code >= &HE0100 And code <= &HE01EF Then
+        Return True
+    End If
+    Return False
+End Function
+
+Internal Function ClassicClusters(text As String) As Array Of String
+    Dim clusters As Array Of String = []
+    Dim afterJoiner As Boolean = False
+    For Each ch As String In String.Chars(text)
+        Dim code As Integer = String.Asc(ch)
+        Dim n As Integer = Array.Count(clusters)
+        If n > 0 And (afterJoiner Or ClassicJoinsPrevious(code)) Then
+            clusters(n - 1) = clusters(n - 1) + ch
+        Else
+            Array.Append(clusters, ch)
+        End If
+        afterJoiner = code = &H200D
+    Next
+    Return clusters
+End Function
+
+Internal Function ClassicOneLine(text As String) As String
+    Dim oneLine As String = String.Replace(text, "\r\n", " ")
+    oneLine = String.Replace(oneLine, "\r", " ")
+    Return String.Replace(oneLine, "\n", " ")
+End Function
+
+' ── Paths ───────────────────────────────────────────────────────────────────
+' Rounded rectangles with elliptical corners (rx, ry clamped to half the
+' size), traced clockwise or counter-clockwise so a reversed inner subpath
+' cuts a hole under both the nonzero and even-odd fill rules. Corners are
+' quarter ellipses approximated by the standard cubic (k = 0.5523).
+
+Internal Sub ClassicAddRoundRect(g As Graphics, x As Double, y As Double, w As Double, h As Double, rx As Double, ry As Double, reverse As Boolean)
+    Dim k As Double = 0.5522847498
+    Dim ax As Double = Math.Max(0.0, Math.Min(rx, w / 2.0))
+    Dim ay As Double = Math.Max(0.0, Math.Min(ry, h / 2.0))
+    Dim r As Double = x + w
+    Dim b As Double = y + h
+    g.MoveTo(x + ax, y)
+    If Not reverse Then
+        g.LineTo(r - ax, y)
+        g.CurveTo(r - ax + k * ax, y, r, y + ay - k * ay, r, y + ay)
+        g.LineTo(r, b - ay)
+        g.CurveTo(r, b - ay + k * ay, r - ax + k * ax, b, r - ax, b)
+        g.LineTo(x + ax, b)
+        g.CurveTo(x + ax - k * ax, b, x, b - ay + k * ay, x, b - ay)
+        g.LineTo(x, y + ay)
+        g.CurveTo(x, y + ay - k * ay, x + ax - k * ax, y, x + ax, y)
+    Else
+        g.CurveTo(x + ax - k * ax, y, x, y + ay - k * ay, x, y + ay)
+        g.LineTo(x, b - ay)
+        g.CurveTo(x, b - ay + k * ay, x + ax - k * ax, b, x + ax, b)
+        g.LineTo(r - ax, b)
+        g.CurveTo(r - ax + k * ax, b, r, b - ay + k * ay, r, b - ay)
+        g.LineTo(r, y + ay)
+        g.CurveTo(r, y + ay - k * ay, r - ax + k * ax, y, r - ax, y)
+    End If
+    g.ClosePath()
+End Sub
+
+' Fills the ring between an outer rounded rectangle and an inner one inset by
+' (insetX, insetY) with radii reduced by the same amounts.
+Internal Sub ClassicFillRing(g As Graphics, x As Double, y As Double, w As Double, h As Double, rx As Double, ry As Double, insetX As Double, insetY As Double, c As Color)
+    g.BeginPath()
+    ClassicAddRoundRect(g, x, y, w, h, rx, ry, False)
+    Dim iw As Double = w - 2.0 * insetX
+    Dim ih As Double = h - 2.0 * insetY
+    If iw > 0.0 And ih > 0.0 Then
+        Dim irx As Double = 0.0
+        Dim iry As Double = 0.0
+        If rx > 0.0 And ry > 0.0 Then
+            irx = Math.Max(0.0, rx - insetX)
+            iry = Math.Max(0.0, ry - insetY)
+        End If
+        ClassicAddRoundRect(g, x + insetX, y + insetY, iw, ih, irx, iry, True)
+    End If
+    g.FillPath(c)
+End Sub
+
+' Cross product of OA x OB for the convex hull.
+Internal Function ClassicCross(ox As Double, oy As Double, ax As Double, ay As Double, bx As Double, by As Double) As Double
+    Return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+End Function
+
+' Fills the convex hull of the points (x0, y0, x1, y1, ...) — Andrew's
+' monotone chain over points sorted by x then y.
+Internal Sub ClassicFillHull(g As Graphics, coords As Array Of Double, c As Color)
+    Dim n As Integer = Array.Count(coords) \ 2
+    Dim xs As Array Of Double = []
+    Dim ys As Array Of Double = []
+    For i As Integer = 0 To n - 1
+        ' insertion sort by (x, y)
+        Dim px As Double = coords(2 * i)
+        Dim py As Double = coords(2 * i + 1)
+        Dim at As Integer = Array.Count(xs)
+        While at > 0 And (xs(at - 1) > px Or (xs(at - 1) = px And ys(at - 1) > py))
+            at = at - 1
+        Wend
+        Array.Insert(xs, at, px)
+        Array.Insert(ys, at, py)
+    Next
+    Dim hx As Array Of Double = []
+    Dim hy As Array Of Double = []
+    For pass As Integer = 0 To 1
+        Dim floor As Integer = Array.Count(hx)
+        For j As Integer = 0 To n - 1
+            Dim i As Integer = j
+            If pass = 1 Then
+                i = n - 1 - j
+            End If
+            While Array.Count(hx) >= floor + 2 And ClassicCross(hx(Array.Count(hx) - 2), hy(Array.Count(hy) - 2), hx(Array.Count(hx) - 1), hy(Array.Count(hy) - 1), xs(i), ys(i)) <= 0.0
+                Array.RemoveAt(hx, Array.Count(hx) - 1)
+                Array.RemoveAt(hy, Array.Count(hy) - 1)
+            Wend
+            Array.Append(hx, xs(i))
+            Array.Append(hy, ys(i))
+        Next
+        Array.RemoveAt(hx, Array.Count(hx) - 1)
+        Array.RemoveAt(hy, Array.Count(hy) - 1)
+    Next
+    If Array.Count(hx) < 3 Then
+        Return
+    End If
+    g.BeginPath()
+    g.MoveTo(hx(0), hy(0))
+    For i As Integer = 1 To Array.Count(hx) - 1
+        g.LineTo(hx(i), hy(i))
+    Next
+    g.ClosePath()
+    g.FillPath(c)
+End Sub
+
+' ── Picture ─────────────────────────────────────────────────────────────────
+
+''' API 1 `Picture` with the old constructors' meaning. `New ClassicPicture(w,
+''' h)` has an alpha channel and starts fully transparent; `New
+''' ClassicPicture(w, h, 24 | 32)` is a legacy picture that starts opaque white
+''' and is returned to white by `ClearRect`. Depth 0 (vector Object2D
+''' pictures) raises UnsupportedOperationException, any other depth
+''' InvalidArgumentException, and sizes outside 1-32767 OutOfBoundsException —
+''' the exceptions legacy documents for this constructor.
+'''
+''' Pixels live in a native `Picture`, exposed as `NativePicture`. Pixel
+''' operations Buoy cannot do in place (translucent `Pixel` writes,
+''' `ClearRect` on an alpha picture, `Transform`, `FloodFill`, `ApplyMask`)
+''' edit a cached straight-RGBA copy; the native picture is rebuilt once, on
+''' the next native draw or `NativePicture` read, as a new object with the
+''' same HiDPI scale. Read `NativePicture` again after pixel operations, and
+''' before each batch of direct native drawing, rather than keeping an old
+''' reference.
+'''
+''' Legacy (non-alpha) pictures support API 1 masks (`Mask`, `ApplyMask`,
+''' `CopyMask`) and `Transparent = 1`. `NativePicture` holds the unmasked
+''' colors; `DrawPicture`, `ClassicCanvas.Backdrop` and `CompositedPicture`
+''' apply the mask.
+Public Class ClassicPicture
+    Internal Property mNative As Picture
+    Internal Property mHasAlpha As Boolean = True
+    Private Property mGraphics As ClassicGraphics
+    Private Property mSurface As ClassicRGBSurface
+    Private Property mCache As Bytes
+    Private Property mCacheValid As Boolean = False
+    Private Property mCacheDirty As Boolean = False
+    Private Property mMask As ClassicPicture
+    Private Property mTransparent As Integer = 0
+
+    ''' API 1 `New Picture(width, height)`: alpha channel, initially transparent.
+    Public Sub Constructor(width As Integer, height As Integer)
+        Me.Init(width, height, True)
+    End Sub
+
+    ''' API 1 `New Picture(width, height, depth)`: depth 24 or 32 makes a
+    ''' legacy, initially opaque white picture (24 is accepted for source
+    ''' compatibility and is 32-bit, as in legacy).
+    Public Sub Constructor(width As Integer, height As Integer, depth As Integer)
+        If depth = 0 Then
+            Throw New UnsupportedOperationException("depth 0 vector pictures (Object2D) are not supported")
+        End If
+        If depth <> 24 And depth <> 32 Then
+            Throw New InvalidArgumentException("picture depth must be 0, 24 or 32, got " + depth.ToString())
+        End If
+        Me.Init(width, height, False)
+    End Sub
+
+    ''' Wraps an existing Buoy `Picture` (loaded, decoded or drawn) as an
+    ''' alpha-channel picture. Raises NilObjectException for Nil.
+    Public Sub Constructor(native As Picture)
+        If native Is Nil Then
+            Throw New NilObjectException("picture is Nil")
+        End If
+        Me.mNative = native
+        Me.mHasAlpha = True
+    End Sub
+
+    Private Sub Init(width As Integer, height As Integer, hasAlpha As Boolean)
+        If width < 1 Or width > 32767 Or height < 1 Or height > 32767 Then
+            Throw New OutOfBoundsException("picture width and height must be in 1-32767")
+        End If
+        Me.mNative = New Picture(width, height)
+        Me.mHasAlpha = hasAlpha
+        If Not hasAlpha Then
+            Me.mNative.Graphics.FillRect(0.0, 0.0, width, height, Color.White)
+        End If
+    End Sub
+
+    ''' The native picture holding the (unmasked) pixels. Reading it applies
+    ''' pending pixel edits (see the class note).
+    Public ReadOnly Property NativePicture As Picture
+        Get
+            Return Me.ForDrawing()
+        End Get
+    End Property
+
+    ''' A snapshot of the picture as it is drawn: for a legacy picture with a
+    ''' mask or `Transparent = 1`, a new alpha Picture with the mask applied
+    ''' (white mask hides, black shows; gray is partial); otherwise the
+    ''' current native picture.
+    Public ReadOnly Property CompositedPicture As Picture
+        Get
+            Return Me.Composite()
+        End Get
+    End Property
+
+    ''' API 1 `Picture.Width` in pixels.
+    Public ReadOnly Property Width As Integer
+        Get
+            Return Me.mNative.Width
+        End Get
+    End Property
+
+    ''' API 1 `Picture.Height` in pixels.
+    Public ReadOnly Property Height As Integer
+        Get
+            Return Me.mNative.Height
+        End Get
+    End Property
+
+    ''' API 1 `Picture.Depth` — always 32 for a pixel picture.
+    Public ReadOnly Property Depth As Integer
+        Get
+            Return 32
+        End Get
+    End Property
+
+    ''' API 1 `Picture.HasAlphaChannel` — False for depth-constructed pictures.
+    Public ReadOnly Property HasAlphaChannel As Boolean
+        Get
+            Return Me.mHasAlpha
+        End Get
+    End Property
+
+    ''' API 1 `Picture.Graphics` — the same ClassicGraphics every time, so its
+    ''' ForeColor/TextFont/pen state persists across reads.
+    Public ReadOnly Property Graphics As ClassicGraphics
+        Get
+            If Me.mGraphics Is Nil Then
+                Me.mGraphics = New ClassicGraphics(Me)
+            End If
+            Return Me.mGraphics
+        End Get
+    End Property
+
+    ''' API 1 `Picture.RGBSurface` — direct pixel access (see ClassicRGBSurface).
+    Public ReadOnly Property RGBSurface As ClassicRGBSurface
+        Get
+            If Me.mSurface Is Nil Then
+                Me.mSurface = New ClassicRGBSurface(Me)
+            End If
+            Return Me.mSurface
+        End Get
+    End Property
+
+    ''' API 1 `Picture.Transparent`: 0 (opaque) or 1 (white pixels are drawn
+    ''' transparent). Only legacy pictures can use 1; an alpha picture raises
+    ''' UnsupportedOperationException, other values InvalidArgumentException.
+    Public Property Transparent As Integer
+        Get
+            Return Me.mTransparent
+        End Get
+        Set
+            If value <> 0 And value <> 1 Then
+                Throw New InvalidArgumentException("Transparent must be 0 or 1")
+            End If
+            If value = 1 And Me.mHasAlpha Then
+                Throw New UnsupportedOperationException("Transparent = 1 needs a picture without an alpha channel")
+            End If
+            Me.mTransparent = value
+        End Set
+    End Property
+
+    ''' API 1 `Picture.Mask([createIfMissing = True])`: the live mask of a
+    ''' legacy picture (white hides, black shows). A new mask starts black, so
+    ''' creating it does not change the picture's appearance (legacy does not
+    ''' document the initial contents). Returns Nil for alpha pictures, as
+    ''' legacy documents, and when no mask exists and createIfMissing is False.
+    Public Function Mask(createIfMissing As Boolean = True) As ClassicPicture
+        If Me.mHasAlpha Then
+            Return Nil
+        End If
+        If Me.mMask Is Nil And createIfMissing Then
+            Dim m As New ClassicPicture(Me.Width, Me.Height, 32)
+            m.mNative.Graphics.FillRect(0.0, 0.0, Me.Width, Me.Height, Color.Black)
+            Me.mMask = m
+        End If
+        Return Me.mMask
+    End Function
+
+    ''' API 1 `Picture.ApplyMask(mask)`: on an alpha picture the alpha channel
+    ''' becomes 255 minus the mask's gray level (the mean of its R, G and B);
+    ''' on a legacy picture the mask is replaced by a copy of `mask`. The mask
+    ''' must have the picture's size (InvalidArgumentException otherwise; legacy
+    ''' leaves other sizes undefined). Fully transparent pixels of an alpha
+    ''' picture carry no color in premultiplied storage, so revealing them
+    ''' shows black.
+    Public Sub ApplyMask(theMask As ClassicPicture)
+        If theMask Is Nil Then
+            Throw New NilObjectException("mask is Nil")
+        End If
+        If theMask.Width <> Me.Width Or theMask.Height <> Me.Height Then
+            Throw New InvalidArgumentException("mask size must equal the picture size")
+        End If
+        Dim m As Bytes = theMask.Snapshot()
+        If Me.mHasAlpha Then
+            Me.EnsureCache()
+            Dim i As Integer = 0
+            While i < Me.mCache.Count
+                If Me.mCache.Item(i + 3) = 0 Then
+                    Me.mCache.SetItem(i, 0)
+                    Me.mCache.SetItem(i + 1, 0)
+                    Me.mCache.SetItem(i + 2, 0)
+                End If
+                Me.mCache.SetItem(i + 3, 255 - ClassicGray(m, i))
+                i = i + 4
+            Wend
+            Me.mCacheDirty = True
+        Else
+            Dim copy As New ClassicPicture(Me.Width, Me.Height, 32)
+            copy.mNative = ClassicFromBacking(m, Me.Width, Me.Height, 1.0)
+            Me.mMask = copy
+        End If
+    End Sub
+
+    ''' API 1 `Picture.CopyMask`: for an alpha picture a new legacy picture
+    ''' whose gray level is 255 minus each pixel's alpha; for a legacy picture
+    ''' a copy of its mask, or Nil when it has none. The copy is not updated
+    ''' by later drawing.
+    Public Function CopyMask() As ClassicPicture
+        If Not Me.mHasAlpha Then
+            If Me.mMask Is Nil Then
+                Return Nil
+            End If
+            Dim copy As New ClassicPicture(Me.Width, Me.Height, 32)
+            copy.mNative = ClassicFromBacking(Me.mMask.Snapshot(), Me.Width, Me.Height, 1.0)
+            Return copy
+        End If
+        Dim b As Bytes = Me.Snapshot()
+        Dim i As Integer = 0
+        While i < b.Count
+            Dim gray As Integer = 255 - b.Item(i + 3)
+            b.SetItem(i, gray)
+            b.SetItem(i + 1, gray)
+            b.SetItem(i + 2, gray)
+            b.SetItem(i + 3, 255)
+            i = i + 4
+        Wend
+        Dim masked As New ClassicPicture(Me.Width, Me.Height, 32)
+        masked.mNative = ClassicFromBacking(b, Me.Width, Me.Height, 1.0)
+        Return masked
+    End Function
+
+    ' ── pixel cache ──
+
+    Private Sub EnsureCache()
+        If Not Me.mCacheValid Then
+            Me.mCache = ClassicBacking(Me.mNative)
+            Me.mCacheValid = True
+            Me.mCacheDirty = False
+        End If
+    End Sub
+
+    Private Sub Flush()
+        If Me.mCacheDirty Then
+            Me.mNative = ClassicFromBacking(Me.mCache, Me.mNative.Width, Me.mNative.Height, Me.mNative.Scale)
+            Me.mCacheDirty = False
+        End If
+    End Sub
+
+    ' The native picture about to be drawn into: pending edits applied and
+    ' the cache dropped, because native drawing changes the pixels.
+    Internal Function ForDrawing() As Picture
+        Me.Flush()
+        Me.mCacheValid = False
+        Me.mCache = Nil
+        Return Me.mNative
+    End Function
+
+    ' The native picture for reading only (cache kept).
+    Internal Function ForReading() As Picture
+        Me.Flush()
+        Return Me.mNative
+    End Function
+
+    ' A private straight-RGBA copy of the current pixels.
+    Internal Function Snapshot() As Bytes
+        If Me.mCacheValid Then
+            Dim copy As New Bytes(Me.mCache.Count)
+            copy.Append(Me.mCache)
+            Return copy
+        End If
+        Return ClassicBacking(Me.mNative)
+    End Function
+
+    ' The picture as drawn (mask / Transparent applied for legacy pictures).
+    Internal Function Composite() As Picture
+        If Me.mHasAlpha Or (Me.mMask Is Nil And Me.mTransparent = 0) Then
+            Return Me.ForReading()
+        End If
+        Dim b As Bytes = Me.Snapshot()
+        Dim m As Bytes = Nil
+        If Me.mMask IsNot Nil Then
+            m = Me.mMask.Snapshot()
+        End If
+        Dim i As Integer = 0
+        While i < b.Count
+            Dim a As Integer = 255
+            If m IsNot Nil Then
+                a = 255 - ClassicGray(m, i)
+            End If
+            If Me.mTransparent = 1 And b.Item(i) = 255 And b.Item(i + 1) = 255 And b.Item(i + 2) = 255 Then
+                a = 0
+            End If
+            b.SetItem(i + 3, a)
+            i = i + 4
+        Wend
+        Return ClassicFromBacking(b, Me.Width, Me.Height, Me.mNative.Scale)
+    End Function
+
+    Internal Function GetPixel(x As Integer, y As Integer) As Color
+        Me.CheckPoint(x, y)
+        If Me.mCacheValid Then
+            Dim i As Integer = (y * Me.mNative.Width + x) * 4
+            If Me.mCache.Item(i + 3) = 0 Then
+                ' Premultiplied storage keeps no color for a transparent pixel.
+                Return Color.RGBA(0.0, 0.0, 0.0, 0.0)
+            End If
+            Return Color.RGBA(Me.mCache.Item(i) / 255.0, Me.mCache.Item(i + 1) / 255.0, Me.mCache.Item(i + 2) / 255.0, Me.mCache.Item(i + 3) / 255.0)
+        End If
+        Return ClassicReadPixel(Me.mNative, x, y)
+    End Function
+
+    Internal Sub SetPixel(x As Integer, y As Integer, c As Color)
+        If c Is Nil Then
+            Throw New NilObjectException("color is Nil")
+        End If
+        Me.CheckPoint(x, y)
+        If c.A < 1.0 And Not Me.mHasAlpha Then
+            Throw New UnsupportedOperationException("a picture without an alpha channel cannot store a translucent pixel")
+        End If
+        If Not Me.mCacheValid And c.A >= 1.0 Then
+            ' An opaque 1x1 fill replaces the pixel exactly, in place.
+            Me.mNative.Graphics.FillRect(x, y, 1.0, 1.0, c)
+            Return
+        End If
+        Me.EnsureCache()
+        Me.WriteCache(x, y, ClassicChannel(c.R), ClassicChannel(c.G), ClassicChannel(c.B), ClassicChannel(c.A))
+        Me.mCacheDirty = True
+    End Sub
+
+    Private Sub WriteCache(x As Integer, y As Integer, r As Integer, g As Integer, b As Integer, a As Integer)
+        Dim i As Integer = (y * Me.mNative.Width + x) * 4
+        Me.mCache.SetItem(i, r)
+        Me.mCache.SetItem(i + 1, g)
+        Me.mCache.SetItem(i + 2, b)
+        Me.mCache.SetItem(i + 3, a)
+    End Sub
+
+    ' Replaces the integer rectangle (clipped to the picture) with transparent
+    ' (alpha picture) or white (legacy picture).
+    Internal Sub Clear(x As Integer, y As Integer, w As Integer, h As Integer)
+        Dim x0 As Integer = Math.Max(x, 0)
+        Dim y0 As Integer = Math.Max(y, 0)
+        Dim x1 As Integer = Math.Min(x + w, Me.Width)
+        Dim y1 As Integer = Math.Min(y + h, Me.Height)
+        If x1 <= x0 Or y1 <= y0 Then
+            Return
+        End If
+        If Not Me.mHasAlpha And Not Me.mCacheValid Then
+            Me.mNative.Graphics.FillRect(x0, y0, x1 - x0, y1 - y0, Color.White)
+            Return
+        End If
+        Me.EnsureCache()
+        Dim v As Integer = 0
+        If Not Me.mHasAlpha Then
+            v = 255
+        End If
+        For yy As Integer = y0 To y1 - 1
+            For xx As Integer = x0 To x1 - 1
+                Me.WriteCache(xx, yy, v, v, v, v)
+            Next
+        Next
+        Me.mCacheDirty = True
+    End Sub
+
+    Internal Sub ApplyTransform(redMap As Array Of Integer, greenMap As Array Of Integer, blueMap As Array Of Integer)
+        ClassicCheckMap(redMap, "redMap")
+        ClassicCheckMap(greenMap, "greenMap")
+        ClassicCheckMap(blueMap, "blueMap")
+        Me.EnsureCache()
+        Dim i As Integer = 0
+        While i < Me.mCache.Count
+            Me.mCache.SetItem(i, redMap(Me.mCache.Item(i)))
+            Me.mCache.SetItem(i + 1, greenMap(Me.mCache.Item(i + 1)))
+            Me.mCache.SetItem(i + 2, blueMap(Me.mCache.Item(i + 2)))
+            i = i + 4
+        Wend
+        Me.mCacheDirty = True
+    End Sub
+
+    ' 4-connected flood fill of the pixels whose RGBA equals the seed's.
+    Internal Sub Flood(x As Integer, y As Integer, c As Color)
+        If c Is Nil Then
+            Throw New NilObjectException("color is Nil")
+        End If
+        Me.CheckPoint(x, y)
+        If c.A < 1.0 And Not Me.mHasAlpha Then
+            Throw New UnsupportedOperationException("a picture without an alpha channel cannot store a translucent pixel")
+        End If
+        Me.EnsureCache()
+        Dim w As Integer = Me.Width
+        Dim h As Integer = Me.Height
+        Dim seed As Integer = (y * w + x) * 4
+        Dim sr As Integer = Me.mCache.Item(seed)
+        Dim sg As Integer = Me.mCache.Item(seed + 1)
+        Dim sb As Integer = Me.mCache.Item(seed + 2)
+        Dim sa As Integer = Me.mCache.Item(seed + 3)
+        Dim fr As Integer = ClassicChannel(c.R)
+        Dim fg As Integer = ClassicChannel(c.G)
+        Dim fb As Integer = ClassicChannel(c.B)
+        Dim fa As Integer = ClassicChannel(c.A)
+        If sr = fr And sg = fg And sb = fb And sa = fa Then
+            Return
+        End If
+        Dim stack As Array Of Integer = []
+        Array.Append(stack, y * w + x)
+        While Array.Count(stack) > 0
+            Dim p As Integer = stack(Array.Count(stack) - 1)
+            Array.RemoveAt(stack, Array.Count(stack) - 1)
+            Dim py As Integer = p \ w
+            Dim left As Integer = p - py * w
+            ' Scan left and right along the row.
+            While left > 0 And Me.Matches(py * w + left - 1, sr, sg, sb, sa)
+                left = left - 1
+            Wend
+            Dim px As Integer = left
+            Dim aboveOpen As Boolean = False
+            Dim belowOpen As Boolean = False
+            While px < w And Me.Matches(py * w + px, sr, sg, sb, sa)
+                Me.WriteCache(px, py, fr, fg, fb, fa)
+                If py > 0 Then
+                    If Me.Matches((py - 1) * w + px, sr, sg, sb, sa) Then
+                        If Not aboveOpen Then
+                            Array.Append(stack, (py - 1) * w + px)
+                            aboveOpen = True
+                        End If
+                    Else
+                        aboveOpen = False
+                    End If
+                End If
+                If py < h - 1 Then
+                    If Me.Matches((py + 1) * w + px, sr, sg, sb, sa) Then
+                        If Not belowOpen Then
+                            Array.Append(stack, (py + 1) * w + px)
+                            belowOpen = True
+                        End If
+                    Else
+                        belowOpen = False
+                    End If
+                End If
+                px = px + 1
+            Wend
+        Wend
+        Me.mCacheDirty = True
+    End Sub
+
+    Private Function Matches(index As Integer, r As Integer, g As Integer, b As Integer, a As Integer) As Boolean
+        Dim i As Integer = index * 4
+        Return Me.mCache.Item(i) = r And Me.mCache.Item(i + 1) = g And Me.mCache.Item(i + 2) = b And Me.mCache.Item(i + 3) = a
+    End Function
+
+    Private Sub CheckPoint(x As Integer, y As Integer)
+        If x < 0 Or y < 0 Or x >= Me.mNative.Width Or y >= Me.mNative.Height Then
+            Throw New OutOfBoundsException("pixel (" + x.ToString() + ", " + y.ToString() + ") is outside the picture")
+        End If
+    End Sub
+End Class
+
+''' API 1 `RGBSurface` of a ClassicPicture. `Pixel(x, y)` reads and writes one
+''' pixel; coordinates outside the picture raise OutOfBoundsException.
+''' Translucent writes, `Transform` and `FloodFill` edit a cached copy that is
+''' written back once, on the next native use (see ClassicPicture), so loops
+''' of pixel writes cost O(1) each after the first. A translucent color on a
+''' picture without an alpha channel raises UnsupportedOperationException.
+''' Translucent pixels round-trip through premultiplied storage once written
+''' back, which legacy also documents as lossy.
+Public Class ClassicRGBSurface
+    Private Property mOwner As ClassicPicture
+
+    Internal Sub Constructor(owner As ClassicPicture)
+        Me.mOwner = owner
+    End Sub
+
+    ''' API 1 `RGBSurface.Pixel(x, y) As Color`.
+    Public Function Pixel(x As Integer, y As Integer) As Color
+        Return Me.mOwner.GetPixel(x, y)
+    End Function
+
+    ''' API 1 `RGBSurface.Pixel(x, y) = c`.
+    Public Sub Pixel(x As Integer, y As Integer, Assigns c As Color)
+        Me.mOwner.SetPixel(x, y, c)
+    End Sub
+
+    ''' API 1 `RGBSurface.Transform(map)`: each pixel's red, green and blue
+    ''' become `map(channel)`; alpha is unchanged. `map` must have exactly 256
+    ''' entries in 0-255 (InvalidArgumentException otherwise).
+    Public Sub Transform(map As Array Of Integer)
+        Me.mOwner.ApplyTransform(map, map, map)
+    End Sub
+
+    ''' API 1 `RGBSurface.Transform(redMap, greenMap, blueMap)`, one map per
+    ''' channel.
+    Public Sub Transform(redMap As Array Of Integer, greenMap As Array Of Integer, blueMap As Array Of Integer)
+        Me.mOwner.ApplyTransform(redMap, greenMap, blueMap)
+    End Sub
+
+    ''' API 1 `RGBSurface.FloodFill(x, y, fillColor)`: the pixel at (x, y) and
+    ''' every pixel connected to it horizontally or vertically (4-connected;
+    ''' legacy says "adjacent" without defining diagonals) with exactly the same
+    ''' RGBA value become `fillColor`, with no blending or antialiasing.
+    Public Sub FloodFill(x As Integer, y As Integer, fillColor As Color)
+        Me.mOwner.Flood(x, y, fillColor)
+    End Sub
+End Class
+
+' ── Graphics ────────────────────────────────────────────────────────────────
+
+''' API 1 `Graphics` over a native Buoy `Graphics`, with legacy's ambient drawing
+''' state. Obtain one from `ClassicPicture.Graphics`, from `ClassicCanvas`'s
+''' `Paint(g, areas)` event, from `Clip`, or wrap a native paint-cycle context
+''' with `New ClassicGraphics(g)` (valid only as long as that context is).
+'''
+''' Limitations (each raises instead of approximating): `ClearRect`/`Pixel`
+''' on a context not backed by a ClassicPicture or on a fractional `Clip`;
+''' `TextAscent`, `TextHeight`, `StringHeight` and wrapped `DrawString` where
+''' the font metrics cannot be verified (every non-Linux target); and
+''' `DrawPolygon` with PenWidth different from PenHeight. See
+''' notes/graphics.md for the geometry rules.
+Public Class ClassicGraphics
+    Private Property mNative As Graphics
+    Private Property mOwner As ClassicPicture
+    Private Property mForeColor As Color = Color.Black
+    Private Property mTransparency As Double = 0.0
+    ' Clip frame: origin and clip rectangle in the root context's coordinates.
+    Private Property mClipped As Boolean = False
+    Private Property mOriginX As Double = 0.0
+    Private Property mOriginY As Double = 0.0
+    Private Property mClipX As Double = 0.0
+    Private Property mClipY As Double = 0.0
+    Private Property mClipW As Double = 0.0
+    Private Property mClipH As Double = 0.0
+    Private Property mWidth As Double = 0.0
+    Private Property mHeight As Double = 0.0
+
+    ''' API 1 `TextFont` (default "System").
+    Public Property TextFont As String = "System"
+    ''' API 1 `TextSize` in points (default 12). 0 reads back as 0 and draws at
+    ''' the system size, taken as 12 (the shim's probed legacy default).
+    Public Property TextSize As Double = 12.0
+    ''' API 1 `PenWidth` (default 1): the horizontal extent of the pen.
+    Public Property PenWidth As Double = 1.0
+    ''' API 1 `PenHeight` (default 1): the vertical extent of the pen.
+    Public Property PenHeight As Double = 1.0
+    ''' API 1 `Bold` text style.
+    Public Property Bold As Boolean = False
+    ''' API 1 `Italic` text style.
+    Public Property Italic As Boolean = False
+    ''' API 1 `Underline` text style.
+    Public Property Underline As Boolean = False
+
+    ''' Wraps a native drawing context, e.g. a Buoy `Canvas.Paint` parameter.
+    Public Sub Constructor(g As Graphics)
+        If g Is Nil Then
+            Throw New NilObjectException("graphics is Nil")
+        End If
+        Me.mNative = g
+    End Sub
+
+    Internal Sub Constructor(owner As ClassicPicture)
+        Me.mOwner = owner
+    End Sub
+
+    Private Sub Constructor()
+    End Sub
+
+    ''' The root native context drawn into (without this object's Clip
+    ''' origin or clip). For a picture this applies pending pixel edits and
+    ''' follows `ClassicPicture.NativePicture`; read it again after pixel
+    ''' operations.
+    Public ReadOnly Property NativeGraphics As Graphics
+        Get
+            If Me.mOwner IsNot Nil Then
+                Return Me.mOwner.ForDrawing().Graphics
+            End If
+            Return Me.mNative
+        End Get
+    End Property
+
+    ''' API 1 `ForeColor` (default black). Nil raises NilObjectException.
+    Public Property ForeColor As Color
+        Get
+            Return Me.mForeColor
+        End Get
+        Set
+            If value Is Nil Then
+                Throw New NilObjectException("ForeColor cannot be Nil")
+            End If
+            Me.mForeColor = value
+        End Set
+    End Property
+
+    ''' API 1 `Transparency`: 0.0 (opaque) to 100.0 (fully transparent),
+    ''' composited with color and picture alpha. Other values raise
+    ''' InvalidArgumentException.
+    Public Property Transparency As Double
+        Get
+            Return Me.mTransparency
+        End Get
+        Set
+            If value < 0.0 Or value > 100.0 Then
+                Throw New InvalidArgumentException("Transparency must be in 0.0-100.0")
+            End If
+            Me.mTransparency = value
+        End Set
+    End Property
+
+    ''' API 1 `Width` of the drawable area in pixels (a Clip's requested width).
+    Public ReadOnly Property Width As Integer
+        Get
+            If Me.mClipped Then
+                Return Math.Floor(Me.mWidth)
+            End If
+            If Me.mOwner IsNot Nil Then
+                Return Me.mOwner.Width
+            End If
+            Return Me.mNative.Width
+        End Get
+    End Property
+
+    ''' API 1 `Height` of the drawable area in pixels (a Clip's requested height).
+    Public ReadOnly Property Height As Integer
+        Get
+            If Me.mClipped Then
+                Return Math.Floor(Me.mHeight)
+            End If
+            If Me.mOwner IsNot Nil Then
+                Return Me.mOwner.Height
+            End If
+            Return Me.mNative.Height
+        End Get
+    End Property
+
+    ''' API 1 `Clip(x, y, width, height) As Graphics`: a child context whose
+    ''' origin is (x, y) in this context and whose drawing is confined to the
+    ''' rectangle (intersected with this context's own clip). Its Width and
+    ''' Height are the requested size even beyond the parent's edges, as
+    ''' legacy documents. The child starts with a copy of this context's
+    ''' ForeColor, text, pen and Transparency settings. Negative sizes raise
+    ''' InvalidArgumentException.
+    Public Function Clip(x As Double, y As Double, width As Double, height As Double) As ClassicGraphics
+        If width < 0.0 Or height < 0.0 Then
+            Throw New InvalidArgumentException("Clip width and height must not be negative")
+        End If
+        Dim child As New ClassicGraphics()
+        child.mNative = Me.mNative
+        child.mOwner = Me.mOwner
+        child.mForeColor = Me.mForeColor
+        child.mTransparency = Me.mTransparency
+        child.TextFont = Me.TextFont
+        child.TextSize = Me.TextSize
+        child.PenWidth = Me.PenWidth
+        child.PenHeight = Me.PenHeight
+        child.Bold = Me.Bold
+        child.Italic = Me.Italic
+        child.Underline = Me.Underline
+        child.mClipped = True
+        child.mOriginX = Me.mOriginX + x
+        child.mOriginY = Me.mOriginY + y
+        child.mWidth = width
+        child.mHeight = height
+        Dim cx0 As Double = child.mOriginX
+        Dim cy0 As Double = child.mOriginY
+        Dim cx1 As Double = cx0 + width
+        Dim cy1 As Double = cy0 + height
+        If Me.mClipped Then
+            cx0 = Math.Max(cx0, Me.mClipX)
+            cy0 = Math.Max(cy0, Me.mClipY)
+            cx1 = Math.Min(cx1, Me.mClipX + Me.mClipW)
+            cy1 = Math.Min(cy1, Me.mClipY + Me.mClipH)
+        End If
+        child.mClipX = cx0
+        child.mClipY = cy0
+        child.mClipW = Math.Max(0.0, cx1 - cx0)
+        child.mClipH = Math.Max(0.0, cy1 - cy0)
+        Return child
+    End Function
+
+    ''' API 1 `Clip(r As Rect) As Graphics`.
+    Public Function Clip(r As Rect) As ClassicGraphics
+        Return Me.Clip(r.Left, r.Top, r.Width, r.Height)
+    End Function
+
+    ' Opens one drawing operation: the root native context with this
+    ' context's clip and origin applied. Pair with Finish.
+    Private Function Begin() As Graphics
+        Dim g As Graphics = Me.NativeGraphics
+        If Me.mClipped Then
+            g.Save()
+            g.ClipToRect(Me.mClipX, Me.mClipY, Me.mClipW, Me.mClipH)
+            g.Translate(Me.mOriginX, Me.mOriginY)
+        End If
+        Return g
+    End Function
+
+    Private Sub Finish(g As Graphics)
+        If Me.mClipped Then
+            g.Restore()
+        End If
+    End Sub
+
+    Private Function Opacity() As Double
+        Return 1.0 - Me.mTransparency / 100.0
+    End Function
+
+    Private Function Ink() As Color
+        Dim c As Color = Me.mForeColor
+        Return Color.RGBA(c.R, c.G, c.B, c.A * Me.Opacity())
+    End Function
+
+    Private Function SymmetricPen() As Boolean
+        Return Me.PenWidth = Me.PenHeight
+    End Function
+
+    Private Sub PrepareStroke(g As Graphics)
+        g.DrawingColor = Me.Ink()
+        g.PenSize = Me.PenWidth
+    End Sub
+
+    Private Function EffectiveTextSize() As Double
+        If Me.TextSize <= 0.0 Then
+            Return 12.0
+        End If
+        Return Me.TextSize
+    End Function
+
+    ''' API 1 `DrawLine(x1, y1, x2, y2)` with ForeColor and the pen. With
+    ''' PenWidth = PenHeight this is the shim's probed legacy line; otherwise
+    ''' the line is the convex hull of a PenWidth x PenHeight rectangle
+    ''' centered on each end pixel.
+    Public Sub DrawLine(x1 As Double, y1 As Double, x2 As Double, y2 As Double)
+        Dim g As Graphics = Me.Begin()
+        Try
+            If Me.SymmetricPen() Then
+                Me.PrepareStroke(g)
+                g.DrawLine(x1, y1, x2, y2)
+            Else
+                Dim hw As Double = Me.PenWidth / 2.0
+                Dim hh As Double = Me.PenHeight / 2.0
+                Dim coords As Array Of Double = []
+                For Each e As Integer In [0, 1]
+                    Dim cx As Double = x1 + 0.5
+                    Dim cy As Double = y1 + 0.5
+                    If e = 1 Then
+                        cx = x2 + 0.5
+                        cy = y2 + 0.5
+                    End If
+                    Array.Append(coords, cx - hw)
+                    Array.Append(coords, cy - hh)
+                    Array.Append(coords, cx + hw)
+                    Array.Append(coords, cy - hh)
+                    Array.Append(coords, cx + hw)
+                    Array.Append(coords, cy + hh)
+                    Array.Append(coords, cx - hw)
+                    Array.Append(coords, cy + hh)
+                Next
+                ClassicFillHull(g, coords, Me.Ink())
+            End If
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ''' API 1 `DrawRect(x, y, width, height)` outline: sides PenWidth wide and
+    ''' top/bottom PenHeight tall, centered on the shim's pixel-center edges.
+    Public Sub DrawRect(x As Double, y As Double, width As Double, height As Double)
+        Dim g As Graphics = Me.Begin()
+        Try
+            If Me.SymmetricPen() Then
+                Me.PrepareStroke(g)
+                g.DrawRectangle(x, y, width, height)
+            Else
+                Me.StrokeRing(g, x, y, width, height, 0.0, 0.0)
+            End If
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ''' API 1 `FillRect(x, y, width, height)`.
+    Public Sub FillRect(x As Double, y As Double, width As Double, height As Double)
+        Dim g As Graphics = Me.Begin()
+        Try
+            g.DrawingColor = Me.Ink()
+            g.FillRectangle(x, y, width, height)
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ''' API 1 `DrawOval(x, y, width, height)` outline. The outer edge stays
+    ''' on the oval's bounds (the shim's probed rule); the ring is PenWidth
+    ''' thick at the sides and PenHeight at the top and bottom.
+    Public Sub DrawOval(x As Double, y As Double, width As Double, height As Double)
+        Dim g As Graphics = Me.Begin()
+        Try
+            If Me.SymmetricPen() Then
+                Me.PrepareStroke(g)
+                g.DrawOval(x, y, width, height)
+            Else
+                Dim w As Double = width + 1.0
+                Dim h As Double = height + 1.0
+                ClassicFillRing(g, x, y, w, h, w / 2.0, h / 2.0, Me.PenWidth, Me.PenHeight, Me.Ink())
+            End If
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ''' API 1 `FillOval(x, y, width, height)`.
+    Public Sub FillOval(x As Double, y As Double, width As Double, height As Double)
+        Dim g As Graphics = Me.Begin()
+        Try
+            g.DrawingColor = Me.Ink()
+            g.FillOval(x, y, width, height)
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ' Stroke of a (rounded) rectangle as a filled ring around the centerline
+    ' (x + 0.5, y + 0.5, w, h): half the pen outside and half inside.
+    Private Sub StrokeRing(g As Graphics, x As Double, y As Double, w As Double, h As Double, rx As Double, ry As Double)
+        Dim hw As Double = Me.PenWidth / 2.0
+        Dim hh As Double = Me.PenHeight / 2.0
+        Dim orx As Double = 0.0
+        Dim ory As Double = 0.0
+        If rx > 0.0 And ry > 0.0 Then
+            orx = rx + hw
+            ory = ry + hh
+        End If
+        ClassicFillRing(g, x + 0.5 - hw, y + 0.5 - hh, w + 2.0 * hw, h + 2.0 * hh, orx, ory, Me.PenWidth, Me.PenHeight, Me.Ink())
+    End Sub
+
+    ''' API 1 `DrawRoundRect(x, y, width, height, arcWidth, arcHeight)`. The
+    ''' arcs are the distances from each corner at which the corner curve
+    ''' begins (legacy's definition); unequal arcs give elliptical corners.
+    Public Sub DrawRoundRect(x As Double, y As Double, width As Double, height As Double, arcWidth As Double, arcHeight As Double)
+        Dim g As Graphics = Me.Begin()
+        Try
+            If Me.SymmetricPen() And arcWidth = arcHeight Then
+                Me.PrepareStroke(g)
+                g.DrawRoundRectangle(x, y, width, height, arcWidth, arcHeight)
+            Else
+                Me.StrokeRing(g, x, y, width, height, arcWidth, arcHeight)
+            End If
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ''' API 1 `FillRoundRect(x, y, width, height, arcWidth, arcHeight)`;
+    ''' unequal arcs give elliptical corners over the same w+1 x h+1 area.
+    Public Sub FillRoundRect(x As Double, y As Double, width As Double, height As Double, arcWidth As Double, arcHeight As Double)
+        Dim g As Graphics = Me.Begin()
+        Try
+            If arcWidth = arcHeight Then
+                g.DrawingColor = Me.Ink()
+                g.FillRoundRectangle(x, y, width, height, arcWidth, arcHeight)
+            Else
+                g.BeginPath()
+                ClassicAddRoundRect(g, x, y, width + 1.0, height + 1.0, arcWidth, arcHeight, False)
+                g.FillPath(Me.Ink())
+            End If
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ' legacy polygon arrays are 1-based: element 0 is ignored, then x1, y1, ...
+    Private Function PolygonCoords(points As Array Of Double) As Array Of Double
+        If points Is Nil Then
+            Throw New NilObjectException("points is Nil")
+        End If
+        Dim n As Integer = Array.Count(points) - 1
+        If n < 2 Or n Mod 2 <> 0 Then
+            Throw New InvalidArgumentException("a polygon array needs element 0 followed by x, y pairs")
+        End If
+        Dim coords As Array Of Double = []
+        For i As Integer = 1 To n
+            Array.Append(coords, points(i))
+        Next
+        Return coords
+    End Function
+
+    Private Function IntegerCoords(points As Array Of Integer) As Array Of Double
+        If points Is Nil Then
+            Throw New NilObjectException("points is Nil")
+        End If
+        Dim converted As Array Of Double = []
+        For Each v As Integer In points
+            Array.Append(converted, v * 1.0)
+        Next
+        Return converted
+    End Function
+
+    ''' API 1 `FillPolygon(points)`: a 1-based array (element 0 ignored) of
+    ''' x, y pairs; vertices are pixel-corner coordinates, so an axis-aligned
+    ''' polygon covers exactly the pixels inside it.
+    Public Sub FillPolygon(points As Array Of Double)
+        Dim coords As Array Of Double = Me.PolygonCoords(points)
+        Dim g As Graphics = Me.Begin()
+        Try
+            g.BeginPath()
+            g.MoveTo(coords(0), coords(1))
+            Dim i As Integer = 2
+            While i < Array.Count(coords)
+                g.LineTo(coords(i), coords(i + 1))
+                i = i + 2
+            Wend
+            g.ClosePath()
+            g.FillPath(Me.Ink())
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ''' `FillPolygon` for an Integer array (the original API 1 signature).
+    Public Sub FillPolygon(points As Array Of Integer)
+        Me.FillPolygon(Me.IntegerCoords(points))
+    End Sub
+
+    ''' API 1 `DrawPolygon(points)`: the closed outline through the points,
+    ''' stroked with the pen centered on pixel centers (like DrawLine).
+    ''' PenWidth must equal PenHeight (UnsupportedOperationException).
+    Public Sub DrawPolygon(points As Array Of Double)
+        Dim coords As Array Of Double = Me.PolygonCoords(points)
+        If Not Me.SymmetricPen() Then
+            Throw New UnsupportedOperationException("DrawPolygon with PenWidth different from PenHeight is not supported")
+        End If
+        Dim g As Graphics = Me.Begin()
+        Try
+            g.BeginPath()
+            g.MoveTo(coords(0) + 0.5, coords(1) + 0.5)
+            Dim i As Integer = 2
+            While i < Array.Count(coords)
+                g.LineTo(coords(i) + 0.5, coords(i + 1) + 0.5)
+                i = i + 2
+            Wend
+            g.ClosePath()
+            g.StrokePath(Me.PenWidth, Me.Ink())
+        Finally
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ''' `DrawPolygon` for an Integer array (the original API 1 signature).
+    Public Sub DrawPolygon(points As Array Of Integer)
+        Me.DrawPolygon(Me.IntegerCoords(points))
+    End Sub
+
+    ' ── text ──
+
+    Private Function Face() As ClassicFontFace
+        Return ClassicFontFace.Resolve(Me.TextFont, Me.EffectiveTextSize(), Me.Bold, Me.Italic)
+    End Function
+
+    ''' API 1 `TextAscent`: the font's ascent above the baseline, from the
+    ''' face the native Graphics draws with. Raises
+    ''' UnsupportedOperationException when that face's metrics cannot be
+    ''' verified (all non-Linux targets).
+    Public ReadOnly Property TextAscent As Double
+        Get
+            Return Me.Face().Ascent
+        End Get
+    End Property
+
+    ''' API 1 `TextHeight`: the font's line height (Cairo's ascent + descent
+    ''' + line gap). Same availability as TextAscent.
+    Public ReadOnly Property TextHeight As Double
+        Get
+            Return Me.Face().LineHeight
+        End Get
+    End Property
+
+    ''' API 1 `StringHeight(text, wrapWidth)`: TextHeight times the number of
+    ''' lines `DrawString(text, x, y, wrapWidth)` draws (one line when
+    ''' wrapWidth <= 0). As legacy documents, this is the font's height, not the
+    ''' ink height of the text. Same availability as TextAscent.
+    Public Function StringHeight(text As String, wrapWidth As Double) As Double
+        Dim lineHeight As Double = Me.Face().LineHeight
+        If wrapWidth <= 0.0 Then
+            Return lineHeight
+        End If
+        Return lineHeight * Array.Count(Me.WrapLines(text, wrapWidth))
+    End Function
+
+    ''' API 1 `DrawString(text, x, y, [wrapWidth = 0], [condense = False])`,
+    ''' baseline at `y`, in ForeColor, TextFont, TextSize and the text styles.
+    '''
+    ''' - wrapWidth <= 0: one line (line breaks are passed to the native
+    '''   renderer unchanged).
+    ''' - wrapWidth > 0, condense False: greedy word wrap at spaces using
+    '''   StringWidth; CR, LF and CRLF start new lines; a word wider than
+    '''   wrapWidth is broken between characters (combining sequences kept
+    '''   together). Line n has its baseline at y + n * TextHeight, so this
+    '''   needs verified font metrics (UnsupportedOperationException on
+    '''   non-Linux targets).
+    ''' - wrapWidth > 0, condense True: one line (line breaks as spaces); if
+    '''   it is wider than wrapWidth it is cut at a character boundary and
+    '''   "..." appended so the result fits; if "..." alone does not fit,
+    '''   nothing is drawn.
+    Public Sub DrawString(text As String, x As Double, y As Double, wrapWidth As Double = 0.0, condense As Boolean = False)
+        If wrapWidth <= 0.0 Then
+            Me.DrawLineOfText(text, x, y)
+        ElseIf condense Then
+            Me.DrawLineOfText(Me.Condensed(ClassicOneLine(text), wrapWidth), x, y)
+        Else
+            Dim lineHeight As Double = Me.Face().LineHeight
+            Dim lines As Array Of String = Me.WrapLines(text, wrapWidth)
+            For i As Integer = 0 To Array.Count(lines) - 1
+                Me.DrawLineOfText(lines(i), x, y + i * lineHeight)
+            Next
+        End If
+    End Sub
+
+    Private Sub DrawLineOfText(text As String, x As Double, y As Double)
+        If String.Len(text) = 0 Then
+            Return
+        End If
+        Dim g As Graphics = Me.Begin()
+        Dim bold As Boolean = g.Bold
+        Dim italic As Boolean = g.Italic
+        Dim underline As Boolean = g.Underline
+        g.Bold = Me.Bold
+        g.Italic = Me.Italic
+        g.Underline = Me.Underline
+        Try
+            g.DrawString(text, x, y, Me.TextFont, Me.EffectiveTextSize(), Me.Ink())
+        Finally
+            g.Bold = bold
+            g.Italic = italic
+            g.Underline = underline
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    Private Function Condensed(text As String, wrapWidth As Double) As String
+        If Me.StringWidth(text) <= wrapWidth Then
+            Return text
+        End If
+        Dim clusters As Array Of String = ClassicClusters(text)
+        Dim prefix As String = ""
+        Dim best As String = ""
+        Dim found As Boolean = False
+        If Me.StringWidth("...") <= wrapWidth Then
+            best = "..."
+            found = True
+        End If
+        For Each c As String In clusters
+            prefix = prefix + c
+            Dim candidate As String = String.RTrim(prefix) + "..."
+            If Me.StringWidth(candidate) > wrapWidth Then
+                Exit For
+            End If
+            best = candidate
+            found = True
+        Next
+        If Not found Then
+            Return ""
+        End If
+        Return best
+    End Function
+
+    ' Lines produced by wrapping `text` at wrapWidth (see DrawString).
+    Private Function WrapLines(text As String, wrapWidth As Double) As Array Of String
+        Dim normalized As String = String.Replace(text, "\r\n", "\n")
+        normalized = String.Replace(normalized, "\r", "\n")
+        Dim lines As Array Of String = []
+        For Each paragraph As String In String.Split(normalized, "\n")
+            Dim line As String = ""
+            Dim started As Boolean = False
+            For Each word As String In String.Split(paragraph, " ")
+                Dim candidate As String = word
+                If started Then
+                    candidate = line + " " + word
+                End If
+                If Me.StringWidth(candidate) <= wrapWidth Then
+                    line = candidate
+                    started = True
+                Else
+                    If started Then
+                        Array.Append(lines, line)
+                    End If
+                    line = ""
+                    ' Break an over-wide word between characters.
+                    For Each c As String In ClassicClusters(word)
+                        If String.Len(line) > 0 And Me.StringWidth(line + c) > wrapWidth Then
+                            Array.Append(lines, line)
+                            line = c
+                        Else
+                            line = line + c
+                        End If
+                    Next
+                    started = True
+                End If
+            Next
+            Array.Append(lines, line)
+        Next
+        Return lines
+    End Function
+
+    ''' API 1 `StringWidth(text)` in the current text settings. As in legacy,
+    ''' line breaks are measured as spaces (multiple lines are not handled).
+    ''' Where the font is verified (Linux) this is the text's advance width,
+    ''' which counts spaces and side bearings like legacy's; otherwise it is the
+    ''' runtime's MeasureStringWidth (ink width on Linux).
+    Public Function StringWidth(text As String) As Double
+        Dim oneLine As String = ClassicOneLine(text)
+        Dim size As Double = Me.EffectiveTextSize()
+        If ClassicFontFace.Available(Me.TextFont, size, Me.Bold, Me.Italic) Then
+            Return Me.Face().Advance(oneLine)
+        End If
+        Dim g As Graphics = Me.NativeGraphics
+        Dim bold As Boolean = g.Bold
+        Dim italic As Boolean = g.Italic
+        Dim underline As Boolean = g.Underline
+        Dim measured As Double = 0.0
+        g.Bold = Me.Bold
+        g.Italic = Me.Italic
+        g.Underline = Me.Underline
+        Try
+            measured = g.MeasureStringWidth(oneLine, Me.TextFont, size)
+        Finally
+            g.Bold = bold
+            g.Italic = italic
+            g.Underline = underline
+        End Try
+        Return measured
+    End Function
+
+    ' ── pictures ──
+
+    ''' API 1 `DrawPicture(image, x, y)` at natural size.
+    Public Sub DrawPicture(image As Picture, x As Double, y As Double)
+        If image Is Nil Then
+            Throw New NilObjectException("picture is Nil")
+        End If
+        Me.DrawPictureRegion(image, x, y, image.Width, image.Height, 0.0, 0.0, image.Width, image.Height)
+    End Sub
+
+    ''' API 1 `DrawPicture(image, x, y, destWidth, destHeight)`: crops (not
+    ''' scales) to the top-left destWidth x destHeight of `image`.
+    Public Sub DrawPicture(image As Picture, x As Double, y As Double, destWidth As Double, destHeight As Double)
+        Me.DrawPictureRegion(image, x, y, destWidth, destHeight, 0.0, 0.0, destWidth, destHeight)
+    End Sub
+
+    ''' API 1 `DrawPicture(image, x, y, destWidth, destHeight, sourceX, sourceY,
+    ''' sourceWidth, sourceHeight)`: the source rectangle scaled into the
+    ''' destination rectangle. Negative sizes raise InvalidArgumentException
+    ''' (legacy leaves them undefined).
+    Public Sub DrawPicture(image As Picture, x As Double, y As Double, destWidth As Double, destHeight As Double, sourceX As Double, sourceY As Double, sourceWidth As Double, sourceHeight As Double)
+        Me.DrawPictureRegion(image, x, y, destWidth, destHeight, sourceX, sourceY, sourceWidth, sourceHeight)
+    End Sub
+
+    ''' `DrawPicture(image, x, y)` for a ClassicPicture (mask applied).
+    Public Sub DrawPicture(image As ClassicPicture, x As Double, y As Double)
+        Me.DrawPicture(ClassicNativeOf(image), x, y)
+    End Sub
+
+    ''' `DrawPicture(image, x, y, destWidth, destHeight)` (crop) for a ClassicPicture.
+    Public Sub DrawPicture(image As ClassicPicture, x As Double, y As Double, destWidth As Double, destHeight As Double)
+        Me.DrawPicture(ClassicNativeOf(image), x, y, destWidth, destHeight)
+    End Sub
+
+    ''' Source-rectangle `DrawPicture` for a ClassicPicture.
+    Public Sub DrawPicture(image As ClassicPicture, x As Double, y As Double, destWidth As Double, destHeight As Double, sourceX As Double, sourceY As Double, sourceWidth As Double, sourceHeight As Double)
+        Me.DrawPicture(ClassicNativeOf(image), x, y, destWidth, destHeight, sourceX, sourceY, sourceWidth, sourceHeight)
+    End Sub
+
+    Private Sub DrawPictureRegion(image As Picture, x As Double, y As Double, dw As Double, dh As Double, sx As Double, sy As Double, sw As Double, sh As Double)
+        If image Is Nil Then
+            Throw New NilObjectException("picture is Nil")
+        End If
+        If dw < 0.0 Or dh < 0.0 Or sw < 0.0 Or sh < 0.0 Then
+            Throw New InvalidArgumentException("DrawPicture sizes must not be negative")
+        End If
+        If dw = 0.0 Or dh = 0.0 Or sw = 0.0 Or sh = 0.0 Then
+            Return
+        End If
+        Dim source As Picture = image
+        If Me.mTransparency > 0.0 Then
+            source = ClassicFaded(image, Me.Opacity())
+        End If
+        Dim kx As Double = dw / sw
+        Dim ky As Double = dh / sh
+        Dim g As Graphics = Me.Begin()
+        g.Save()
+        Try
+            g.ClipToRect(x, y, dw, dh)
+            If kx = 1.0 And ky = 1.0 Then
+                g.DrawPicture(source, x - sx, y - sy)
+            Else
+                g.DrawPicture(source, x - sx * kx, y - sy * ky, source.Width * kx, source.Height * ky)
+            End If
+        Finally
+            g.Restore()
+            Me.Finish(g)
+        End Try
+    End Sub
+
+    ' ── pixels ──
+
+    Private Function Owner(member As String) As ClassicPicture
+        If Me.mOwner Is Nil Then
+            Throw New UnsupportedOperationException(member + " needs a ClassicPicture's Graphics")
+        End If
+        If Me.mClipped Then
+            If Me.mOriginX <> Math.Floor(Me.mOriginX) Or Me.mOriginY <> Math.Floor(Me.mOriginY) Or Me.mClipX <> Math.Floor(Me.mClipX) Or Me.mClipY <> Math.Floor(Me.mClipY) Or Me.mClipW <> Math.Floor(Me.mClipW) Or Me.mClipH <> Math.Floor(Me.mClipH) Then
+                Throw New UnsupportedOperationException(member + " needs a Clip with whole-pixel bounds")
+            End If
+        End If
+        Return Me.mOwner
+    End Function
+
+    ''' API 1 `ClearRect(x, y, width, height)` on a ClassicPicture's Graphics
+    ''' (or a whole-pixel Clip of it): the integer rectangle, limited to the
+    ''' clip, returns to transparent (alpha picture) or opaque white (depth
+    ''' picture). On other contexts raises UnsupportedOperationException
+    ''' (Buoy cannot erase a paint context).
+    Public Sub ClearRect(x As Integer, y As Integer, width As Integer, height As Integer)
+        Dim p As ClassicPicture = Me.Owner("ClearRect")
+        If width <= 0 Or height <= 0 Then
+            Return
+        End If
+        Dim x0 As Integer = x + Math.Floor(Me.mOriginX)
+        Dim y0 As Integer = y + Math.Floor(Me.mOriginY)
+        Dim x1 As Integer = x0 + width
+        Dim y1 As Integer = y0 + height
+        If Me.mClipped Then
+            x0 = Math.Max(x0, Math.Floor(Me.mClipX))
+            y0 = Math.Max(y0, Math.Floor(Me.mClipY))
+            x1 = Math.Min(x1, Math.Floor(Me.mClipX + Me.mClipW))
+            y1 = Math.Min(y1, Math.Floor(Me.mClipY + Me.mClipH))
+        End If
+        If x1 > x0 And y1 > y0 Then
+            p.Clear(x0, y0, x1 - x0, y1 - y0)
+        End If
+    End Sub
+
+    ' Root pixel coordinate of local (x, y); outside a clip raises.
+    Private Function RootX(x As Integer, y As Integer, p As ClassicPicture) As Integer
+        Dim rx As Integer = x + Math.Floor(Me.mOriginX)
+        Dim ry As Integer = y + Math.Floor(Me.mOriginY)
+        If Me.mClipped Then
+            If rx < Me.mClipX Or ry < Me.mClipY Or rx >= Me.mClipX + Me.mClipW Or ry >= Me.mClipY + Me.mClipH Then
+                Throw New OutOfBoundsException("pixel (" + x.ToString() + ", " + y.ToString() + ") is outside the clip")
+            End If
+        End If
+        Return rx
+    End Function
+
+    ''' API 1 `Graphics.Pixel(x, y) As Color` — picture-backed contexts only
+    ''' (see ClassicRGBSurface); local to a Clip.
+    Public Function Pixel(x As Integer, y As Integer) As Color
+        Dim p As ClassicPicture = Me.Owner("Pixel")
+        Dim rx As Integer = Me.RootX(x, y, p)
+        Return p.GetPixel(rx, y + Math.Floor(Me.mOriginY))
+    End Function
+
+    ''' API 1 `Graphics.Pixel(x, y) = c` — picture-backed contexts only.
+    Public Sub Pixel(x As Integer, y As Integer, Assigns c As Color)
+        Dim p As ClassicPicture = Me.Owner("Pixel")
+        Dim rx As Integer = Me.RootX(x, y, p)
+        p.SetPixel(rx, y + Math.Floor(Me.mOriginY), c)
+    End Sub
+End Class
+
+Internal Function ClassicNativeOf(image As ClassicPicture) As Picture
+    If image Is Nil Then
+        Throw New NilObjectException("picture is Nil")
+    End If
+    Return image.Composite()
+End Function
+
+' ── Canvas ──────────────────────────────────────────────────────────────────
+
+''' API 1 `Canvas` event bridge. Subclass it instead of `Canvas` and handle:
+'''
+'''   Paint(g As ClassicGraphics, areas As Array Of Rect)
+'''   MouseDown(x As Integer, y As Integer) As Boolean
+'''   MouseDrag(x As Integer, y As Integer)   ' only after MouseDown returned True
+'''   MouseUp(x As Integer, y As Integer)     ' only after MouseDown returned True
+'''   MouseMove(x As Integer, y As Integer)
+'''   MouseEnter() / MouseExit()
+'''
+''' `areas` is always empty, which legacy defines as "redraw the whole canvas".
+''' `Backdrop` is drawn at its natural size at (0, 0) before `Paint`.
+''' Coordinates are local and rounded down to Integer. Repaints are always
+''' deferred: there is no synchronous `Refresh`/`RefreshRect`; use
+''' `Invalidate`.
+Public Class ClassicCanvas Inherits Canvas
+    Private Property mBackdrop As ClassicPicture
+    Private Property mTracking As Boolean = False
+
+    Event Paint(g As ClassicGraphics, areas As Array Of Rect)
+    Event MouseDown(x As Integer, y As Integer) As Boolean
+    Event MouseDrag(x As Integer, y As Integer)
+    Event MouseUp(x As Integer, y As Integer)
+    Event MouseMove(x As Integer, y As Integer)
+    Event MouseEnter()
+    Event MouseExit()
+
+    ''' API 1 `Canvas.Backdrop` (Nil for none); assigning schedules a repaint.
+    ''' Wrap a plain Picture with `New ClassicPicture(pic)`.
+    Public Property Backdrop As ClassicPicture
+        Get
+            Return Me.mBackdrop
+        End Get
+        Set
+            Me.mBackdrop = value
+            Me.Invalidate()
+        End Set
+    End Property
+
+    ''' API 1 `Invalidate(eraseBackground)` — schedules a full repaint.
+    ''' `eraseBackground` is accepted and has no effect (legacy honours it only
+    ''' on Windows).
+    Public Sub Invalidate(eraseBackground As Boolean)
+        Me.Invalidate()
+    End Sub
+
+    ''' API 1 `Invalidate(x, y, width, height, [eraseBackground])` — schedules a
+    ''' repaint of the rectangle.
+    Public Sub Invalidate(x As Integer, y As Integer, width As Integer, height As Integer, eraseBackground As Boolean = True)
+        Me.InvalidateRect(x, y, width, height)
+    End Sub
+
+    Handle Paint(g As Graphics)
+        Dim cg As New ClassicGraphics(g)
+        If Me.mBackdrop IsNot Nil Then
+            g.DrawPicture(Me.mBackdrop.Composite(), 0.0, 0.0)
+        End If
+        Dim areas As Array Of Rect = []
+        RaiseEvent Paint(cg, areas)
+    End Handle
+
+    Handle MouseDown(e As MouseEvent)
+        Me.mTracking = RaiseEvent MouseDown(Math.Floor(e.X), Math.Floor(e.Y))
+    End Handle
+
+    Handle MouseDrag(e As MouseEvent)
+        If Me.mTracking Then
+            RaiseEvent MouseDrag(Math.Floor(e.X), Math.Floor(e.Y))
+        End If
+    End Handle
+
+    Handle MouseUp(e As MouseEvent)
+        If Me.mTracking Then
+            Me.mTracking = False
+            RaiseEvent MouseUp(Math.Floor(e.X), Math.Floor(e.Y))
+        End If
+    End Handle
+
+    Handle MouseMove(e As MouseEvent)
+        RaiseEvent MouseMove(Math.Floor(e.X), Math.Floor(e.Y))
+    End Handle
+
+    Handle MouseEnter(e As MouseEvent)
+        RaiseEvent MouseEnter()
+    End Handle
+
+    Handle MouseExit(e As MouseEvent)
+        RaiseEvent MouseExit()
+    End Handle
+End Class

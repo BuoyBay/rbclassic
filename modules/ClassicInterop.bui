@@ -1,0 +1,28 @@
+Import RBFoundation
+Import ClassicData
+
+''' None when the foundation Variant cannot preserve this ClassicVariant kind.
+Public Extension Function TryToVariant(value As ClassicVariant) As Optional Of Variant
+    If value Is Nil Then Return None
+    Try
+        Return Some(value.ToVariant())
+    Catch e As TypeMismatchException
+        Return None
+    End Try
+End Function
+
+''' Explicit object boxing preserves extended payloads without scalar coercion.
+Public Function BoxClassicValue(value As ClassicVariant) As Variant
+    If value Is Nil Then Throw New InvalidArgumentException("ClassicVariant value required")
+    Dim instance As Object = value
+    Return Variant.From(instance)
+End Function
+
+Public Function TryUnboxClassicValue(value As Variant) As Optional Of ClassicVariant
+    If value Is Nil Then Return None
+    If Not value.IsObject() Then Return None
+    Dim instance As Object = value.AsObject().Value
+    Dim classic As ClassicVariant = TryCast(instance, ClassicVariant)
+    If classic Is Nil Then Return None
+    Return Some(classic)
+End Function

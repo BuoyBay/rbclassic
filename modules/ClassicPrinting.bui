@@ -1,0 +1,1806 @@
+Import RBFoundation
+' ClassicPrinting — REALbasic / legacy API 1 printing adapters.
+'
+' API 1 `OpenPrinter`/`OpenPrinterDialog` return a printer-backed `Graphics`
+' that paginates with `NextPage` and is sent to the printer when it goes out
+' of scope. Buoy has no printer `Graphics`, so this module records every page
+' as vector PDF through the bundled `pdf` package (`PDFGraphics Implements
+' IGraphics`) and hands the finished document to a native print system:
+'
+'   API 1 source                         rewrite
+'   Dim p As New PrinterSetup        ->  Dim p As New ClassicPrinterSetup
+'   Dim g As Graphics = OpenPrinter(p) -> Dim g As ClassicPrinterGraphics = OpenPrinter(p)
+'   g = OpenPrinterDialog(p, w)      ->  g = OpenPrinterDialog(p, w)
+'   g.NextPage                       ->  g.NextPage()
+'
+' Destinations (see notes/printing.md for the exact tested boundary):
+'   * PDF (all platforms): `ClassicOpenPDFPrinter(setup)` records the same
+'     pages without contacting any print system; `ClassicFinishPrinting`
+'     then exposes the bytes. It is never reported as a physical job.
+'   * Linux CUPS: `OpenPrinter` streams the PDF to the setup's named queue,
+'     or the default queue, through libcups (`libcups.so.2`).
+'   * Linux GTK 4: `OpenPrinterDialog` runs the native GtkPrintUnixDialog and
+'     sends the PDF to the selected GtkPrinter with GtkPrintJob.
+'   * macOS/Windows printer destinations raise UnsupportedOperationException.
+'
+' Global functions need a selective import to be callable unqualified:
+'   Public Import ClassicPrinting.{ OpenPrinter, OpenPrinterDialog, ClassicOpenPDFPrinter }
+
+Import PDF
+Import ClassicGraphics
+
+' ── Validation helpers ──────────────────────────────────────────────────────
+
+Internal Sub ClassicPrintRequireText(value As String, name As String, allowEmpty As Boolean)
+    If Not allowEmpty And value = "" Then
+        Throw New InvalidArgumentException(name + " must not be empty")
+    End If
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    If encoded.Count > 4096 Then
+        Throw New InvalidArgumentException(name + " exceeds 4096 bytes")
+    End If
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then
+            Throw New InvalidArgumentException(name + " cannot contain NUL")
+        End If
+    Next
+End Sub
+
+' Base14/TrueType text is written through libharu's single-byte encoding, so
+' only printable ASCII is accepted rather than emitting wrong glyphs.
+Internal Sub ClassicPrintRequireDrawableText(value As String)
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        Dim b As Integer = encoded.Item(i)
+        If b < 32 Or b > 126 Then
+            Throw New UnsupportedOperationException("printer text supports printable ASCII only; byte " + RBFoundation.Str(b) + " at offset " + RBFoundation.Str(i))
+        End If
+    Next
+End Sub
+
+Internal Sub ClassicPrintRequirePoints(value As Double, name As String, low As Double, high As Double)
+    If Not (value >= low And value <= high) Then
+        Throw New InvalidArgumentException(name + " must be within " + RBFoundation.Str(low) + "-" + RBFoundation.Str(high) + " points")
+    End If
+End Sub
+
+Internal Sub ClassicPrintRequireResolution(value As Integer, name As String)
+    If value = -1 Then
+        Throw New UnsupportedOperationException(name + " = -1 (device maximum) is unsupported: the vector backends report no driver resolution; request an explicit dpi")
+    End If
+    If value < 1 Or value > 9600 Then Throw New InvalidArgumentException(name + " must be within 1-9600")
+End Sub
+
+' Rejects NaN, infinities and coordinates beyond any page (|v| > 1e9).
+Internal Sub ClassicPrintRequireFinite(values As Array Of Double)
+    For Each v As Double In values
+        If Not (v >= -1000000000.0 And v <= 1000000000.0) Then
+            Throw New InvalidArgumentException("Drawing coordinates and sizes must be finite")
+        End If
+    Next
+End Sub
+
+Internal Function ClassicPrintRound3(value As Double) As Double
+    Return Math.Round(value * 1000.0) / 1000.0
+End Function
+
+' ── pdf package library ─────────────────────────────────────────────────────
+' pdf 2.4.6 PDFGraphics.FillPath/StrokePath set the color after the path is
+' built, which libharu rejects (HPDF_PAGE_INVALID_GMODE, 0x1051); see
+' upstream-issues/classic-wave2-printing. Polygons therefore paint through
+' the same exported libpdf symbols the package binds, with the fill color
+' set before the path. HPDF_REAL arguments go through its bui_pdf_* shims.
+Private Declare Function ClassicPDFAddPage Lib "pdf" Alias "HPDF_AddPage" (document As Ptr) As Ptr
+Private Declare Function ClassicPDFSetWidth Lib "pdf" Alias "bui_pdf_page_set_width" (page As Ptr, value As Double) As Integer
+Private Declare Function ClassicPDFSetHeight Lib "pdf" Alias "bui_pdf_page_set_height" (page As Ptr, value As Double) As Integer
+Private Declare Function ClassicPDFSetFill Lib "pdf" Alias "bui_pdf_page_set_rgb_fill" (page As Ptr, r As Double, g As Double, b As Double) As Integer
+Private Declare Function ClassicPDFMoveTo Lib "pdf" Alias "bui_pdf_page_move_to" (page As Ptr, x As Double, y As Double) As Integer
+Private Declare Function ClassicPDFLineTo Lib "pdf" Alias "bui_pdf_page_line_to" (page As Ptr, x As Double, y As Double) As Integer
+Private Declare Function ClassicPDFClosePath Lib "pdf" Alias "HPDF_Page_ClosePath" (page As Ptr) As Integer
+Private Declare Function ClassicPDFFill Lib "pdf" Alias "HPDF_Page_Fill" (page As Ptr) As Integer
+
+' ── Linux native bindings ───────────────────────────────────────────────────
+
+#If TargetLinux Then
+Sequential Structure ClassicCupsDestination
+    QueueName As Ptr
+    InstanceName As Ptr
+    DefaultFlag As Int32
+    OptionCount As Int32
+    Options As Ptr
+End Structure
+
+Sequential Structure ClassicGError
+    Domain As UInt32
+    Code As Int32
+    Message As Ptr
+End Structure
+
+Sequential Structure ClassicGtkPageRange
+    FirstIndex As Int32
+    LastIndex As Int32
+End Structure
+
+Delegate Sub ClassicGtkResponseHandler(dialog As Ptr, response As Int32, data As Ptr)
+Delegate Sub ClassicGtkJobCompleted(job As Ptr, data As Ptr, failure As Ptr)
+
+Private Optional Declare Function CupsGetDests Lib "libcups.so.2" Alias "cupsGetDests2" (connection As Ptr, ByRef destinations As Ptr) As Int32
+Private Optional Declare Sub CupsFreeDests Lib "libcups.so.2" Alias "cupsFreeDests" (count As Int32, destinations As Ptr)
+Private Optional Declare Function CupsLastError Lib "libcups.so.2" Alias "cupsLastError" () As Int32
+Private Optional Declare Function CupsLastErrorString Lib "libcups.so.2" Alias "cupsLastErrorString" () As CString
+Private Optional Declare Function CupsAddOption Lib "libcups.so.2" Alias "cupsAddOption" (name As String, value As String, count As Int32, ByRef options As Ptr) As Int32
+Private Optional Declare Sub CupsFreeOptions Lib "libcups.so.2" Alias "cupsFreeOptions" (count As Int32, options As Ptr)
+Private Optional Declare Function CupsCreateJob Lib "libcups.so.2" Alias "cupsCreateJob" (connection As Ptr, queue As String, title As String, count As Int32, options As Ptr) As Int32
+Private Optional Declare Function CupsStartDocument Lib "libcups.so.2" Alias "cupsStartDocument" (connection As Ptr, queue As String, jobId As Int32, documentName As String, format As String, lastDocument As Int32) As Int32
+Private Optional Declare Function CupsWriteRequestData Lib "libcups.so.2" Alias "cupsWriteRequestData" (connection As Ptr, buffer As Ptr, length As UInt64) As Int32
+Private Optional Declare Function CupsFinishDocument Lib "libcups.so.2" Alias "cupsFinishDocument" (connection As Ptr, queue As String) As Int32
+Private Optional Declare Function CupsCancelJob Lib "libcups.so.2" Alias "cupsCancelJob2" (connection As Ptr, queue As String, jobId As Int32, purge As Int32) As Int32
+Private Optional Declare Function CupsCopyDestination Lib "c" Alias "memcpy" (ByRef destination As ClassicCupsDestination, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function ClassicCopyGError Lib "c" Alias "memcpy" (ByRef destination As ClassicGError, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function ClassicCopyPageRange Lib "c" Alias "memcpy" (ByRef destination As ClassicGtkPageRange, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function ClassicTempFile Lib "c" Alias "mkstemp" (template As Ptr) As Int32
+Private Optional Declare Function ClassicWriteFile Lib "c" Alias "write" (descriptor As Int32, buffer As Ptr, count As UInt64) As Int64
+Private Optional Declare Function ClassicCloseFile Lib "c" Alias "close" (descriptor As Int32) As Int32
+Private Optional Declare Function ClassicUnlink Lib "c" Alias "unlink" (fileName As String) As Int32
+
+Private Optional Declare Function GtkIsInitialized Lib "libgtk-4.so.1" Alias "gtk_is_initialized" () As Int32
+Private Optional Declare Function GtkPrintDialogNew Lib "libgtk-4.so.1" Alias "gtk_print_unix_dialog_new" (title As String, parent As Ptr) As Ptr
+Private Optional Declare Sub GtkPrintDialogSetSettings Lib "libgtk-4.so.1" Alias "gtk_print_unix_dialog_set_settings" (dialog As Ptr, settings As Ptr)
+Private Optional Declare Function GtkPrintDialogGetSettings Lib "libgtk-4.so.1" Alias "gtk_print_unix_dialog_get_settings" (dialog As Ptr) As Ptr
+Private Optional Declare Sub GtkPrintDialogSetPageSetup Lib "libgtk-4.so.1" Alias "gtk_print_unix_dialog_set_page_setup" (dialog As Ptr, setup As Ptr)
+Private Optional Declare Function GtkPrintDialogGetPageSetup Lib "libgtk-4.so.1" Alias "gtk_print_unix_dialog_get_page_setup" (dialog As Ptr) As Ptr
+Private Optional Declare Function GtkPrintDialogPrinter Lib "libgtk-4.so.1" Alias "gtk_print_unix_dialog_get_selected_printer" (dialog As Ptr) As Ptr
+Private Optional Declare Function GtkPageSetupDialogNew Lib "libgtk-4.so.1" Alias "gtk_page_setup_unix_dialog_new" (title As String, parent As Ptr) As Ptr
+Private Optional Declare Sub GtkPageSetupDialogSetSetup Lib "libgtk-4.so.1" Alias "gtk_page_setup_unix_dialog_set_page_setup" (dialog As Ptr, setup As Ptr)
+Private Optional Declare Function GtkPageSetupDialogGetSetup Lib "libgtk-4.so.1" Alias "gtk_page_setup_unix_dialog_get_page_setup" (dialog As Ptr) As Ptr
+Private Optional Declare Sub GtkPageSetupDialogSetSettings Lib "libgtk-4.so.1" Alias "gtk_page_setup_unix_dialog_set_print_settings" (dialog As Ptr, settings As Ptr)
+Private Optional Declare Sub GtkWindowSetModal Lib "libgtk-4.so.1" Alias "gtk_window_set_modal" (window As Ptr, modal As Int32)
+Private Optional Declare Sub GtkWindowSetHideOnClose Lib "libgtk-4.so.1" Alias "gtk_window_set_hide_on_close" (window As Ptr, hide As Int32)
+Private Optional Declare Sub GtkWindowPresent Lib "libgtk-4.so.1" Alias "gtk_window_present" (window As Ptr)
+Private Optional Declare Sub GtkWindowDestroy Lib "libgtk-4.so.1" Alias "gtk_window_destroy" (window As Ptr)
+Private Optional Declare Function GtkSettingsNew Lib "libgtk-4.so.1" Alias "gtk_print_settings_new" () As Ptr
+Private Optional Declare Sub GtkSettingsSetPrinter Lib "libgtk-4.so.1" Alias "gtk_print_settings_set_printer" (settings As Ptr, printer As String)
+Private Optional Declare Function GtkSettingsCopies Lib "libgtk-4.so.1" Alias "gtk_print_settings_get_n_copies" (settings As Ptr) As Int32
+Private Optional Declare Function GtkSettingsCollate Lib "libgtk-4.so.1" Alias "gtk_print_settings_get_collate" (settings As Ptr) As Int32
+Private Optional Declare Function GtkSettingsReverse Lib "libgtk-4.so.1" Alias "gtk_print_settings_get_reverse" (settings As Ptr) As Int32
+Private Optional Declare Function GtkSettingsPrintPages Lib "libgtk-4.so.1" Alias "gtk_print_settings_get_print_pages" (settings As Ptr) As Int32
+Private Optional Declare Function GtkSettingsPageRanges Lib "libgtk-4.so.1" Alias "gtk_print_settings_get_page_ranges" (settings As Ptr, ByRef count As Int32) As Ptr
+Private Optional Declare Function GtkPageSetupNew Lib "libgtk-4.so.1" Alias "gtk_page_setup_new" () As Ptr
+Private Optional Declare Function GtkPaperCustom Lib "libgtk-4.so.1" Alias "gtk_paper_size_new_custom" (name As String, displayName As String, width As Double, height As Double, unit As Int32) As Ptr
+Private Optional Declare Function GtkPaperNew Lib "libgtk-4.so.1" Alias "gtk_paper_size_new" (name As String) As Ptr
+Private Optional Declare Function GtkPaperWidth Lib "libgtk-4.so.1" Alias "gtk_paper_size_get_width" (paper As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPaperHeight Lib "libgtk-4.so.1" Alias "gtk_paper_size_get_height" (paper As Ptr, unit As Int32) As Double
+Private Optional Declare Sub GtkPaperFree Lib "libgtk-4.so.1" Alias "gtk_paper_size_free" (paper As Ptr)
+Private Optional Declare Function GtkPaperName Lib "libgtk-4.so.1" Alias "gtk_paper_size_get_name" (paper As Ptr) As CString
+Private Optional Declare Sub GtkPageSetupSetPaper Lib "libgtk-4.so.1" Alias "gtk_page_setup_set_paper_size" (setup As Ptr, paper As Ptr)
+Private Optional Declare Function GtkPageSetupGetPaper Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_paper_size" (setup As Ptr) As Ptr
+Private Optional Declare Sub GtkPageSetupSetOrientation Lib "libgtk-4.so.1" Alias "gtk_page_setup_set_orientation" (setup As Ptr, orientation As Int32)
+Private Optional Declare Function GtkPageSetupGetOrientation Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_orientation" (setup As Ptr) As Int32
+Private Optional Declare Sub GtkPageSetupSetLeft Lib "libgtk-4.so.1" Alias "gtk_page_setup_set_left_margin" (setup As Ptr, margin As Double, unit As Int32)
+Private Optional Declare Sub GtkPageSetupSetRight Lib "libgtk-4.so.1" Alias "gtk_page_setup_set_right_margin" (setup As Ptr, margin As Double, unit As Int32)
+Private Optional Declare Sub GtkPageSetupSetTop Lib "libgtk-4.so.1" Alias "gtk_page_setup_set_top_margin" (setup As Ptr, margin As Double, unit As Int32)
+Private Optional Declare Sub GtkPageSetupSetBottom Lib "libgtk-4.so.1" Alias "gtk_page_setup_set_bottom_margin" (setup As Ptr, margin As Double, unit As Int32)
+Private Optional Declare Function GtkPageSetupGetLeft Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_left_margin" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPageSetupGetRight Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_right_margin" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPageSetupGetTop Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_top_margin" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPageSetupGetBottom Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_bottom_margin" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPageSetupPageWidth Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_page_width" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPageSetupPageHeight Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_page_height" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPageSetupPaperWidth Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_paper_width" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPageSetupPaperHeight Lib "libgtk-4.so.1" Alias "gtk_page_setup_get_paper_height" (setup As Ptr, unit As Int32) As Double
+Private Optional Declare Function GtkPrinterName Lib "libgtk-4.so.1" Alias "gtk_printer_get_name" (printer As Ptr) As CString
+Private Optional Declare Function GtkPrinterAcceptsPDF Lib "libgtk-4.so.1" Alias "gtk_printer_accepts_pdf" (printer As Ptr) As Int32
+Private Optional Declare Function GtkJobNew Lib "libgtk-4.so.1" Alias "gtk_print_job_new" (title As String, printer As Ptr, settings As Ptr, setup As Ptr) As Ptr
+Private Optional Declare Function GtkJobSetSource Lib "libgtk-4.so.1" Alias "gtk_print_job_set_source_file" (job As Ptr, fileName As String, ByRef failure As Ptr) As Int32
+Private Optional Declare Sub GtkJobSetCopies Lib "libgtk-4.so.1" Alias "gtk_print_job_set_num_copies" (job As Ptr, copies As Int32)
+Private Optional Declare Sub GtkJobSetCollate Lib "libgtk-4.so.1" Alias "gtk_print_job_set_collate" (job As Ptr, collate As Int32)
+Private Optional Declare Sub GtkJobSetReverse Lib "libgtk-4.so.1" Alias "gtk_print_job_set_reverse" (job As Ptr, reverse As Int32)
+Private Optional Declare Sub GtkJobSend Lib "libgtk-4.so.1" Alias "gtk_print_job_send" (job As Ptr, callback As Ptr, data As Ptr, destroyNotify As Ptr)
+Private Optional Declare Function GObjectRef Lib "libgobject-2.0.so.0" Alias "g_object_ref" (instance As Ptr) As Ptr
+Private Optional Declare Sub GObjectUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (instance As Ptr)
+Private Optional Declare Function GSignalConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, handler As Ptr, data As Ptr, destroyData As Ptr, connectFlags As Int32) As UInt64
+Private Optional Declare Sub GSignalDisconnect Lib "libgobject-2.0.so.0" Alias "g_signal_handler_disconnect" (instance As Ptr, handlerId As UInt64)
+Private Optional Declare Function GMainDefault Lib "libglib-2.0.so.0" Alias "g_main_context_default" () As Ptr
+Private Optional Declare Function GMainIsOwner Lib "libglib-2.0.so.0" Alias "g_main_context_is_owner" (context As Ptr) As Int32
+Private Optional Declare Function GMainAcquire Lib "libglib-2.0.so.0" Alias "g_main_context_acquire" (context As Ptr) As Int32
+Private Optional Declare Sub GMainRelease Lib "libglib-2.0.so.0" Alias "g_main_context_release" (context As Ptr)
+Private Optional Declare Function GMainIteration Lib "libglib-2.0.so.0" Alias "g_main_context_iteration" (context As Ptr, mayBlock As Int32) As Int32
+Private Optional Declare Sub GFree Lib "libglib-2.0.so.0" Alias "g_free" (memory As Ptr)
+Private Optional Declare Sub GErrorFree Lib "libglib-2.0.so.0" Alias "g_error_free" (failure As Ptr)
+
+' GTK constants: GTK_UNIT_POINTS, GTK_RESPONSE_OK, GTK_PRINT_PAGES_RANGES.
+Const ClassicGtkPoints As Integer = 1
+Const ClassicGtkResponseOK As Integer = -5
+Const ClassicGtkPagesRanges As Integer = 2
+
+' Callback state for the one modal dialog / job send that may be active.
+Class ClassicGtkWait
+    Public Shared Property Active As Boolean = False
+    Public Shared Property Done As Boolean = False
+    Public Shared Property Response As Integer = 0
+    Public Shared Property FailureMessage As String = ""
+    Public Shared Property Failed As Boolean = False
+End Class
+
+Sub ClassicGtkOnResponse(dialog As Ptr, response As Int32, data As Ptr)
+    ClassicGtkWait.Response = response
+    ClassicGtkWait.Done = True
+End Sub
+
+Sub ClassicGtkOnJobCompleted(job As Ptr, data As Ptr, failure As Ptr)
+    If failure <> Nil Then
+        Dim record As ClassicGError
+        ClassicCopyGError(record, failure, 16)
+        ClassicGtkWait.Failed = True
+        If record.Message <> Nil Then
+            ClassicGtkWait.FailureMessage = CType(CType(record.Message, CString), String)
+        Else
+            Dim code As Integer = record.Code
+            ClassicGtkWait.FailureMessage = "GtkPrintJob failed (code " + RBFoundation.Str(code) + ")"
+        End If
+    End If
+    ClassicGtkWait.Done = True
+End Sub
+
+Private Function ClassicCupsFailure(operation As String) As String
+    Dim message As CString = CupsLastErrorString()
+    If message = Nil Then
+        Dim status As Integer = CupsLastError()
+        Return operation + " failed (IPP status " + RBFoundation.Str(status) + ")"
+    End If
+    Return operation + " failed: " + CType(message, String)
+End Function
+
+' Returns the queue to use, "" when CUPS reports no matching/default queue.
+Private Function ClassicCupsResolveQueue(requested As String) As String
+    If Not System.IsLibraryAvailable("libcups.so.2") Then
+        Throw New LibraryUnavailableException("CUPS 2 runtime library libcups.so.2 is unavailable")
+    End If
+    CupsLastError()
+    CupsLastErrorString()
+    Dim destinations As Ptr = Nil
+    Dim count As Integer = CupsGetDests(Nil, destinations)
+    Try
+        Dim status As Integer = CupsLastError()
+        ' 0x0406 (client-error-not-found) is a reachable server with no queues.
+        If count < 0 Or (count = 0 And status >= 1024 And status <> 1030) Then
+            Throw New IOException(ClassicCupsFailure("cupsGetDests2"))
+        End If
+        Dim fallback As String = ""
+        For i As Integer = 0 To count - 1
+            Dim native As ClassicCupsDestination
+            CupsCopyDestination(native, CType(CType(destinations, Integer) + i * 32, Ptr), 32)
+            If native.QueueName = Nil Then Continue For
+            Dim queue As String = CType(CType(native.QueueName, CString), String)
+            If requested <> "" Then
+                If queue = requested Then Return queue
+            ElseIf native.DefaultFlag <> 0 Then
+                fallback = queue
+            End If
+        Next
+        Return fallback
+    Finally
+        If destinations <> Nil Then CupsFreeDests(count, destinations)
+    End Try
+End Function
+
+' Streams a finished PDF to a CUPS queue; cancels the created job on failure.
+Private Function ClassicCupsSubmit(queue As String, title As String, document As Bytes) As Integer
+    Dim options As Ptr = Nil
+    Dim optionCount As Integer = CupsAddOption("document-format", "application/pdf", 0, options)
+    Dim jobId As Integer = 0
+    Dim finished As Boolean = False
+    Try
+        If optionCount <> 1 Then Throw New IOException("Unable to allocate the CUPS document-format option")
+        jobId = CupsCreateJob(Nil, queue, title, optionCount, options)
+        If jobId <= 0 Then
+            jobId = 0
+            Throw New IOException(ClassicCupsFailure("cupsCreateJob"))
+        End If
+        ' HTTP_STATUS_CONTINUE (100) means the server accepts document data.
+        If CupsStartDocument(Nil, queue, jobId, title, "application/pdf", 1) <> 100 Then
+            Throw New IOException(ClassicCupsFailure("cupsStartDocument"))
+        End If
+        Dim offset As Integer = 0
+        While offset < document.Count
+            Dim size As Integer = document.Count - offset
+            If size > 65536 Then size = 65536
+            If CupsWriteRequestData(Nil, CType(CType(document.DataPtr(), Integer) + offset, Ptr), size) <> 100 Then
+                Throw New IOException(ClassicCupsFailure("cupsWriteRequestData"))
+            End If
+            offset += size
+        Wend
+        Dim status As Integer = CupsFinishDocument(Nil, queue)
+        If status > 255 Then Throw New IOException(ClassicCupsFailure("cupsFinishDocument"))
+        finished = True
+        Return jobId
+    Catch failure As Exception
+        ' BUI-015: cleanup belongs in Catch because Throw from Catch skips Finally.
+        If jobId > 0 And Not finished Then CupsCancelJob(Nil, queue, jobId, 1)
+        If options <> Nil Then CupsFreeOptions(optionCount, options)
+        options = Nil
+        Throw failure
+    Finally
+        If options <> Nil Then CupsFreeOptions(optionCount, options)
+    End Try
+End Function
+
+' Writes bytes to a new private temporary file and returns its path.
+Private Function ClassicWriteTempPDF(document As Bytes) As String
+    Dim template As Bytes = Bytes.FromString("/tmp/buoy-classic-print-XXXXXX", Text.Encodings.UTF8)
+    template.Append(0)
+    Dim descriptor As Integer = ClassicTempFile(template.DataPtr())
+    If descriptor < 0 Then Throw New IOException("mkstemp failed for the print spool file")
+    Dim fileName As String = CType(CType(template.DataPtr(), CString), String)
+    Dim offset As Integer = 0
+    Dim writeOk As Boolean = True
+    While offset < document.Count And writeOk
+        Dim written As Integer = ClassicWriteFile(descriptor, CType(CType(document.DataPtr(), Integer) + offset, Ptr), document.Count - offset)
+        If written <= 0 Then
+            writeOk = False
+        Else
+            offset += written
+        End If
+    Wend
+    If ClassicCloseFile(descriptor) <> 0 Then writeOk = False
+    If Not writeOk Then
+        ClassicUnlink(fileName)
+        Throw New IOException("Writing the print spool file failed")
+    End If
+    Return fileName
+End Function
+
+' Acquires the default GLib context on the main thread; False if it was already owned.
+Private Function ClassicGtkEnter() As Boolean
+    If Not System.IsLibraryAvailable("libgtk-4.so.1") Then
+        Throw New LibraryUnavailableException("GTK 4 runtime library libgtk-4.so.1 is unavailable")
+    End If
+    If GtkIsInitialized() = 0 Then
+        Throw New UnsupportedOperationException("Native print dialogs need an initialized Buoy desktop application (show a Window first)")
+    End If
+    If ClassicGtkWait.Active Then
+        Throw New InvalidArgumentException("A native print dialog or print job is already active")
+    End If
+    Dim context As Ptr = GMainDefault()
+    If GMainIsOwner(context) <> 0 Then Return False
+    If GMainAcquire(context) = 0 Then
+        Throw New InvalidArgumentException("Native printing must run on the main thread")
+    End If
+    Return True
+End Function
+
+Private Sub ClassicGtkLeave(acquired As Boolean)
+    If acquired Then GMainRelease(GMainDefault())
+End Sub
+
+' Runs a GTK dialog modally (nested main loop) and returns its response.
+Private Function ClassicGtkRunDialog(dialog As Ptr, reapplySetup As Ptr) As Integer
+    Dim handler As ClassicGtkResponseHandler = AddressOf ClassicGtkOnResponse
+    ClassicGtkWait.Active = True
+    ClassicGtkWait.Done = False
+    ClassicGtkWait.Response = 0
+    Dim connection As UInt64 = GSignalConnect(dialog, "response", CType(handler, Ptr), Nil, Nil, 0)
+    GtkWindowSetModal(dialog, 1)
+    GtkWindowSetHideOnClose(dialog, 1)
+    GtkWindowPresent(dialog)
+    If reapplySetup <> Nil Then
+        ' GtkPageSetupUnixDialog fills its paper list after construction; a
+        ' page setup applied before that cannot select its paper, so apply
+        ' it again once pending events have run.
+        Dim spins As Integer = 0
+        While GMainIteration(Nil, 0) <> 0 And spins < 1000
+            spins += 1
+        Wend
+        GtkPageSetupDialogSetSetup(dialog, reapplySetup)
+    End If
+    While Not ClassicGtkWait.Done
+        GMainIteration(Nil, 1)
+    Wend
+    GSignalDisconnect(dialog, connection)
+    ClassicGtkWait.Active = False
+    Return ClassicGtkWait.Response
+End Function
+
+Private Function ClassicGtkParent(parentWindow As Optional Of Window) As Ptr
+    If Not parentWindow.HasValue Then Return Nil
+    If parentWindow.Value Is Nil Then Return Nil
+    Return parentWindow.Value.NativeWidget
+End Function
+#End If
+
+' ── Printer setup ───────────────────────────────────────────────────────────
+
+''' API 1 `PrinterSetup`, renamed so it cannot collide with the separate
+''' `printing` package's macOS `PrinterSetup`. Geometry is a portable model:
+''' paper size (portrait points), orientation, margins (points, relative to
+''' the oriented page) and drawing resolution. Defaults: US Letter, portrait,
+''' 18-point margins, 72 dpi — Buoy defaults, not values read from a driver.
+'''
+''' Integer properties follow legacy's printer-coordinate contract in device
+''' units at `HorizontalResolution`/`VerticalResolution`: `Left`/`Top` are 0
+''' (the printable origin), `PageLeft`/`PageTop` are the negative margins.
+Public Class ClassicPrinterSetup
+    Private Property mPaperWidth As Double = 612.0
+    Private Property mPaperHeight As Double = 792.0
+    Private Property mLandscape As Boolean = False
+    Private Property mLeft As Double = 18.0
+    Private Property mTop As Double = 18.0
+    Private Property mRight As Double = 18.0
+    Private Property mBottom As Double = 18.0
+    Private Property mHorizontalResolution As Integer = 72
+    Private Property mVerticalResolution As Integer = 72
+    Private Property mPrinterName As String = ""
+    Private Property mPaperName As String = "na_letter"
+
+    Public Sub Constructor()
+    End Sub
+
+    ''' API 1 `Landscape` (read/write). Swaps the oriented page dimensions.
+    Public Property Landscape As Boolean
+        Get
+            Return Me.mLandscape
+        End Get
+        Set
+            ' Validate the oriented printable area before changing anything.
+            Dim ow As Double = Me.mPaperWidth
+            Dim oh As Double = Me.mPaperHeight
+            If value Then
+                ow = Me.mPaperHeight
+                oh = Me.mPaperWidth
+            End If
+            If ow - Me.mLeft - Me.mRight <= 0.0 Or oh - Me.mTop - Me.mBottom <= 0.0 Then
+                Throw New InvalidArgumentException("That orientation leaves no printable area with the current margins")
+            End If
+            Me.mLandscape = value
+        End Set
+    End Property
+
+    ''' Oriented page width in points.
+    Public ReadOnly Property ClassicPageWidthPoints As Double
+        Get
+            If Me.mLandscape Then Return Me.mPaperHeight
+            Return Me.mPaperWidth
+        End Get
+    End Property
+
+    ''' Oriented page height in points.
+    Public ReadOnly Property ClassicPageHeightPoints As Double
+        Get
+            If Me.mLandscape Then Return Me.mPaperWidth
+            Return Me.mPaperHeight
+        End Get
+    End Property
+
+    Public ReadOnly Property ClassicLeftMargin As Double
+        Get
+            Return Me.mLeft
+        End Get
+    End Property
+
+    Public ReadOnly Property ClassicTopMargin As Double
+        Get
+            Return Me.mTop
+        End Get
+    End Property
+
+    Public ReadOnly Property ClassicRightMargin As Double
+        Get
+            Return Me.mRight
+        End Get
+    End Property
+
+    Public ReadOnly Property ClassicBottomMargin As Double
+        Get
+            Return Me.mBottom
+        End Get
+    End Property
+
+    ''' Native paper identifier recorded from the last page-setup/print dialog.
+    Public ReadOnly Property ClassicPaperName As String
+        Get
+            Return Me.mPaperName
+        End Get
+    End Property
+
+    ''' Buoy extension: CUPS queue / GTK printer name. Empty means the default
+    ''' queue for `OpenPrinter`; the dialog preselects a nonempty name.
+    Public Property ClassicPrinterName As String
+        Get
+            Return Me.mPrinterName
+        End Get
+        Set
+            ClassicPrintRequireText(value, "printer name", True)
+            Me.mPrinterName = value
+        End Set
+    End Property
+
+    ''' Buoy extension: portrait paper size in points (1-14400 each).
+    Public Sub ClassicSetPaperSize(widthPoints As Double, heightPoints As Double)
+        ClassicPrintRequirePoints(widthPoints, "paper width", 1.0, 14400.0)
+        ClassicPrintRequirePoints(heightPoints, "paper height", 1.0, 14400.0)
+        Dim w As Double = ClassicPrintRound3(widthPoints)
+        Dim h As Double = ClassicPrintRound3(heightPoints)
+        If Me.OrientedWidth(w, h) - Me.mLeft - Me.mRight <= 0.0 Or Me.OrientedHeight(w, h) - Me.mTop - Me.mBottom <= 0.0 Then
+            Throw New InvalidArgumentException("Current margins leave no printable area on that paper")
+        End If
+        Me.mPaperWidth = w
+        Me.mPaperHeight = h
+        Me.mPaperName = "custom"
+    End Sub
+
+    ''' Buoy extension: margins in points relative to the oriented page.
+    Public Sub ClassicSetMargins(leftPoints As Double, topPoints As Double, rightPoints As Double, bottomPoints As Double)
+        ClassicPrintRequirePoints(leftPoints, "left margin", 0.0, 14400.0)
+        ClassicPrintRequirePoints(topPoints, "top margin", 0.0, 14400.0)
+        ClassicPrintRequirePoints(rightPoints, "right margin", 0.0, 14400.0)
+        ClassicPrintRequirePoints(bottomPoints, "bottom margin", 0.0, 14400.0)
+        Dim l As Double = ClassicPrintRound3(leftPoints)
+        Dim t As Double = ClassicPrintRound3(topPoints)
+        Dim r As Double = ClassicPrintRound3(rightPoints)
+        Dim b As Double = ClassicPrintRound3(bottomPoints)
+        If Me.ClassicPageWidthPoints - l - r <= 0.0 Or Me.ClassicPageHeightPoints - t - b <= 0.0 Then
+            Throw New InvalidArgumentException("Page margins leave no printable area")
+        End If
+        Me.mLeft = l
+        Me.mTop = t
+        Me.mRight = r
+        Me.mBottom = b
+    End Sub
+
+    Private Function OrientedWidth(w As Double, h As Double) As Double
+        If Me.mLandscape Then Return h
+        Return w
+    End Function
+
+    Private Function OrientedHeight(w As Double, h As Double) As Double
+        If Me.mLandscape Then Return w
+        Return h
+    End Function
+
+    Private Function ToDevice(points As Double, resolution As Integer) As Integer
+        Return Math.Round(points * resolution / 72.0)
+    End Function
+
+    ''' API 1 `PageWidth`: full oriented page width in device units.
+    Public ReadOnly Property PageWidth As Integer
+        Get
+            Return Me.ToDevice(Me.ClassicPageWidthPoints, Me.mHorizontalResolution)
+        End Get
+    End Property
+
+    ''' API 1 `PageHeight`: full oriented page height in device units.
+    Public ReadOnly Property PageHeight As Integer
+        Get
+            Return Me.ToDevice(Me.ClassicPageHeightPoints, Me.mVerticalResolution)
+        End Get
+    End Property
+
+    ''' API 1 `Width`: printable width (page minus margins) in device units.
+    Public ReadOnly Property Width As Integer
+        Get
+            Return Me.ToDevice(Me.ClassicPageWidthPoints - Me.mLeft - Me.mRight, Me.mHorizontalResolution)
+        End Get
+    End Property
+
+    ''' API 1 `Height`: printable height (page minus margins) in device units.
+    Public ReadOnly Property Height As Integer
+        Get
+            Return Me.ToDevice(Me.ClassicPageHeightPoints - Me.mTop - Me.mBottom, Me.mVerticalResolution)
+        End Get
+    End Property
+
+    ''' API 1 `Left`: printable origin, always 0.
+    Public ReadOnly Property Left As Integer
+        Get
+            Return 0
+        End Get
+    End Property
+
+    ''' API 1 `Top`: printable origin, always 0.
+    Public ReadOnly Property Top As Integer
+        Get
+            Return 0
+        End Get
+    End Property
+
+    ''' API 1 `PageLeft`: negative offset from the printable origin to the paper edge.
+    Public ReadOnly Property PageLeft As Integer
+        Get
+            Return 0 - Me.ToDevice(Me.mLeft, Me.mHorizontalResolution)
+        End Get
+    End Property
+
+    ''' API 1 `PageTop`: negative offset from the printable origin to the paper edge.
+    Public ReadOnly Property PageTop As Integer
+        Get
+            Return 0 - Me.ToDevice(Me.mTop, Me.mVerticalResolution)
+        End Get
+    End Property
+
+    ''' API 1 `HorizontalResolution` in dots per inch of the drawing coordinates.
+    Public ReadOnly Property HorizontalResolution As Integer
+        Get
+            Return Me.mHorizontalResolution
+        End Get
+    End Property
+
+    ''' API 1 `VerticalResolution` in dots per inch of the drawing coordinates.
+    Public ReadOnly Property VerticalResolution As Integer
+        Get
+            Return Me.mVerticalResolution
+        End Get
+    End Property
+
+    ''' API 1 `MaxHorizontalResolution` request (1-9600). Output is vector PDF,
+    ''' so the request is granted exactly; read HorizontalResolution back.
+    ''' legacy's -1 ("highest possible resolution of the output device") raises
+    ''' UnsupportedOperationException: no backend here reports a driver maximum.
+    Public Property MaxHorizontalResolution As Integer
+        Get
+            Return Me.mHorizontalResolution
+        End Get
+        Set
+            ClassicPrintRequireResolution(value, "MaxHorizontalResolution")
+            Me.mHorizontalResolution = value
+        End Set
+    End Property
+
+    ''' API 1 `MaxVerticalResolution` request (1-9600), granted exactly.
+    Public Property MaxVerticalResolution As Integer
+        Get
+            Return Me.mVerticalResolution
+        End Get
+        Set
+            ClassicPrintRequireResolution(value, "MaxVerticalResolution")
+            Me.mVerticalResolution = value
+        End Set
+    End Property
+
+    ''' API 1 `SetupString`: versioned Buoy JSON (not a legacy/driver blob). It
+    ''' stores geometry, resolution, paper name and printer name only. Invalid
+    ''' input raises before any field changes.
+    Public Property SetupString As String
+        Get
+            Dim item As New JSONItem()
+            item.Value("format") = "buoy.classicprinting.setup.v1"
+            item.Value("paperWidth") = Me.mPaperWidth
+            item.Value("paperHeight") = Me.mPaperHeight
+            item.Value("landscape") = Me.mLandscape
+            item.Value("left") = Me.mLeft
+            item.Value("top") = Me.mTop
+            item.Value("right") = Me.mRight
+            item.Value("bottom") = Me.mBottom
+            item.Value("horizontalResolution") = Me.mHorizontalResolution
+            item.Value("verticalResolution") = Me.mVerticalResolution
+            item.Value("paperName") = Me.mPaperName
+            item.Value("printer") = Me.mPrinterName
+            Dim options As New JSONOptions()
+            options.DecimalPlaces = 3
+            Return item.ToString(options)
+        End Get
+        Set
+            Dim item As JSONItem
+            Try
+                item = Json.Parse(value)
+            Catch parseFailure As Exception
+                Throw New InvalidArgumentException("ClassicPrinterSetup settings are not valid JSON")
+            End Try
+            If item Is Nil Then Throw New InvalidArgumentException("ClassicPrinterSetup settings are not valid JSON")
+            If item.Value("format").AsString().Or("") <> "buoy.classicprinting.setup.v1" Then
+                Throw New InvalidArgumentException("Unsupported ClassicPrinterSetup settings format")
+            End If
+            If Not item.Value("landscape").IsBoolean() Then Throw New InvalidArgumentException("Missing landscape setting")
+            Dim w As Double = ClassicPrintRound3(item.Value("paperWidth").AsNumber().Or(-1.0))
+            Dim h As Double = ClassicPrintRound3(item.Value("paperHeight").AsNumber().Or(-1.0))
+            Dim l As Double = ClassicPrintRound3(item.Value("left").AsNumber().Or(-1.0))
+            Dim t As Double = ClassicPrintRound3(item.Value("top").AsNumber().Or(-1.0))
+            Dim r As Double = ClassicPrintRound3(item.Value("right").AsNumber().Or(-1.0))
+            Dim b As Double = ClassicPrintRound3(item.Value("bottom").AsNumber().Or(-1.0))
+            Dim hr As Double = item.Value("horizontalResolution").AsNumber().Or(-1.0)
+            Dim vr As Double = item.Value("verticalResolution").AsNumber().Or(-1.0)
+            Dim landscapeValue As Boolean = item.Value("landscape").AsBoolean().Or(False)
+            Dim paperName As String = item.Value("paperName").AsString().Or("")
+            Dim printer As String = item.Value("printer").AsString().Or("")
+            ClassicPrintRequirePoints(w, "paper width", 1.0, 14400.0)
+            ClassicPrintRequirePoints(h, "paper height", 1.0, 14400.0)
+            ClassicPrintRequirePoints(l, "left margin", 0.0, 14400.0)
+            ClassicPrintRequirePoints(t, "top margin", 0.0, 14400.0)
+            ClassicPrintRequirePoints(r, "right margin", 0.0, 14400.0)
+            ClassicPrintRequirePoints(b, "bottom margin", 0.0, 14400.0)
+            If Not (hr >= 1.0 And hr <= 9600.0 And vr >= 1.0 And vr <= 9600.0) Or hr <> Math.Floor(hr) Or vr <> Math.Floor(vr) Then
+                Throw New InvalidArgumentException("Resolutions must be integers within 1-9600")
+            End If
+            Dim ow As Double = w
+            Dim oh As Double = h
+            If landscapeValue Then
+                ow = h
+                oh = w
+            End If
+            If ow - l - r <= 0.0 Or oh - t - b <= 0.0 Then Throw New InvalidArgumentException("Page margins leave no printable area")
+            ClassicPrintRequireText(paperName, "paper name", True)
+            ClassicPrintRequireText(printer, "printer name", True)
+            Me.mPaperWidth = w
+            Me.mPaperHeight = h
+            Me.mLandscape = landscapeValue
+            Me.mLeft = l
+            Me.mTop = t
+            Me.mRight = r
+            Me.mBottom = b
+            Me.mHorizontalResolution = Math.Round(hr)
+            Me.mVerticalResolution = Math.Round(vr)
+            Me.mPaperName = paperName
+            Me.mPrinterName = printer
+        End Set
+    End Property
+
+    ''' API 2 name for `SetupString`.
+    Public Property Settings As String
+        Get
+            Return Me.SetupString
+        End Get
+        Set
+            Me.SetupString = value
+        End Set
+    End Property
+
+    Internal Sub ApplyNative(paperWidth As Double, paperHeight As Double, landscapeValue As Boolean, l As Double, t As Double, r As Double, b As Double, paperName As String)
+        Me.mPaperWidth = ClassicPrintRound3(paperWidth)
+        Me.mPaperHeight = ClassicPrintRound3(paperHeight)
+        Me.mLandscape = landscapeValue
+        Me.mLeft = ClassicPrintRound3(l)
+        Me.mTop = ClassicPrintRound3(t)
+        Me.mRight = ClassicPrintRound3(r)
+        Me.mBottom = ClassicPrintRound3(b)
+        Me.mPaperName = paperName
+    End Sub
+
+#If TargetLinux Then
+    ' New GtkPageSetup (caller unrefs) describing this setup.
+    Internal Function NewGtkPageSetup() As Ptr
+        Dim setup As Ptr = GtkPageSetupNew()
+        ' Prefer the recorded named paper so GTK's paper list preselects it;
+        ' gtk_paper_size_new falls back to the locale default for unknown
+        ' names, so the size must match before the name is trusted.
+        Dim paper As Ptr = Nil
+        If Me.mPaperName <> "" And Me.mPaperName <> "custom" Then
+            paper = GtkPaperNew(Me.mPaperName)
+            If paper <> Nil Then
+                If Math.Abs(GtkPaperWidth(paper, ClassicGtkPoints) - Me.mPaperWidth) > 0.5 Or Math.Abs(GtkPaperHeight(paper, ClassicGtkPoints) - Me.mPaperHeight) > 0.5 Then
+                    GtkPaperFree(paper)
+                    paper = Nil
+                End If
+            End If
+        End If
+        If paper = Nil Then paper = GtkPaperCustom("buoy-classic", "Buoy custom", Me.mPaperWidth, Me.mPaperHeight, ClassicGtkPoints)
+        GtkPageSetupSetPaper(setup, paper)
+        GtkPaperFree(paper)
+        Dim orientationValue As Integer = 0
+        If Me.mLandscape Then orientationValue = 1
+        GtkPageSetupSetOrientation(setup, orientationValue)
+        ' GtkPageSetup margins are measured from the portrait paper edges.
+        ' Landscape is content rotated 90 degrees counter-clockwise (IPP
+        ' orientation-requested 4): oriented left/top/right/bottom are the
+        ' portrait bottom/left/top/right edges.
+        If Me.mLandscape Then
+            GtkPageSetupSetLeft(setup, Me.mTop, ClassicGtkPoints)
+            GtkPageSetupSetTop(setup, Me.mRight, ClassicGtkPoints)
+            GtkPageSetupSetRight(setup, Me.mBottom, ClassicGtkPoints)
+            GtkPageSetupSetBottom(setup, Me.mLeft, ClassicGtkPoints)
+        Else
+            GtkPageSetupSetLeft(setup, Me.mLeft, ClassicGtkPoints)
+            GtkPageSetupSetTop(setup, Me.mTop, ClassicGtkPoints)
+            GtkPageSetupSetRight(setup, Me.mRight, ClassicGtkPoints)
+            GtkPageSetupSetBottom(setup, Me.mBottom, ClassicGtkPoints)
+        End If
+        Return setup
+    End Function
+
+    ' Copies the geometry chosen in a native dialog. Orientation 1 and 3 are
+    ' GTK landscape/reverse landscape; reverse orientations are not modelled.
+    Internal Sub ReadGtkPageSetup(setup As Ptr)
+        Dim orientationValue As Integer = GtkPageSetupGetOrientation(setup)
+        If orientationValue = 2 Or orientationValue = 3 Then
+            Throw New UnsupportedOperationException("Reverse page orientations are not supported")
+        End If
+        Dim landscapeValue As Boolean = orientationValue = 1
+        Dim ow As Double = GtkPageSetupPaperWidth(setup, ClassicGtkPoints)
+        Dim oh As Double = GtkPageSetupPaperHeight(setup, ClassicGtkPoints)
+        Dim pw As Double = ow
+        Dim ph As Double = oh
+        If landscapeValue Then
+            pw = oh
+            ph = ow
+        End If
+        Dim name As String = "custom"
+        Dim paper As Ptr = GtkPageSetupGetPaper(setup)
+        If paper <> Nil Then
+            Dim native As CString = GtkPaperName(paper)
+            If native <> Nil Then name = CType(native, String)
+        End If
+        Dim pl As Double = GtkPageSetupGetLeft(setup, ClassicGtkPoints)
+        Dim pt As Double = GtkPageSetupGetTop(setup, ClassicGtkPoints)
+        Dim pr As Double = GtkPageSetupGetRight(setup, ClassicGtkPoints)
+        Dim pb As Double = GtkPageSetupGetBottom(setup, ClassicGtkPoints)
+        Dim l As Double = pl
+        Dim t As Double = pt
+        Dim r As Double = pr
+        Dim b As Double = pb
+        If landscapeValue Then
+            l = pb
+            t = pl
+            r = pt
+            b = pr
+        End If
+        ' GTK's own printable size must agree with the mapped margins.
+        If Math.Abs(ow - l - r - GtkPageSetupPageWidth(setup, ClassicGtkPoints)) > 0.01 Or Math.Abs(oh - t - b - GtkPageSetupPageHeight(setup, ClassicGtkPoints)) > 0.01 Then
+            Throw New IOException("GTK page margins do not match the oriented printable area")
+        End If
+        If pw < 1.0 Or ph < 1.0 Or l < 0.0 Or t < 0.0 Or r < 0.0 Or b < 0.0 Or ow - l - r <= 0.0 Or oh - t - b <= 0.0 Then
+            Throw New IOException("The native page setup has no printable area")
+        End If
+        Me.ApplyNative(pw, ph, landscapeValue, l, t, r, b, name)
+    End Sub
+#End If
+
+    ''' API 1 `PageSetupDialog`: native modal page setup (Linux GTK 4 only).
+    ''' Returns False on cancel with every setting unchanged.
+    Public Function PageSetupDialog() As Boolean
+        Return Me.RunPageSetupDialog(None)
+    End Function
+
+    Public Function PageSetupDialog(parentWindow As Window) As Boolean
+        Return Me.RunPageSetupDialog(Some(parentWindow))
+    End Function
+
+    Private Function RunPageSetupDialog(parentWindow As Optional Of Window) As Boolean
+        #If TargetLinux Then
+            Dim acquired As Boolean = ClassicGtkEnter()
+            Dim dialog As Ptr = Nil
+            Dim setup As Ptr = Nil
+            Try
+                dialog = GtkPageSetupDialogNew("Page Setup", ClassicGtkParent(parentWindow))
+                If dialog = Nil Then Throw New IOException("Could not create the GTK page setup dialog")
+                GObjectRef(dialog)
+                setup = Me.NewGtkPageSetup()
+                GtkPageSetupDialogSetSetup(dialog, setup)
+                Dim response As Integer = ClassicGtkRunDialog(dialog, setup)
+                If response <> ClassicGtkResponseOK Then Return False
+                Me.ReadGtkPageSetup(GtkPageSetupDialogGetSetup(dialog))
+                Return True
+            Catch failure As Exception
+                ClassicGtkWait.Active = False
+                If setup <> Nil Then GObjectUnref(setup)
+                setup = Nil
+                If dialog <> Nil Then
+                    GtkWindowDestroy(dialog)
+                    GObjectUnref(dialog)
+                End If
+                dialog = Nil
+                ClassicGtkLeave(acquired)
+                acquired = False
+                Throw failure
+            Finally
+                If setup <> Nil Then GObjectUnref(setup)
+                If dialog <> Nil Then
+                    GtkWindowDestroy(dialog)
+                    GObjectUnref(dialog)
+                End If
+                ClassicGtkLeave(acquired)
+            End Try
+        #Else
+            Throw New UnsupportedOperationException("ClassicPrinterSetup.PageSetupDialog is implemented only on Linux (GTK 4)")
+        #End If
+    End Function
+
+    ''' API 2 name for `PageSetupDialog`.
+    Public Function ShowPageSetupDialog() As Boolean
+        Return Me.RunPageSetupDialog(None)
+    End Function
+
+    Public Function ShowPageSetupDialog(parentWindow As Window) As Boolean
+        Return Me.RunPageSetupDialog(Some(parentWindow))
+    End Function
+
+    ''' API 2 `ShowPrinterDialog`: same as `OpenPrinterDialog(Me, parentWindow)`.
+    Public Function ShowPrinterDialog() As ClassicPrinterGraphics
+        Return ClassicRunPrinterDialog(Me, None)
+    End Function
+
+    Public Function ShowPrinterDialog(parentWindow As Window) As ClassicPrinterGraphics
+        Return ClassicRunPrinterDialog(Me, Some(parentWindow))
+    End Function
+End Class
+
+' Convex hull (Andrew's monotone chain) as a 1-based API 1 polygon array.
+Internal Function ClassicConvexHull(xsIn As Array Of Double, ysIn As Array Of Double) As Array Of Double
+    Dim xs As Array Of Double = []
+    Dim ys As Array Of Double = []
+    For i As Integer = 0 To Array.Count(xsIn) - 1
+        Array.Append(xs, xsIn(i))
+        Array.Append(ys, ysIn(i))
+    Next
+    Dim n As Integer = Array.Count(xs)
+    For i As Integer = 1 To n - 1
+        Dim j As Integer = i
+        While j > 0 And (xs(j - 1) > xs(j) Or (xs(j - 1) = xs(j) And ys(j - 1) > ys(j)))
+            Dim tx As Double = xs(j)
+            Dim ty As Double = ys(j)
+            xs(j) = xs(j - 1)
+            ys(j) = ys(j - 1)
+            xs(j - 1) = tx
+            ys(j - 1) = ty
+            j -= 1
+        Wend
+    Next
+    Dim hx As Array Of Double = []
+    Dim hy As Array Of Double = []
+    For pass As Integer = 0 To 1
+        Dim start As Integer = Array.Count(hx)
+        For k As Integer = 0 To n - 1
+            Dim i As Integer = k
+            If pass = 1 Then i = n - 1 - k
+            While Array.Count(hx) - start >= 2
+                Dim m As Integer = Array.Count(hx)
+                Dim cross As Double = (hx(m - 1) - hx(m - 2)) * (ys(i) - hy(m - 2)) - (hy(m - 1) - hy(m - 2)) * (xs(i) - hx(m - 2))
+                If cross > 0.0 Then Exit While
+                Array.RemoveAt(hx, m - 1)
+                Array.RemoveAt(hy, m - 1)
+            Wend
+            Array.Append(hx, xs(i))
+            Array.Append(hy, ys(i))
+        Next
+        ' The last point of each chain starts the other one.
+        Array.RemoveAt(hx, Array.Count(hx) - 1)
+        Array.RemoveAt(hy, Array.Count(hy) - 1)
+    Next
+    ' A nonempty literal would be fixed-mode; start empty and append.
+    Dim points As Array Of Double = []
+    Array.Append(points, 0.0)
+    For i As Integer = 0 To Array.Count(hx) - 1
+        Array.Append(points, hx(i))
+        Array.Append(points, hy(i))
+    Next
+    Return points
+End Function
+
+' ── Printer graphics ────────────────────────────────────────────────────────
+
+''' Destination kinds: PDF only (no print system), CUPS queue, GTK printer.
+Public Enum ClassicPrintDestination As Integer
+    PDF = 0
+    CupsQueue = 1
+    GtkPrinter = 2
+End Enum
+
+''' API 1 printer `Graphics`. Pages are vector PDF in the setup's device
+''' units: (0, 0) is the printable origin and one unit is 1/resolution inch.
+'''
+''' Lifecycle: draw, `NextPage()` between pages, then either call
+''' `ClassicFinishPrinting()` (Buoy extension: submits and reports errors) or
+''' drop the last reference — the destructor submits a printer job, as legacy
+''' sends the job when its Graphics goes out of scope, but errors there can
+''' only be swallowed. `ClassicCancelPrinting()` discards every page.
+Public Class ClassicPrinterGraphics
+    Private Property mDocument As PDFDocument
+    Private Property mPage As PDFGraphics
+    Private Property mPageHandle As Ptr
+    Private Property mPageCount As Integer = 0
+    Private Property mState As Integer = 0
+    Private Property mDestination As ClassicPrintDestination = ClassicPrintDestination.PDF
+    Private Property mQueue As String = ""
+    Private Property mPDF As Bytes
+    Private Property mJobId As Integer = 0
+    Private Property mForeColor As Color = Color.Black
+    Private Property mTransparency As Double = 0.0
+    Private Property mPageWidthPoints As Double
+    Private Property mPageHeightPoints As Double
+    Private Property mOriginX As Double
+    Private Property mOriginY As Double
+    Private Property mUnitX As Double
+    Private Property mUnitY As Double
+    Private Property mWidth As Integer
+    Private Property mHeight As Integer
+    Private Property mCopies As Integer = 1
+    Private Property mFirstPage As Integer = 1
+    Private Property mLastPage As Integer = 0
+    Private Property mGtkPrinter As Ptr
+    Private Property mGtkSettings As Ptr
+    Private Property mGtkSetup As Ptr
+    Private Property mNativeCopies As Integer = 1
+    Private Property mNativeCollate As Boolean = False
+    Private Property mNativeReverse As Boolean = False
+
+    ''' API 1 `TextFont` (default "System" = Helvetica in PDF output).
+    Public Property TextFont As String = "System"
+    ''' API 1 `TextSize` in points regardless of resolution (0 = 12; at most 600).
+    Public Property TextSize As Double = 12.0
+    ''' API 1 `PenWidth` in device units (default 1).
+    Public Property PenWidth As Double = 1.0
+    ''' API 1 `PenHeight`; strokes need PenHeight = PenWidth.
+    Public Property PenHeight As Double = 1.0
+    Public Property Bold As Boolean = False
+    Public Property Italic As Boolean = False
+    Public Property Underline As Boolean = False
+    ''' Buoy extension: job title passed to CUPS/GTK.
+    Public Property ClassicJobTitle As String = "Buoy print job"
+
+    Internal Sub Constructor(setup As ClassicPrinterSetup, destination As ClassicPrintDestination, queue As String)
+        If setup Is Nil Then Throw New NilObjectException("printer setup is Nil")
+        Me.mDestination = destination
+        Me.mQueue = queue
+        Me.mPageWidthPoints = setup.ClassicPageWidthPoints
+        Me.mPageHeightPoints = setup.ClassicPageHeightPoints
+        Me.mOriginX = setup.ClassicLeftMargin
+        Me.mOriginY = setup.ClassicTopMargin
+        Me.mUnitX = 72.0 / setup.HorizontalResolution
+        Me.mUnitY = 72.0 / setup.VerticalResolution
+        Me.mWidth = setup.Width
+        Me.mHeight = setup.Height
+        If Me.mWidth <= 0 Or Me.mHeight <= 0 Then
+            Throw New InvalidArgumentException("The printer setup has no printable area at its resolution")
+        End If
+        Me.mDocument = New PDFDocument()
+        Me.BeginPage()
+    End Sub
+
+#If TargetLinux Then
+    Internal Sub AdoptGtk(printer As Ptr, settings As Ptr, pageSetup As Ptr)
+        Me.mGtkPrinter = GObjectRef(printer)
+        Me.mGtkSettings = settings
+        Me.mGtkSetup = GObjectRef(pageSetup)
+        Me.mNativeCopies = GtkSettingsCopies(settings)
+        If Me.mNativeCopies < 1 Then Me.mNativeCopies = 1
+        Me.mNativeCollate = GtkSettingsCollate(settings) <> 0
+        Me.mNativeReverse = GtkSettingsReverse(settings) <> 0
+        If GtkSettingsPrintPages(settings) = ClassicGtkPagesRanges Then
+            Dim count As Int32 = 0
+            Dim ranges As Ptr = GtkSettingsPageRanges(settings, count)
+            If ranges <> Nil And count > 0 Then
+                ' Ranges may be unordered: report the smallest start and largest end.
+                Dim lowest As Integer = 2147483647
+                Dim highest As Integer = -1
+                For i As Integer = 0 To count - 1
+                    Dim range As ClassicGtkPageRange
+                    ClassicCopyPageRange(range, CType(CType(ranges, Integer) + i * 8, Ptr), 8)
+                    If range.FirstIndex < lowest Then lowest = range.FirstIndex
+                    If range.LastIndex > highest Then highest = range.LastIndex
+                Next
+                If lowest >= 0 And highest >= lowest Then
+                    Me.mFirstPage = lowest + 1
+                    Me.mLastPage = highest + 1
+                End If
+            End If
+            If ranges <> Nil Then GFree(ranges)
+        End If
+    End Sub
+
+    Private Sub ReleaseGtk()
+        If Me.mGtkPrinter <> Nil Then GObjectUnref(Me.mGtkPrinter)
+        If Me.mGtkSettings <> Nil Then GObjectUnref(Me.mGtkSettings)
+        If Me.mGtkSetup <> Nil Then GObjectUnref(Me.mGtkSetup)
+        Me.mGtkPrinter = Nil
+        Me.mGtkSettings = Nil
+        Me.mGtkSetup = Nil
+    End Sub
+#End If
+
+    Public Sub Destructor()
+        If Me.mState <> 0 Then Return
+        If Me.mDestination = ClassicPrintDestination.PDF Then
+            Me.mState = 2
+            Return
+        End If
+        Try
+            Me.ClassicFinishPrinting()
+        Catch failure As Exception
+            Me.mState = 3
+        End Try
+        #If TargetLinux Then
+            Me.ReleaseGtk()
+        #End If
+    End Sub
+
+    Private Sub BeginPage()
+        Dim handle As Ptr = ClassicPDFAddPage(Me.mDocument.NativeHandle())
+        Me.mDocument.CheckError()
+        If handle = Nil Then Throw New PDFException("HPDF_AddPage returned no page")
+        ClassicPDFSetWidth(handle, Me.mPageWidthPoints)
+        ClassicPDFSetHeight(handle, Me.mPageHeightPoints)
+        Me.mDocument.CheckError()
+        Me.mPageHandle = handle
+        Me.mPage = New PDFGraphics(handle, Me.mDocument)
+        Me.mPage.Translate(Me.mOriginX, Me.mOriginY)
+        Me.mPage.Scale(Me.mUnitX, Me.mUnitY)
+        Me.mPageCount += 1
+    End Sub
+
+    Private Function Target() As PDFGraphics
+        If Me.mState = 1 Then Throw New InvalidArgumentException("The print job is already finished")
+        If Me.mState = 2 Then Throw New InvalidArgumentException("The print job was cancelled")
+        If Me.mState = 3 Then Throw New InvalidArgumentException("The print job failed")
+        Return Me.mPage
+    End Function
+
+    ''' API 1 `ForeColor` (default black). Translucent colors raise when used:
+    ''' the PDF backend cannot write alpha for solid drawing.
+    Public Property ForeColor As Color
+        Get
+            Return Me.mForeColor
+        End Get
+        Set
+            If value Is Nil Then Throw New NilObjectException("ForeColor cannot be Nil")
+            Me.mForeColor = value
+        End Set
+    End Property
+
+    ''' API 1 `Transparency` (0-100). Nonzero values raise when drawing
+    ''' shapes, text or pictures (pictures keep only their own alpha).
+    Public Property Transparency As Double
+        Get
+            Return Me.mTransparency
+        End Get
+        Set
+            ClassicPrintRequireFinite([value])
+            If value < 0.0 Or value > 100.0 Then Throw New InvalidArgumentException("Transparency must be in 0.0-100.0")
+            Me.mTransparency = value
+        End Set
+    End Property
+
+    ''' API 1 `Width`: printable width in device units.
+    Public ReadOnly Property Width As Integer
+        Get
+            Return Me.mWidth
+        End Get
+    End Property
+
+    ''' API 1 `Height`: printable height in device units.
+    Public ReadOnly Property Height As Integer
+        Get
+            Return Me.mHeight
+        End Get
+    End Property
+
+    ''' API 1 `Copies`. GTK jobs send the dialog's copy count to the print
+    ''' system, so this is 1 (as legacy documents for macOS).
+    Public ReadOnly Property Copies As Integer
+        Get
+            Return Me.mCopies
+        End Get
+    End Property
+
+    ''' API 1 `FirstPage`: first page of the dialog's range (1 otherwise).
+    Public ReadOnly Property FirstPage As Integer
+        Get
+            Return Me.mFirstPage
+        End Get
+    End Property
+
+    ''' API 1 `LastPage`: last page of the dialog's range; 0 means "all pages".
+    Public ReadOnly Property LastPage As Integer
+        Get
+            Return Me.mLastPage
+        End Get
+    End Property
+
+    ''' API 1 `PrintingCancelled`: True after ClassicCancelPrinting.
+    Public ReadOnly Property PrintingCancelled As Boolean
+        Get
+            Return Me.mState = 2
+        End Get
+    End Property
+
+    ''' Buoy extension: pages recorded so far (the current page included).
+    Public ReadOnly Property ClassicPageCount As Integer
+        Get
+            Return Me.mPageCount
+        End Get
+    End Property
+
+    Public ReadOnly Property ClassicDestination As ClassicPrintDestination
+        Get
+            Return Me.mDestination
+        End Get
+    End Property
+
+    ''' Buoy extension: CUPS queue or GTK printer name ("" for PDF).
+    Public ReadOnly Property ClassicPrinterName As String
+        Get
+            Return Me.mQueue
+        End Get
+    End Property
+
+    ''' Buoy extension: CUPS job id after a successful CUPS submission, else 0.
+    Public ReadOnly Property ClassicJobId As Integer
+        Get
+            Return Me.mJobId
+        End Get
+    End Property
+
+    ''' Buoy extension: True once ClassicFinishPrinting succeeded.
+    Public ReadOnly Property ClassicFinished As Boolean
+        Get
+            Return Me.mState = 1
+        End Get
+    End Property
+
+    ''' Buoy extension: the finished PDF of a PDF-destination job.
+    Public Function ClassicPDFBytes() As Bytes
+        If Me.mDestination <> ClassicPrintDestination.PDF Then
+            Throw New InvalidArgumentException("Only PDF-destination jobs expose their document")
+        End If
+        If Me.mState <> 1 Then Throw New InvalidArgumentException("Call ClassicFinishPrinting before reading the PDF")
+        Return Me.mPDF
+    End Function
+
+    ''' Buoy extension: embeds a TrueType font usable as `TextFont = name`.
+    Public Sub ClassicLoadFont(f As FileSystemItem, name As String)
+        Me.Target()
+        ClassicPrintRequireText(name, "font name", False)
+        Me.mDocument.LoadFont(f, name)
+    End Sub
+
+    ''' API 1 `NextPage`: ends the current page and starts a new one.
+    Public Sub NextPage()
+        Me.Target()
+        If Me.mPageCount >= 10000 Then Throw New InvalidArgumentException("Print jobs are limited to 10000 pages")
+        Me.BeginPage()
+    End Sub
+
+    ''' Buoy extension: discards every page; nothing is submitted.
+    Public Sub ClassicCancelPrinting()
+        If Me.mState = 1 Then Throw New InvalidArgumentException("The print job is already finished")
+        Me.mState = 2
+        #If TargetLinux Then
+            Me.ReleaseGtk()
+        #End If
+    End Sub
+
+    ''' Buoy extension: finishes the last page and submits the document (or,
+    ''' for PDF jobs, makes ClassicPDFBytes available). Errors raise and leave
+    ''' the job failed; it is never retried or reported as printed.
+    Public Sub ClassicFinishPrinting()
+        Me.Target()
+        If Me.mDestination <> ClassicPrintDestination.PDF Then
+            ClassicPrintRequireText(Me.ClassicJobTitle, "job title", False)
+        End If
+        Dim document As Bytes
+        Try
+            document = Me.mDocument.ToBytes()
+        Catch failure As Exception
+            Me.mState = 3
+            #If TargetLinux Then
+                Me.ReleaseGtk()
+            #End If
+            Throw failure
+        End Try
+        Select Case Me.mDestination
+            Case ClassicPrintDestination.PDF
+                Me.mPDF = document
+                Me.mState = 1
+            Case ClassicPrintDestination.CupsQueue
+                #If TargetLinux Then
+                    Try
+                        Me.mJobId = ClassicCupsSubmit(Me.mQueue, Me.ClassicJobTitle, document)
+                    Catch failure As Exception
+                        Me.mState = 3
+                        Throw failure
+                    End Try
+                    Me.mState = 1
+                #Else
+                    Me.mState = 3
+                    Throw New UnsupportedOperationException("CUPS printing is implemented only on Linux")
+                #End If
+            Case ClassicPrintDestination.GtkPrinter
+                #If TargetLinux Then
+                    Try
+                        Me.SendGtk(document)
+                    Catch failure As Exception
+                        Me.mState = 3
+                        Me.ReleaseGtk()
+                        Throw failure
+                    End Try
+                    Me.mState = 1
+                    Me.ReleaseGtk()
+                #Else
+                    Me.mState = 3
+                    Throw New UnsupportedOperationException("GTK printing is implemented only on Linux")
+                #End If
+        End Select
+    End Sub
+
+#If TargetLinux Then
+    Private Sub SendGtk(document As Bytes)
+        Dim acquired As Boolean = ClassicGtkEnter()
+        Dim fileName As String = ""
+        Dim job As Ptr = Nil
+        Try
+            fileName = ClassicWriteTempPDF(document)
+            job = GtkJobNew(Me.ClassicJobTitle, Me.mGtkPrinter, Me.mGtkSettings, Me.mGtkSetup)
+            If job = Nil Then Throw New IOException("Could not create the GtkPrintJob")
+            Dim failure As Ptr = Nil
+            If GtkJobSetSource(job, fileName, failure) = 0 Then
+                Dim message As String = "gtk_print_job_set_source_file failed"
+                If failure <> Nil Then
+                    Dim record As ClassicGError
+                    ClassicCopyGError(record, failure, 16)
+                    If record.Message <> Nil Then message = message + ": " + CType(CType(record.Message, CString), String)
+                    GErrorFree(failure)
+                End If
+                Throw New IOException(message)
+            End If
+            GtkJobSetCopies(job, Me.mNativeCopies)
+            GtkJobSetCollate(job, If(Me.mNativeCollate, 1, 0))
+            GtkJobSetReverse(job, If(Me.mNativeReverse, 1, 0))
+            Dim completed As ClassicGtkJobCompleted = AddressOf ClassicGtkOnJobCompleted
+            ClassicGtkWait.Active = True
+            ClassicGtkWait.Done = False
+            ClassicGtkWait.Failed = False
+            ClassicGtkWait.FailureMessage = ""
+            GtkJobSend(job, CType(completed, Ptr), Nil, Nil)
+            While Not ClassicGtkWait.Done
+                GMainIteration(Nil, 1)
+            Wend
+            ClassicGtkWait.Active = False
+            If ClassicGtkWait.Failed Then Throw New IOException("GtkPrintJob failed: " + ClassicGtkWait.FailureMessage)
+        Catch failure As Exception
+            ClassicGtkWait.Active = False
+            If job <> Nil Then GObjectUnref(job)
+            job = Nil
+            If fileName <> "" Then ClassicUnlink(fileName)
+            fileName = ""
+            ClassicGtkLeave(acquired)
+            acquired = False
+            Throw failure
+        Finally
+            If job <> Nil Then GObjectUnref(job)
+            If fileName <> "" Then ClassicUnlink(fileName)
+            ClassicGtkLeave(acquired)
+        End Try
+    End Sub
+#End If
+
+    ' ── Drawing ──
+
+    Private Function Ink() As Color
+        If Me.mTransparency > 0.0 Then
+            Throw New UnsupportedOperationException("Transparency is not supported for printed shapes and text")
+        End If
+        If Me.mForeColor.A < 1.0 Then
+            Throw New UnsupportedOperationException("Translucent ForeColor is not supported for printed shapes and text")
+        End If
+        Return Me.mForeColor
+    End Function
+
+    Private Function Pen() As Double
+        ClassicPrintRequireFinite([Me.PenWidth, Me.PenHeight])
+        If Me.PenWidth <> Me.PenHeight Then
+            Throw New UnsupportedOperationException("PenWidth and PenHeight differ; printing strokes with one pen size")
+        End If
+        If Not (Me.PenWidth > 0.0) Then Throw New InvalidArgumentException("PenWidth must be positive")
+        Return Me.PenWidth
+    End Function
+
+    Private Sub RequireSize(width As Double, height As Double)
+        ClassicPrintRequireFinite([width, height])
+        If width < 0.0 Or height < 0.0 Then Throw New InvalidArgumentException("Width and height must not be negative")
+    End Sub
+
+    ''' API 1 `DrawLine`. The pen hangs right/below the coordinates, as on legacy
+    ''' raster contexts: the p x p pen square swept from (x1, y1) to (x2, y2) is
+    ''' filled, so a horizontal line covers x1..x2+p and a zero-length line is a
+    ''' p x p dot.
+    Public Sub DrawLine(x1 As Double, y1 As Double, x2 As Double, y2 As Double)
+        Me.Target()
+        ClassicPrintRequireFinite([x1, y1, x2, y2])
+        Dim p As Double = Me.Pen()
+        Dim c As Color = Me.Ink()
+        Dim xs As Array Of Double = [x1, x1 + p, x1 + p, x1, x2, x2 + p, x2 + p, x2]
+        Dim ys As Array Of Double = [y1, y1, y1 + p, y1 + p, y2, y2, y2 + p, y2 + p]
+        ClassicPDFSetFill(Me.mPageHandle, c.R, c.G, c.B)
+        Me.PolygonPath(ClassicConvexHull(xs, ys))
+        ClassicPDFFill(Me.mPageHandle)
+        Me.mDocument.CheckError()
+    End Sub
+
+    ''' API 1 `DrawRect`: the outline lies inside (x, y, width, height).
+    Public Sub DrawRect(x As Double, y As Double, width As Double, height As Double)
+        Dim g As PDFGraphics = Me.Target()
+        ClassicPrintRequireFinite([x, y])
+        Me.RequireSize(width, height)
+        Dim p As Double = Me.Pen()
+        If width <= p Or height <= p Then
+            g.FillRect(x, y, width, height, Me.Ink())
+            Return
+        End If
+        g.StrokeRect(x + p / 2.0, y + p / 2.0, width - p, height - p, p, Me.Ink())
+    End Sub
+
+    ''' API 1 `FillRect` covering exactly width x height device units.
+    Public Sub FillRect(x As Double, y As Double, width As Double, height As Double)
+        Dim g As PDFGraphics = Me.Target()
+        ClassicPrintRequireFinite([x, y])
+        Me.RequireSize(width, height)
+        g.FillRect(x, y, width, height, Me.Ink())
+    End Sub
+
+    ''' API 1 `DrawOval`: the outline lies inside the bounds.
+    Public Sub DrawOval(x As Double, y As Double, width As Double, height As Double)
+        Dim g As PDFGraphics = Me.Target()
+        ClassicPrintRequireFinite([x, y])
+        Me.RequireSize(width, height)
+        Dim p As Double = Me.Pen()
+        If width <= p Or height <= p Then
+            g.FillOval(x, y, width, height, Me.Ink())
+            Return
+        End If
+        g.StrokeOval(x + p / 2.0, y + p / 2.0, width - p, height - p, p, Me.Ink())
+    End Sub
+
+    Public Sub FillOval(x As Double, y As Double, width As Double, height As Double)
+        Dim g As PDFGraphics = Me.Target()
+        ClassicPrintRequireFinite([x, y])
+        Me.RequireSize(width, height)
+        g.FillOval(x, y, width, height, Me.Ink())
+    End Sub
+
+    Private Function Radius(arcWidth As Double, arcHeight As Double) As Double
+        If arcWidth <> arcHeight Then
+            Throw New UnsupportedOperationException("arcWidth and arcHeight differ; printing uses circular corners")
+        End If
+        ClassicPrintRequireFinite([arcWidth])
+        If arcWidth < 0.0 Then Throw New InvalidArgumentException("Corner arcs must not be negative")
+        Return arcWidth
+    End Function
+
+    ''' API 1 `DrawRoundRect`; the arc is the corner radius, as in ClassicGraphics.
+    Public Sub DrawRoundRect(x As Double, y As Double, width As Double, height As Double, arcWidth As Double, arcHeight As Double)
+        Dim g As PDFGraphics = Me.Target()
+        ClassicPrintRequireFinite([x, y])
+        Me.RequireSize(width, height)
+        Dim r As Double = Me.Radius(arcWidth, arcHeight)
+        Dim p As Double = Me.Pen()
+        If width <= p Or height <= p Then
+            g.FillRoundedRect(x, y, width, height, r, Me.Ink())
+            Return
+        End If
+        g.StrokeRoundedRect(x + p / 2.0, y + p / 2.0, width - p, height - p, r, p, Me.Ink())
+    End Sub
+
+    Public Sub FillRoundRect(x As Double, y As Double, width As Double, height As Double, arcWidth As Double, arcHeight As Double)
+        Dim g As PDFGraphics = Me.Target()
+        ClassicPrintRequireFinite([x, y])
+        Me.RequireSize(width, height)
+        g.FillRoundedRect(x, y, width, height, Me.Radius(arcWidth, arcHeight), Me.Ink())
+    End Sub
+
+    ' API 1 polygon arrays are 1-based: element 0 is ignored, then x1, y1, ...
+    ' The caller has already set the paint color/width (see the pdf note).
+    Private Sub PolygonPath(points As Array Of Double)
+        Dim count As Integer = Array.Count(points)
+        Dim h As Ptr = Me.mPageHandle
+        ClassicPDFMoveTo(h, points(1), points(2))
+        Dim i As Integer = 3
+        While i < count
+            ClassicPDFLineTo(h, points(i), points(i + 1))
+            i += 2
+        Wend
+        ClassicPDFClosePath(h)
+    End Sub
+
+    Private Sub RequirePolygon(points As Array Of Double)
+        Dim count As Integer = Array.Count(points)
+        If count < 7 Or count Mod 2 = 0 Then
+            Throw New InvalidArgumentException("Polygon arrays need an ignored element 0 and at least three x, y pairs")
+        End If
+        Dim coordinates As Array Of Double = []
+        For i As Integer = 1 To count - 1
+            Array.Append(coordinates, points(i))
+        Next
+        ClassicPrintRequireFinite(coordinates)
+    End Sub
+
+    Private Function ToDoubles(points As Array Of Integer) As Array Of Double
+        Dim values As Array Of Double = []
+        For Each value As Integer In points
+            Dim converted As Double = value
+            Array.Append(values, converted)
+        Next
+        Return values
+    End Function
+
+    ''' API 1 `DrawPolygon(points())` (1-based x, y pairs). Each closed edge is
+    ''' drawn like DrawLine: the pen square hangs right/below the vertices.
+    Public Sub DrawPolygon(points As Array Of Double)
+        Me.Target()
+        Me.RequirePolygon(points)
+        Dim p As Double = Me.Pen()
+        Dim c As Color = Me.Ink()
+        Dim count As Integer = Array.Count(points)
+        Dim i As Integer = 1
+        ClassicPDFSetFill(Me.mPageHandle, c.R, c.G, c.B)
+        While i < count
+            Dim x1 As Double = points(i)
+            Dim y1 As Double = points(i + 1)
+            Dim x2 As Double = points(1)
+            Dim y2 As Double = points(2)
+            If i + 2 < count Then
+                x2 = points(i + 2)
+                y2 = points(i + 3)
+            End If
+            Dim xs As Array Of Double = [x1, x1 + p, x1 + p, x1, x2, x2 + p, x2 + p, x2]
+            Dim ys As Array Of Double = [y1, y1, y1 + p, y1 + p, y2, y2, y2 + p, y2 + p]
+            Me.PolygonPath(ClassicConvexHull(xs, ys))
+            i += 2
+        Wend
+        ' One nonzero fill of all edge sweeps (same winding, so no holes).
+        ClassicPDFFill(Me.mPageHandle)
+        Me.mDocument.CheckError()
+    End Sub
+
+    Public Sub DrawPolygon(points As Array Of Integer)
+        Me.DrawPolygon(Me.ToDoubles(points))
+    End Sub
+
+    ''' API 1 `FillPolygon(points())` (1-based x, y pairs).
+    Public Sub FillPolygon(points As Array Of Double)
+        Me.Target()
+        Me.RequirePolygon(points)
+        Dim c As Color = Me.Ink()
+        ClassicPDFSetFill(Me.mPageHandle, c.R, c.G, c.B)
+        Me.PolygonPath(points)
+        ClassicPDFFill(Me.mPageHandle)
+        Me.mDocument.CheckError()
+    End Sub
+
+    Public Sub FillPolygon(points As Array Of Integer)
+        Me.FillPolygon(Me.ToDoubles(points))
+    End Sub
+
+    ' Resolves TextFont/Bold/Italic to a PDF font name or raises.
+    Private Function PDFFont() As String
+        Dim family As String = Me.TextFont
+        If family = "" Or family = "System" Or family = "SmallSystem" Or family = "Arial" Or family = "Helvetica" Then
+            family = "Helvetica"
+        ElseIf family = "Times" Or family = "Times New Roman" Or family = "Times-Roman" Then
+            family = "Times"
+        ElseIf family = "Courier" Or family = "Courier New" Then
+            family = "Courier"
+        ElseIf Me.mDocument.CustomFonts().Get(family).HasValue Or family = "Symbol" Or family = "ZapfDingbats" Then
+            If Me.Bold Or Me.Italic Then
+                Throw New UnsupportedOperationException("Bold/Italic are not synthesized for font '" + family + "'")
+            End If
+            Return family
+        Else
+            Throw New UnsupportedOperationException("Font '" + family + "' is not available for printing; use ClassicLoadFont or a Helvetica/Times/Courier family")
+        End If
+        If family = "Times" Then
+            If Me.Bold And Me.Italic Then Return "Times-BoldItalic"
+            If Me.Bold Then Return "Times-Bold"
+            If Me.Italic Then Return "Times-Italic"
+            Return "Times-Roman"
+        End If
+        If Me.Bold And Me.Italic Then Return family + "-BoldOblique"
+        If Me.Bold Then Return family + "-Bold"
+        If Me.Italic Then Return family + "-Oblique"
+        Return family
+    End Function
+
+    ' TextSize in points (0 = 12). Text is drawn in a point-space transform,
+    ' so libharu's 600-point font limit applies to TextSize itself.
+    Private Function PointTextSize() As Double
+        Dim size As Double = Me.TextSize
+        If size = 0.0 Then size = 12.0
+        If Not (size > 0.0 And size <= 600.0) Then
+            Throw New UnsupportedOperationException("TextSize must be within 0-600 points (the PDF backend's font size limit)")
+        End If
+        Return size
+    End Function
+
+    ''' API 1 `DrawString(text, x, y)`: one line, `y` is the baseline. A
+    ''' positive wrapWidth (wrap/condense) raises UnsupportedOperationException.
+    Public Sub DrawString(text As String, x As Double, y As Double, wrapWidth As Double = 0.0, condense As Boolean = False)
+        Dim g As PDFGraphics = Me.Target()
+        If wrapWidth > 0.0 Then Throw New UnsupportedOperationException("DrawString wrapping/condensing is not supported for printing")
+        ClassicPrintRequireDrawableText(text)
+        ClassicPrintRequireFinite([x, y])
+        Dim font As String = Me.PDFFont()
+        Dim size As Double = Me.PointTextSize()
+        Dim c As Color = Me.Ink()
+        ' Undo the device-unit scale at the baseline origin: glyphs are laid
+        ' out in points, undistorted even when the two resolutions differ.
+        g.Save()
+        Try
+            g.Translate(x, y)
+            g.Scale(1.0 / Me.mUnitX, 1.0 / Me.mUnitY)
+            g.DrawString(text, 0.0, 0.0, font, size, c)
+            If Me.Underline Then
+                Dim w As Double = g.MeasureStringWidth(text, font, size)
+                g.FillRect(0.0, size / 10.0, w, size / 16.0, c)
+            End If
+        Catch failure As Exception
+            g.Restore()
+            Throw failure
+        End Try
+        g.Restore()
+    End Sub
+
+    ''' API 1 `StringWidth` in device units, from the PDF font metrics.
+    Public Function StringWidth(text As String) As Double
+        Dim g As PDFGraphics = Me.Target()
+        ClassicPrintRequireDrawableText(text)
+        Return g.MeasureStringWidth(text, Me.PDFFont(), Me.PointTextSize()) / Me.mUnitX
+    End Function
+
+    Private Sub RequireOpaqueLayer(image As Picture, coordinates As Array Of Double)
+        If image Is Nil Then Throw New NilObjectException("picture is Nil")
+        ClassicPrintRequireFinite(coordinates)
+        If Me.mTransparency > 0.0 Then
+            Throw New UnsupportedOperationException("Transparency is not supported for printed pictures")
+        End If
+    End Sub
+
+    ''' API 1 `DrawPicture(image, x, y)` at natural size (1 pixel = 1 device unit).
+    Public Sub DrawPicture(image As Picture, x As Double, y As Double)
+        Dim g As PDFGraphics = Me.Target()
+        Me.RequireOpaqueLayer(image, [x, y])
+        g.DrawPicture(image, x, y)
+    End Sub
+
+    ''' API 1 5-argument `DrawPicture` crops to the top-left destW x destH region.
+    Public Sub DrawPicture(image As Picture, x As Double, y As Double, destWidth As Double, destHeight As Double)
+        Dim g As PDFGraphics = Me.Target()
+        Me.RequireOpaqueLayer(image, [x, y])
+        Me.RequireSize(destWidth, destHeight)
+        If destWidth = 0.0 Or destHeight = 0.0 Then Return
+        g.Save()
+        g.ClipToRect(x, y, destWidth, destHeight)
+        g.DrawPicture(image, x, y)
+        g.Restore()
+    End Sub
+
+    ''' API 1 9-argument `DrawPicture`: scales the source rectangle into the destination.
+    Public Sub DrawPicture(image As Picture, x As Double, y As Double, destWidth As Double, destHeight As Double, sourceX As Double, sourceY As Double, sourceWidth As Double, sourceHeight As Double)
+        Dim g As PDFGraphics = Me.Target()
+        Me.RequireOpaqueLayer(image, [x, y, sourceX, sourceY])
+        Me.RequireSize(destWidth, destHeight)
+        Me.RequireSize(sourceWidth, sourceHeight)
+        If destWidth = 0.0 Or destHeight = 0.0 Or sourceWidth = 0.0 Or sourceHeight = 0.0 Then Return
+        g.Save()
+        g.ClipToRect(x, y, destWidth, destHeight)
+        g.Translate(x, y)
+        g.Scale(destWidth / sourceWidth, destHeight / sourceHeight)
+        g.DrawPicture(image, 0.0 - sourceX, 0.0 - sourceY)
+        g.Restore()
+    End Sub
+
+    Public Sub DrawPicture(image As ClassicPicture, x As Double, y As Double)
+        If image Is Nil Then Throw New NilObjectException("picture is Nil")
+        Me.DrawPicture(image.NativePicture, x, y)
+    End Sub
+
+    Public Sub DrawPicture(image As ClassicPicture, x As Double, y As Double, destWidth As Double, destHeight As Double)
+        If image Is Nil Then Throw New NilObjectException("picture is Nil")
+        Me.DrawPicture(image.NativePicture, x, y, destWidth, destHeight)
+    End Sub
+
+    Public Sub DrawPicture(image As ClassicPicture, x As Double, y As Double, destWidth As Double, destHeight As Double, sourceX As Double, sourceY As Double, sourceWidth As Double, sourceHeight As Double)
+        If image Is Nil Then Throw New NilObjectException("picture is Nil")
+        Me.DrawPicture(image.NativePicture, x, y, destWidth, destHeight, sourceX, sourceY, sourceWidth, sourceHeight)
+    End Sub
+End Class
+
+' ── Entry points ────────────────────────────────────────────────────────────
+
+''' Buoy extension: a printer Graphics recorded as PDF on every platform. It
+''' contacts no print system; finish it and read ClassicPDFBytes.
+Public Function ClassicOpenPDFPrinter() As ClassicPrinterGraphics
+    Return ClassicOpenPDFPrinter(New ClassicPrinterSetup())
+End Function
+
+Public Function ClassicOpenPDFPrinter(setup As ClassicPrinterSetup) As ClassicPrinterGraphics
+    Dim effective As ClassicPrinterSetup = setup
+    If effective Is Nil Then effective = New ClassicPrinterSetup()
+    Return New ClassicPrinterGraphics(effective, ClassicPrintDestination.PDF, "")
+End Function
+
+''' API 1 `OpenPrinter([setup])` without a dialog. Linux: targets
+''' `setup.ClassicPrinterName`, or the default CUPS queue, and returns Nil
+''' when CUPS reports no such queue. Unreachable CUPS raises IOException.
+''' macOS/Windows raise UnsupportedOperationException.
+Public Function OpenPrinter() As ClassicPrinterGraphics
+    Return OpenPrinter(New ClassicPrinterSetup())
+End Function
+
+Public Function OpenPrinter(setup As ClassicPrinterSetup) As ClassicPrinterGraphics
+    Dim effective As ClassicPrinterSetup = setup
+    If effective Is Nil Then effective = New ClassicPrinterSetup()
+    #If TargetLinux Then
+        Dim queue As String = ClassicCupsResolveQueue(effective.ClassicPrinterName)
+        If queue = "" Then Return Nil
+        Return New ClassicPrinterGraphics(effective, ClassicPrintDestination.CupsQueue, queue)
+    #Else
+        Throw New UnsupportedOperationException("OpenPrinter is implemented only on Linux (CUPS); use ClassicOpenPDFPrinter for PDF output")
+    #End If
+End Function
+
+''' API 1 `OpenPrinterDialog([setup], [parentWindow])`: the native GTK 4 print
+''' dialog (Linux). Returns Nil on cancel. On OK, the dialog's paper,
+''' orientation and margins are copied into `setup`, and the returned
+''' Graphics sends its PDF to the chosen printer.
+Public Function OpenPrinterDialog() As ClassicPrinterGraphics
+    Return ClassicRunPrinterDialog(New ClassicPrinterSetup(), None)
+End Function
+
+Public Function OpenPrinterDialog(setup As ClassicPrinterSetup) As ClassicPrinterGraphics
+    Return ClassicRunPrinterDialog(setup, None)
+End Function
+
+Public Function OpenPrinterDialog(setup As ClassicPrinterSetup, parentWindow As Window) As ClassicPrinterGraphics
+    Return ClassicRunPrinterDialog(setup, Some(parentWindow))
+End Function
+
+Internal Function ClassicRunPrinterDialog(setup As ClassicPrinterSetup, parentWindow As Optional Of Window) As ClassicPrinterGraphics
+    Dim effective As ClassicPrinterSetup = setup
+    If effective Is Nil Then effective = New ClassicPrinterSetup()
+    #If TargetLinux Then
+        Dim acquired As Boolean = ClassicGtkEnter()
+        Dim dialog As Ptr = Nil
+        Dim pageSetup As Ptr = Nil
+        Dim settings As Ptr = Nil
+        Try
+            dialog = GtkPrintDialogNew("Print", ClassicGtkParent(parentWindow))
+            If dialog = Nil Then Throw New IOException("Could not create the GTK print dialog")
+            GObjectRef(dialog)
+            pageSetup = effective.NewGtkPageSetup()
+            GtkPrintDialogSetPageSetup(dialog, pageSetup)
+            If effective.ClassicPrinterName <> "" Then
+                Dim initial As Ptr = GtkSettingsNew()
+                GtkSettingsSetPrinter(initial, effective.ClassicPrinterName)
+                GtkPrintDialogSetSettings(dialog, initial)
+                GObjectUnref(initial)
+            End If
+            Dim response As Integer = ClassicGtkRunDialog(dialog, Nil)
+            If response <> ClassicGtkResponseOK Then Return Nil
+            Dim printer As Ptr = GtkPrintDialogPrinter(dialog)
+            If printer = Nil Then Throw New IOException("The print dialog returned no printer")
+            If GtkPrinterAcceptsPDF(printer) = 0 Then
+                Throw New UnsupportedOperationException("The selected printer does not accept PDF documents")
+            End If
+            Dim chosen As Ptr = GtkPrintDialogGetPageSetup(dialog)
+            Dim candidate As New ClassicPrinterSetup()
+            candidate.SetupString = effective.SetupString
+            candidate.ReadGtkPageSetup(chosen)
+            Dim name As String = CType(GtkPrinterName(printer), String)
+            effective.SetupString = candidate.SetupString
+            settings = GtkPrintDialogGetSettings(dialog)
+            Dim opened As New ClassicPrinterGraphics(effective, ClassicPrintDestination.GtkPrinter, name)
+            opened.AdoptGtk(printer, settings, chosen)
+            settings = Nil
+            Return opened
+        Catch failure As Exception
+            ClassicGtkWait.Active = False
+            If settings <> Nil Then GObjectUnref(settings)
+            settings = Nil
+            If pageSetup <> Nil Then GObjectUnref(pageSetup)
+            pageSetup = Nil
+            If dialog <> Nil Then
+                GtkWindowDestroy(dialog)
+                GObjectUnref(dialog)
+            End If
+            dialog = Nil
+            ClassicGtkLeave(acquired)
+            acquired = False
+            Throw failure
+        Finally
+            If settings <> Nil Then GObjectUnref(settings)
+            If pageSetup <> Nil Then GObjectUnref(pageSetup)
+            If dialog <> Nil Then
+                GtkWindowDestroy(dialog)
+                GObjectUnref(dialog)
+            End If
+            ClassicGtkLeave(acquired)
+        End Try
+    #Else
+        Throw New UnsupportedOperationException("OpenPrinterDialog is implemented only on Linux (GTK 4); use ClassicOpenPDFPrinter for PDF output")
+    #End If
+End Function

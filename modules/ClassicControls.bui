@@ -1,0 +1,1691 @@
+' API 1 (REALbasic / legacy pre-2019r2) control adapters over the bundled legacy
+' shim's Desktop* wrappers. Buoy's native ListBox/Checkbox/ComboBox own the
+' plain names, so ported declarations are rewritten to Classic* names:
+'   ListBox -> ClassicListBox, PopupMenu -> ClassicPopupMenu,
+'   ComboBox -> ClassicComboBox, CheckBox -> ClassicCheckBox.
+' Event semantics follow the archived docs.xojo.com pages; every deviation is
+' listed in notes/controls.md.
+Import RBFoundation
+Import ClassicListNative
+
+''' Mutable result slot for ClassicListBox.CompareRows. Buoy events pass
+''' parameters by value, so API 1's `ByRef result As Integer` becomes
+''' `outcome As ClassicCompareResult` (`Result` is a Buoy keyword); rewrite
+''' `result = x` to `outcome.Value = x`.
+Public Class ClassicCompareResult
+    Public Property Value As Integer = 0
+End Class
+
+''' Per-row tag storage. Moving the record (not copying its fields) keeps a
+''' row's Variant tags attached to that row through insert, remove and sort.
+Private Class ClassicListRow
+    Public Property Tag As Variant
+    Public Property CellTags As Array Of Variant
+
+    Public Sub Constructor()
+        Me.Tag = Variant.Empty()
+        Me.CellTags = []
+    End Sub
+End Class
+
+Private Function ClassicSplitLines(value As String) As Array Of String
+    Dim normalized As String = String.Replace(value, "\r\n", "\n")
+    normalized = String.Replace(normalized, "\r", "\n")
+    Return String.Split(normalized, "\n")
+End Function
+
+Private Function ClassicTabFields(value As String) As Array Of String
+    Return String.Split(value, "\t")
+End Function
+
+''' API 1 `ListBox`. ListIndex, Change, LastIndex, tags and Sort are tracked
+''' by row identity. On Linux a ClassicListNativeBridge adds DoubleClick,
+''' KeyDown with type-to-select, header clicks with sort indicators,
+''' HasHeading, column titles/widths/removal and SelectionMultiple; other
+''' platforms report those as unsupported (see notes/controls.md and
+''' notes/list-native.md).
+Public Class ClassicListBox Inherits DesktopListBox Implements ClassicListNativeClient
+    Public Const SortDescending As Integer = -1
+    Public Const SortNone As Integer = 0
+    Public Const SortAscending As Integer = 1
+    Public Const SelectionSingle As Integer = 0
+    Public Const SelectionMultiple As Integer = 1
+
+    ''' Selection changed, by the user or by code (ListIndex/Selected
+    ''' assignment, or removal of the selected row).
+    Event Change()
+    ''' Custom sort comparison. Set outcome.Value to -1/0/1 and return True;
+    ''' return False to use the default case-insensitive text comparison.
+    Event CompareRows(row1 As Integer, row2 As Integer, column As Integer, outcome As ClassicCompareResult) As Boolean
+    ''' The user double-clicked a row (native, Linux). ListIndex is the row.
+    Event DoubleClick()
+    ''' A key was pressed while the list has focus (native, Linux). Return
+    ''' True to consume it: the list does not navigate or type-select.
+    Event KeyDown(key As String) As Boolean
+    ''' A header was clicked (or PressHeader called). Return True to leave
+    ''' SortedColumn unchanged and not sort.
+    Event HeaderPressed(column As Integer) As Boolean
+    ''' The list is about to sort on `column` (header click or Sort). Return
+    ''' True to prevent the sort.
+    Event SortColumn(column As Integer) As Boolean
+
+    Private Property mRecords As Array Of ClassicListRow
+    Private Property mSelected As ClassicListRow
+    Private Property mMulti As Array Of ClassicListRow
+    Private Property mMultiple As Boolean = False
+    Private Property mLastIndex As Integer = -1
+    Private Property mQuiet As Integer = 0
+    Private Property mSortedColumn As Integer = -1
+    Private Property mSortDirections As Array Of Integer
+    Private Property mColumns As Integer = 1
+    Private Property mWidthExpressions As Array Of String
+    Private Property mHasHeading As Boolean = False
+    Private Property mBridge As ClassicListNativeBridge
+    Private Property mNative As Boolean = False
+    Private Property mTypeBuffer As String = ""
+    Private Property mTypeTime As Integer = 0
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.mRecords = []
+        Me.mMulti = []
+        Me.mSortDirections = []
+        Me.mWidthExpressions = []
+        Me.mSelected = Nil
+        ' API 1 ListBoxes start with one column; the Desktop wrapper starts at 0.
+        Super.ColumnCount = 1
+        Me.mBridge = New ClassicListNativeBridge(Me)
+        Me.mNative = Me.mBridge.Attach(Me.NativeWidget)
+        ' API 1 HasHeading defaults to False. Headers can only be hidden
+        ' where the native bridge is attached; elsewhere they stay visible.
+        If Me.mNative Then Call Me.mBridge.SetHeaderVisible(False)
+    End Sub
+
+    ''' True when the native bridge is attached (Linux GTK). Without it,
+    ''' DoubleClick/KeyDown/HeaderPressed never fire and HasHeading = False,
+    ''' retitling, width changes, column removal and SelectionMultiple raise
+    ''' UnsupportedOperationException.
+    Public ReadOnly Property NativeListAvailable As Boolean
+        Get
+            Return Me.mNative
+        End Get
+    End Property
+
+    Private Sub RequireNative(feature As String)
+        If Not Me.mNative Then
+            Throw New UnsupportedOperationException(feature + " needs the native ListBox bridge, which this platform does not provide")
+        End If
+    End Sub
+
+    ' ── Bookkeeping ────────────────────────────────────────────────────
+
+    ''' Rows edited through the public `Rows` escape hatch have no identity;
+    ''' pad or trim records so tags and selection stay index-safe.
+    Private Sub SyncRecords()
+        Dim target As Integer = Array.Count(Me.Rows)
+        While Array.Count(Me.mRecords) < target
+            Me.mRecords.Append(New ClassicListRow())
+        Wend
+        If Array.Count(Me.mRecords) > target Then
+            While Array.Count(Me.mRecords) > target
+                Me.mRecords.RemoveAt(Array.Count(Me.mRecords) - 1)
+            Wend
+            If Me.IndexOfRecord(Me.mSelected) < 0 Then Me.mSelected = Nil
+            Dim kept As Array Of ClassicListRow = []
+            For Each rec As ClassicListRow In Me.mMulti
+                If Me.IndexOfRecord(rec) >= 0 Then kept.Append(rec)
+            Next
+            Me.mMulti = kept
+        End If
+    End Sub
+
+    Private Function IndexOfRecord(rec As ClassicListRow) As Integer
+        If rec Is Nil Then Return -1
+        Dim i As Integer = 0
+        While i < Array.Count(Me.mRecords)
+            If Me.mRecords(i) Is rec Then Return i
+            i = i + 1
+        Wend
+        Return -1
+    End Function
+
+    Private Function InMulti(rec As ClassicListRow) As Boolean
+        For Each item As ClassicListRow In Me.mMulti
+            If item Is rec Then Return True
+        Next
+        Return False
+    End Function
+
+    ''' Selected row indexes in ascending order (either selection mode).
+    Private Function SelectedIndexes() As Array Of Integer
+        Dim rows As Array Of Integer = []
+        If Not Me.mMultiple Then
+            Dim row As Integer = Me.IndexOfRecord(Me.mSelected)
+            If row >= 0 Then rows.Append(row)
+            Return rows
+        End If
+        Dim i As Integer = 0
+        While i < Array.Count(Me.mRecords)
+            If Me.InMulti(Me.mRecords(i)) Then rows.Append(i)
+            i = i + 1
+        Wend
+        Return rows
+    End Function
+
+    Private Function SameSelection(a As Array Of ClassicListRow, b As Array Of ClassicListRow) As Boolean
+        If Array.Count(a) <> Array.Count(b) Then Return False
+        For Each rec As ClassicListRow In a
+            Dim found As Boolean = False
+            For Each other As ClassicListRow In b
+                If other Is rec Then found = True
+            Next
+            If Not found Then Return False
+        Next
+        Return True
+    End Function
+
+    Private Sub CheckRow(row As Integer)
+        If row < 0 Or row >= Array.Count(Me.Rows) Then
+            Throw New OutOfBoundsException("ListBox row " + String.From(row) + " is out of range")
+        End If
+    End Sub
+
+    Private Sub CheckColumn(column As Integer)
+        If column < 0 Or column >= Me.mColumns Then
+            Throw New OutOfBoundsException("ListBox column " + String.From(column) + " is out of range")
+        End If
+    End Sub
+
+    ''' Native columns created so far (the runtime's own counter; hidden
+    ''' trailing columns are still counted).
+    Private Function NativeColumnCount() As Integer
+        Dim native As ListBox = Me
+        Return native.ColumnCount
+    End Function
+
+    ''' Native ReloadData/ReloadRow clear the selection on GTK and raise a
+    ''' spurious SelectionChanged; keep the logical selection and re-apply it.
+    Private Sub PushSelection()
+        Me.mQuiet = Me.mQuiet + 1
+        If Me.mMultiple Then
+            Call Me.mBridge.SelectRows(Me.SelectedIndexes())
+        Else
+            Me.SelectedRow = Me.IndexOfRecord(Me.mSelected)
+        End If
+        Me.mQuiet = Me.mQuiet - 1
+    End Sub
+
+    Public Overrides Sub ReloadData()
+        Me.mQuiet = Me.mQuiet + 1
+        Super.ReloadData()
+        Me.mQuiet = Me.mQuiet - 1
+        Me.SyncRecords()
+        Me.ApplyColumns()
+        Me.PushSelection()
+    End Sub
+
+    Public Overrides Sub ReloadRow(row As Integer)
+        Me.mQuiet = Me.mQuiet + 1
+        Super.ReloadRow(row)
+        Me.mQuiet = Me.mQuiet - 1
+        Me.PushSelection()
+    End Sub
+
+    Handle SelectionChanged()
+        If Me.mQuiet > 0 Or Me.mMultiple Then Return
+        Me.SyncRecords()
+        Dim row As Integer = Me.SelectedRow
+        If row >= 0 And row < Array.Count(Me.mRecords) Then
+            Me.mSelected = Me.mRecords(row)
+        Else
+            Me.mSelected = Nil
+        End If
+        RaiseEvent Change()
+    End Handle
+
+    ' ── Native bridge callbacks (ClassicListNativeClient) ──────────────
+
+    ''' Native row activation: a mouse double-click on GTK.
+    Public Sub ClassicListNativeActivated(row As Integer)
+        RaiseEvent DoubleClick()
+    End Sub
+
+    Public Function ClassicListNativeKey(keyval As Integer, codepoint As Integer, modifiers As Integer) As Boolean
+        Dim key As String = ClassicListKeyString(keyval, codepoint)
+        If key = "" Then Return False
+        If RaiseEvent KeyDown(key) Then Return True
+        ' Type-to-select: printable keys without Control/Alt/Super/Meta.
+        If codepoint < 32 Or codepoint = 127 Then Return False
+        If (modifiers And ClassicListCommandModifiers) <> 0 Then Return False
+        Return Me.TypeSelect(String.Chr(codepoint))
+    End Function
+
+    Public Sub ClassicListNativeHeader(column As Integer)
+        If column < 0 Or column >= Me.mColumns Then
+            Me.ApplySortIndicator()
+            Return
+        End If
+        Me.HeaderClick(column, True)
+    End Sub
+
+    Public Sub ClassicListNativeSelection()
+        If Me.mQuiet > 0 Or Not Me.mMultiple Then Return
+        Me.SyncRecords()
+        Dim chosen As Array Of ClassicListRow = []
+        For Each row As Integer In Me.mBridge.SelectedRows()
+            If row >= 0 And row < Array.Count(Me.mRecords) Then chosen.Append(Me.mRecords(row))
+        Next
+        If Me.SameSelection(chosen, Me.mMulti) Then Return
+        Me.mMulti = chosen
+        RaiseEvent Change()
+    End Sub
+
+    Public Sub ClassicListNativeResized(width As Integer)
+        If Me.HasRelativeWidths() Then Me.ApplyWidths()
+    End Sub
+
+    ''' Incremental, case-insensitive prefix search on column 0. Keys typed
+    ''' within one second extend the prefix. Returns True when a row matched.
+    Private Function TypeSelect(typed As String) As Boolean
+        Dim now As Integer = System.Microseconds()
+        If now - Me.mTypeTime > 1000000 Then Me.mTypeBuffer = ""
+        Me.mTypeTime = now
+        Me.mTypeBuffer = Me.mTypeBuffer + typed
+        Dim r As Integer = 0
+        While r < Array.Count(Me.Rows)
+            If String.StartsWith(Me.CellTextAt(r, 0), Me.mTypeBuffer) Then
+                If Me.mMultiple Then
+                    Dim only As Array Of ClassicListRow = [Me.mRecords(r)]
+                    If Not Me.SameSelection(only, Me.mMulti) Then
+                        Me.mMulti = only
+                        Me.PushSelection()
+                        RaiseEvent Change()
+                    End If
+                Else
+                    Me.ListIndex = r
+                End If
+                Return True
+            End If
+            r = r + 1
+        Wend
+        Return False
+    End Function
+
+    ' ── Rows ───────────────────────────────────────────────────────────
+
+    ''' API 1 `ListCount`.
+    Public ReadOnly Property ListCount As Integer
+        Get
+            Return Array.Count(Me.Rows)
+        End Get
+    End Property
+
+    ''' API 1 `LastIndex`: the row most recently created by AddRow or
+    ''' InsertRow (-1 before any). Removal and sorting do not change it.
+    Public ReadOnly Property LastIndex As Integer
+        Get
+            Return Me.mLastIndex
+        End Get
+    End Property
+
+    ''' API 2 `LastAddedRowIndex`; same value as LastIndex (the Desktop
+    ''' wrapper's RowCount - 1 is wrong after AddRowAt).
+    @Shadows
+    Public ReadOnly Property LastAddedRowIndex As Integer
+        Get
+            Return Me.mLastIndex
+        End Get
+    End Property
+
+    Public Overrides Sub AddRow(ParamArray items As String)
+        Me.SyncRecords()
+        Me.mRecords.Append(New ClassicListRow())
+        Me.mLastIndex = Array.Count(Me.mRecords) - 1
+        ' A ParamArray cannot be forwarded; add an empty row, then fill it.
+        Super.AddRow()
+        Me.Rows(Me.mLastIndex) = Array.AsResizable(items)
+        Me.ReloadRow(Me.mLastIndex)
+    End Sub
+
+    ''' API 1 `AddRow(items() As String)`: one column per element. Buoy
+    ''' cannot overload it beside the ParamArray form; rewrite to AddRowItems.
+    Public Sub AddRowItems(items As Array Of String)
+        Dim copy As Array Of String = []
+        Dim i As Integer = 0
+        While i < Array.Count(items)
+            copy.Append(items(i))
+            i = i + 1
+        Wend
+        Me.SyncRecords()
+        Me.mRecords.Append(New ClassicListRow())
+        Me.mLastIndex = Array.Count(Me.mRecords) - 1
+        Super.AddRow()
+        Me.Rows(Me.mLastIndex) = copy
+        Me.ReloadRow(Me.mLastIndex)
+    End Sub
+
+    Public Overrides Sub AddRowAt(index As Integer, ParamArray items As String)
+        Me.SyncRecords()
+        If index < 0 Or index > Array.Count(Me.Rows) Then
+            Throw New OutOfBoundsException("ListBox insert row " + String.From(index) + " is out of range")
+        End If
+        Me.mRecords.Insert(index, New ClassicListRow())
+        Me.mLastIndex = index
+        Super.AddRowAt(index)
+        Me.Rows(index) = Array.AsResizable(items)
+        Me.ReloadRow(index)
+    End Sub
+
+    ''' API 1 `InsertRow(row, text [, indent])`. Text goes to column 0;
+    ''' indent only affects hierarchical lists, which Buoy does not provide.
+    Public Sub InsertRow(row As Integer, text As String, indent As Integer = 0)
+        Me.AddRowAt(row, text)
+    End Sub
+
+    Public Overrides Sub RemoveRowAt(index As Integer)
+        Me.SyncRecords()
+        Me.CheckRow(index)
+        Dim rec As ClassicListRow = Me.mRecords(index)
+        Dim wasSelected As Boolean = rec Is Me.mSelected
+        If Me.InMulti(rec) Then
+            wasSelected = True
+            Dim kept As Array Of ClassicListRow = []
+            For Each item As ClassicListRow In Me.mMulti
+                If Not (item Is rec) Then kept.Append(item)
+            Next
+            Me.mMulti = kept
+        End If
+        Me.mRecords.RemoveAt(index)
+        If rec Is Me.mSelected Then Me.mSelected = Nil
+        Super.RemoveRowAt(index)
+        If wasSelected Then RaiseEvent Change()
+    End Sub
+
+    ''' API 1 `RemoveRow(index)`.
+    Public Sub RemoveRow(index As Integer)
+        Me.RemoveRowAt(index)
+    End Sub
+
+    Public Overrides Sub RemoveAllRows()
+        Dim hadSelection As Boolean = Not (Me.mSelected Is Nil) Or Array.Count(Me.mMulti) > 0
+        Me.mRecords = []
+        Me.mSelected = Nil
+        Me.mMulti = []
+        Super.RemoveAllRows()
+        If hadSelection Then RaiseEvent Change()
+    End Sub
+
+    ''' API 1 `DeleteAllRows`.
+    Public Sub DeleteAllRows()
+        Me.RemoveAllRows()
+    End Sub
+
+    ' ── Selection ──────────────────────────────────────────────────────
+
+    ''' API 1 `SelectionType`: SelectionSingle (default) or
+    ''' SelectionMultiple. Multiple needs the native bridge. Switching keeps
+    ''' the selected rows that the new mode can hold (the lowest one when
+    ''' going back to single) and raises Change only if rows were dropped.
+    Public Property SelectionType As Integer
+        Get
+            If Me.mMultiple Then Return ClassicListBox.SelectionMultiple
+            Return ClassicListBox.SelectionSingle
+        End Get
+        Set
+            If value <> ClassicListBox.SelectionSingle And value <> ClassicListBox.SelectionMultiple Then
+                Throw New InvalidArgumentException("SelectionType must be SelectionSingle or SelectionMultiple")
+            End If
+            Dim wantMultiple As Boolean = value = ClassicListBox.SelectionMultiple
+            If wantMultiple = Me.mMultiple Then Return
+            Me.SyncRecords()
+            If wantMultiple Then
+                Me.RequireNative("SelectionMultiple")
+                If Not Me.mBridge.SetMultiple(True) Then Throw New UnsupportedOperationException("The native ListBox rejected multiple selection")
+                Me.mMulti = []
+                If Not (Me.mSelected Is Nil) Then Me.mMulti.Append(Me.mSelected)
+                Me.mSelected = Nil
+                Me.mMultiple = True
+                Me.PushSelection()
+                Return
+            End If
+            Dim rows As Array Of Integer = Me.SelectedIndexes()
+            Dim dropped As Boolean = Array.Count(rows) > 1
+            Me.mSelected = Nil
+            If Array.Count(rows) > 0 Then Me.mSelected = Me.mRecords(rows(0))
+            Me.mMulti = []
+            Me.mMultiple = False
+            Call Me.mBridge.SetMultiple(False)
+            Me.PushSelection()
+            If dropped Then RaiseEvent Change()
+        End Set
+    End Property
+
+    ''' API 1 `ListIndex`: the selected row, or the lowest selected row with
+    ''' SelectionMultiple. Assigning selects only that row (-1 deselects all)
+    ''' and raises Change when the selection differs. Out-of-range values
+    ''' raise OutOfBoundsException.
+    Public Property ListIndex As Integer
+        Get
+            Me.SyncRecords()
+            If Me.mMultiple Then
+                Dim rows As Array Of Integer = Me.SelectedIndexes()
+                If Array.Count(rows) = 0 Then Return -1
+                Return rows(0)
+            End If
+            Return Me.IndexOfRecord(Me.mSelected)
+        End Get
+        Set
+            Me.SyncRecords()
+            If value < -1 Or value >= Array.Count(Me.mRecords) Then
+                Throw New OutOfBoundsException("ListIndex " + String.From(value) + " is out of range")
+            End If
+            Dim target As ClassicListRow = Nil
+            If value >= 0 Then target = Me.mRecords(value)
+            If Me.mMultiple Then
+                Dim chosen As Array Of ClassicListRow = []
+                If Not (target Is Nil) Then chosen.Append(target)
+                If Me.SameSelection(chosen, Me.mMulti) Then Return
+                Me.mMulti = chosen
+                Me.PushSelection()
+                RaiseEvent Change()
+                Return
+            End If
+            If target Is Me.mSelected Then Return
+            Me.mSelected = target
+            Me.PushSelection()
+            RaiseEvent Change()
+        End Set
+    End Property
+
+    ''' API 2 `SelectedRowIndex`, routed through the same selection model.
+    @Shadows
+    Public Property SelectedRowIndex As Integer
+        Get
+            Return Me.ListIndex
+        End Get
+        Set
+            Me.ListIndex = value
+        End Set
+    End Property
+
+    ''' API 1 `Selected(row)`.
+    Public Function Selected(row As Integer) As Boolean
+        Me.SyncRecords()
+        Me.CheckRow(row)
+        If Me.mMultiple Then Return Me.InMulti(Me.mRecords(row))
+        Return Me.mRecords(row) Is Me.mSelected
+    End Function
+
+    ''' With SelectionMultiple, adds or removes one row without touching the
+    ''' others; with SelectionSingle, True selects only that row. A change
+    ''' raises Change.
+    Public Sub Selected(row As Integer, Assigns value As Boolean)
+        Me.SyncRecords()
+        Me.CheckRow(row)
+        Dim rec As ClassicListRow = Me.mRecords(row)
+        If Me.mMultiple Then
+            If value = Me.InMulti(rec) Then Return
+            If value Then
+                Me.mMulti.Append(rec)
+            Else
+                Dim kept As Array Of ClassicListRow = []
+                For Each item As ClassicListRow In Me.mMulti
+                    If Not (item Is rec) Then kept.Append(item)
+                Next
+                Me.mMulti = kept
+            End If
+            Me.PushSelection()
+            RaiseEvent Change()
+            Return
+        End If
+        If value Then
+            Me.ListIndex = row
+        ElseIf rec Is Me.mSelected Then
+            Me.ListIndex = -1
+        End If
+    End Sub
+
+    ''' API 1 `SelCount`: number of selected rows.
+    Public ReadOnly Property SelCount As Integer
+        Get
+            Me.SyncRecords()
+            Return Array.Count(Me.SelectedIndexes())
+        End Get
+    End Property
+
+    ''' API 1 `Text`: column 0 of ListIndex's row, "" with no selection.
+    Public ReadOnly Property Text As String
+        Get
+            Dim row As Integer = Me.ListIndex
+            If row < 0 Then Return ""
+            Return Me.CellTextAt(row, 0)
+        End Get
+    End Property
+
+    ' ── Cells and headings ─────────────────────────────────────────────
+
+    ''' API 1 `List(row)`: column 0 of the row.
+    Public Function List(row As Integer) As String
+        Return Me.Cell(row, 0)
+    End Function
+
+    Public Sub List(row As Integer, Assigns value As String)
+        Me.Cell(row, 0) = value
+    End Sub
+
+    Private Function RowText(row As Integer) As String
+        Dim parts As Array Of String = []
+        Dim c As Integer = 0
+        While c < Me.ColumnCount
+            parts.Append(Me.CellTextAt(row, c))
+            c = c + 1
+        Wend
+        Return String.Join(parts, "\t")
+    End Function
+
+    ''' API 1 `Cell(row, column)`. -1 selects all rows (EndOfLine-delimited)
+    ''' or all columns (tab-delimited).
+    Public Function Cell(row As Integer, column As Integer) As String
+        If column < -1 Or column >= Me.ColumnCount Then Throw New OutOfBoundsException("ListBox column " + String.From(column) + " is out of range")
+        If row = -1 Then
+            Dim lines As Array Of String = []
+            Dim r As Integer = 0
+            While r < Array.Count(Me.Rows)
+                If column = -1 Then
+                    lines.Append(Me.RowText(r))
+                Else
+                    lines.Append(Me.CellTextAt(r, column))
+                End If
+                r = r + 1
+            Wend
+            Return String.Join(lines, EndOfLine.Current)
+        End If
+        Me.CheckRow(row)
+        If column = -1 Then Return Me.RowText(row)
+        Return Me.CellTextAt(row, column)
+    End Function
+
+    Public Sub Cell(row As Integer, column As Integer, Assigns value As String)
+        If column < -1 Or column >= Me.ColumnCount Then Throw New OutOfBoundsException("ListBox column " + String.From(column) + " is out of range")
+        If row = -1 And column = -1 Then
+            Me.ReplaceAllCells(value)
+            Return
+        End If
+        If row = -1 Then
+            Dim lines As Array Of String = ClassicSplitLines(value)
+            If Array.Count(lines) <> Array.Count(Me.Rows) Then
+                Throw New InvalidArgumentException("Cell(-1, column) needs one line per row")
+            End If
+            Dim r As Integer = 0
+            While r < Array.Count(lines)
+                Me.SetCellQuiet(r, column, lines(r))
+                r = r + 1
+            Wend
+            Me.ReloadData()
+            Return
+        End If
+        Me.CheckRow(row)
+        If column = -1 Then
+            Dim fields As Array Of String = ClassicTabFields(value)
+            If Array.Count(fields) > Me.ColumnCount Then Throw New OutOfBoundsException("Cell row has more fields than ColumnCount")
+            Dim c As Integer = 0
+            While c < Array.Count(fields)
+                Me.SetCellQuiet(row, c, fields(c))
+                c = c + 1
+            Wend
+            Me.ReloadRow(row)
+            Return
+        End If
+        Me.SetCellQuiet(row, column, value)
+        Me.ReloadRow(row)
+    End Sub
+
+    Private Sub SetCellQuiet(row As Integer, column As Integer, value As String)
+        If column < 0 Or column >= Me.ColumnCount Then Throw New OutOfBoundsException("ListBox column is out of range")
+        Dim cols As Array Of String = Array.AsResizable(Me.Rows(row))
+        While Array.Count(cols) <= column
+            cols.Append("")
+        Wend
+        cols(column) = value
+        Me.Rows(row) = cols
+    End Sub
+
+    ''' Cell(-1, -1) = text gives the list one row per line and one column per
+    ''' tab field. Surviving rows keep their identity (tags, selection).
+    Private Sub ReplaceAllCells(value As String)
+        Me.SyncRecords()
+        Dim lines As Array Of String = []
+        If value <> "" Then lines = ClassicSplitLines(value)
+        Dim widest As Integer = Me.ColumnCount
+        Dim i As Integer = 0
+        While i < Array.Count(lines)
+            Dim n As Integer = Array.Count(ClassicTabFields(lines(i)))
+            If n > widest Then widest = n
+            i = i + 1
+        Wend
+        If widest > Me.ColumnCount Then Me.ColumnCount = widest
+        Dim lostSelection As Boolean = False
+        While Array.Count(Me.Rows) > Array.Count(lines)
+            Dim last As Integer = Array.Count(Me.Rows) - 1
+            Dim rec As ClassicListRow = Me.mRecords(last)
+            If rec Is Me.mSelected Then
+                Me.mSelected = Nil
+                lostSelection = True
+            End If
+            If Me.InMulti(rec) Then
+                Dim kept As Array Of ClassicListRow = []
+                For Each item As ClassicListRow In Me.mMulti
+                    If Not (item Is rec) Then kept.Append(item)
+                Next
+                Me.mMulti = kept
+                lostSelection = True
+            End If
+            Me.mRecords.RemoveAt(last)
+            Super.RemoveRowAt(last)
+        Wend
+        i = 0
+        While i < Array.Count(lines)
+            Dim fields As Array Of String = ClassicTabFields(lines(i))
+            If i < Array.Count(Me.Rows) Then
+                Me.Rows(i) = Array.AsResizable(fields)
+            Else
+                Me.mRecords.Append(New ClassicListRow())
+                Super.AddRow()
+                Me.Rows(i) = Array.AsResizable(fields)
+            End If
+            i = i + 1
+        Wend
+        Me.ReloadData()
+        If lostSelection Then RaiseEvent Change()
+    End Sub
+
+    ' ── Columns ────────────────────────────────────────────────────────
+
+    ''' API 1 `ColumnCount` (1 to 256). Growing works everywhere. Shrinking
+    ''' needs the native bridge: the trailing native columns are hidden and
+    ''' the removed columns' cells, cell tags, headings, widths and sort
+    ''' state are discarded, so growing again starts them empty. Without the
+    ''' bridge shrinking raises UnsupportedOperationException.
+    @Shadows
+    Public Property ColumnCount As Integer
+        Get
+            Return Me.mColumns
+        End Get
+        Set
+            If value < 1 Or value > 256 Then
+                Throw New OutOfBoundsException("ListBox ColumnCount must be 1 to 256")
+            End If
+            If value = Me.mColumns Then Return
+            If value > Me.mColumns Then
+                ' Super.ColumnCount is the wrapper's count: created columns,
+                ' including hidden ones that are reused first.
+                If value > Super.ColumnCount Then Super.ColumnCount = value
+                Me.mColumns = value
+                Me.ApplyColumns()
+                Me.ApplyWidths()
+                Return
+            End If
+            Me.RequireNative("Removing ListBox columns")
+            Me.SyncRecords()
+            Dim r As Integer = 0
+            While r < Array.Count(Me.Rows)
+                Dim cols As Array Of String = Me.Rows(r)
+                If Array.Count(cols) > value Then
+                    Dim kept As Array Of String = []
+                    For c As Integer = 0 To value - 1
+                        kept.Append(cols(c))
+                    Next
+                    Me.Rows(r) = kept
+                End If
+                Dim tags As Array Of Variant = Me.mRecords(r).CellTags
+                While Array.Count(tags) > value
+                    tags.RemoveAt(Array.Count(tags) - 1)
+                Wend
+                r = r + 1
+            Wend
+            Dim c As Integer = value
+            While c < Super.ColumnCount
+                Me.HeaderAt(c) = ""
+                c = c + 1
+            Wend
+            While Array.Count(Me.mSortDirections) > value
+                Me.mSortDirections.RemoveAt(Array.Count(Me.mSortDirections) - 1)
+            Wend
+            While Array.Count(Me.mWidthExpressions) > value
+                Me.mWidthExpressions.RemoveAt(Array.Count(Me.mWidthExpressions) - 1)
+            Wend
+            If Me.mSortedColumn >= value Then Me.mSortedColumn = -1
+            Me.mColumns = value
+            Me.ReloadData()
+            Me.ApplyWidths()
+        End Set
+    End Property
+
+    ''' Push the logical column state to the native columns: visibility,
+    ''' titles, clickable headers, header visibility and the sort indicator.
+    Private Sub ApplyColumns()
+        If Not Me.mNative Then Return
+        Dim n As Integer = Me.mBridge.NativeColumnCount()
+        Dim c As Integer = 0
+        While c < n
+            Dim visible As Boolean = c < Me.mColumns
+            If Me.mBridge.ColumnVisible(c) <> visible Then Call Me.mBridge.SetColumnVisible(c, visible)
+            If visible Then
+                Dim title As String = Me.HeaderAt(c)
+                If String.Compare(Me.mBridge.ColumnTitle(c), title, True) <> 0 Then Call Me.mBridge.SetColumnTitle(c, title)
+                Call Me.mBridge.SetColumnClickable(c, True)
+            End If
+            c = c + 1
+        Wend
+        If Me.mBridge.HeaderVisible() <> Me.mHasHeading Then Call Me.mBridge.SetHeaderVisible(Me.mHasHeading)
+        Me.ApplySortIndicator()
+    End Sub
+
+    Private Sub ApplySortIndicator()
+        If Not Me.mNative Then Return
+        Dim direction As Integer = ClassicListBox.SortNone
+        If Me.mSortedColumn >= 0 And Me.mSortedColumn < Me.mColumns Then direction = Me.ColumnSortDirection(Me.mSortedColumn)
+        Call Me.mBridge.SetSortIndicator(Me.mSortedColumn, direction)
+    End Sub
+
+    ''' API 1 `HasHeading`. Defaults to False, as in API 1. Hiding the header
+    ''' row needs the native bridge; without it the header is always shown,
+    ''' HasHeading reads True and assigning False raises
+    ''' UnsupportedOperationException.
+    Public Property HasHeading As Boolean
+        Get
+            If Not Me.mNative Then Return True
+            Return Me.mHasHeading
+        End Get
+        Set
+            If Not Me.mNative Then
+                If value Then Return
+                Me.RequireNative("Hiding the ListBox header")
+            End If
+            Me.mHasHeading = value
+            Call Me.mBridge.SetHeaderVisible(value)
+        End Set
+    End Property
+
+    ''' API 1 `Heading(column)`; Heading(-1) is every heading, tab-delimited.
+    Public Function Heading(column As Integer) As String
+        If column = -1 Then
+            Dim parts As Array Of String = []
+            Dim c As Integer = 0
+            While c < Me.ColumnCount
+                parts.Append(Me.HeaderAt(c))
+                c = c + 1
+            Wend
+            Return String.Join(parts, "\t")
+        End If
+        Me.CheckColumn(column)
+        Return Me.HeaderAt(column)
+    End Function
+
+    ''' Headings can always be assigned before the native columns exist (the
+    ''' first row or ReloadData). After that, retitling needs the native
+    ''' bridge; without it a changed heading raises
+    ''' UnsupportedOperationException.
+    Public Sub Heading(column As Integer, Assigns value As String)
+        If column = -1 Then
+            Dim fields As Array Of String = []
+            If value <> "" Then fields = ClassicTabFields(value)
+            Dim c As Integer = 0
+            While c < Me.ColumnCount
+                Dim title As String = ""
+                If c < Array.Count(fields) Then title = fields(c)
+                Me.Heading(c) = title
+                c = c + 1
+            Wend
+            Return
+        End If
+        Me.CheckColumn(column)
+        If String.Compare(Me.HeaderAt(column), value, True) = 0 Then Return
+        If Me.NativeColumnCount() > column Then
+            Me.RequireNative("Retitling a ListBox column after rows are shown")
+            Me.HeaderAt(column) = value
+            Call Me.mBridge.SetColumnTitle(column, value)
+            Return
+        End If
+        Me.HeaderAt(column) = value
+    End Sub
+
+    ' ── Column widths ──────────────────────────────────────────────────
+
+    Private Function WidthExpressionAt(column As Integer) As String
+        If column < Array.Count(Me.mWidthExpressions) Then Return Me.mWidthExpressions(column)
+        Return ""
+    End Function
+
+    Private Function HasRelativeWidths() As Boolean
+        For c As Integer = 0 To Me.mColumns - 1
+            Dim e As String = Me.WidthExpressionAt(c)
+            If e <> "" And (e.EndsWith("%") Or e.EndsWith("*")) Then Return True
+        Next
+        Return False
+    End Function
+
+    ''' Lay out the native widths from the expressions: points, "N%" of the
+    ''' list width, and "*"/"N*" shares of what remains. Columns without an
+    ''' expression keep their native width.
+    Private Sub ApplyWidths()
+        If Not Me.mNative Then Return
+        Dim any As Boolean = False
+        For c As Integer = 0 To Me.mColumns - 1
+            If Me.WidthExpressionAt(c) <> "" Then any = True
+        Next
+        If Not any Then Return
+        Dim total As Integer = Me.mBridge.VisibleWidth()
+        If total <= 0 Then total = Me.Width
+        Dim fixed As Double = 0.0
+        Dim shares As Double = 0.0
+        For c As Integer = 0 To Me.mColumns - 1
+            Dim e As String = Me.WidthExpressionAt(c)
+            If e.EndsWith("*") Then
+                shares = shares + ClassicStarWeight(e)
+            ElseIf e.EndsWith("%") Then
+                fixed = fixed + total * ClassicNumberPart(e) / 100.0
+            ElseIf e <> "" Then
+                fixed = fixed + ClassicNumberPart(e)
+            Else
+                ' GTK reports -1 for an automatic (unmeasured) width.
+                ' Preserve that column without adding its sentinel to the budget.
+                Dim nativeWidth As Integer = Me.mBridge.ColumnWidth(c)
+                If nativeWidth > 0 Then fixed = fixed + nativeWidth
+            End If
+        Next
+        Dim remaining As Double = total - fixed
+        If remaining < 0.0 Then remaining = 0.0
+        For c As Integer = 0 To Me.mColumns - 1
+            Dim e As String = Me.WidthExpressionAt(c)
+            If e = "" Then Continue For
+            Dim w As Double
+            If e.EndsWith("*") Then
+                w = 0.0
+                If shares > 0.0 Then w = remaining * ClassicStarWeight(e) / shares
+            ElseIf e.EndsWith("%") Then
+                w = total * ClassicNumberPart(e) / 100.0
+            Else
+                w = ClassicNumberPart(e)
+            End If
+            Dim px As Integer = w
+            Call Me.mBridge.SetColumnWidth(c, px)
+        Next
+    End Sub
+
+    ''' API 1 `ColumnWidths`: comma-separated points, percentages ("25%")
+    ''' and relative shares ("*", "2*"); a blank entry leaves that column's
+    ''' width alone. Relative and percentage widths are recomputed when the
+    ''' list is resized. Needs the native bridge.
+    Public Property ColumnWidths As String
+        Get
+            Dim parts As Array Of String = []
+            For c As Integer = 0 To Me.mColumns - 1
+                parts.Append(Me.WidthExpressionAt(c))
+            Next
+            Return String.Join(parts, ",")
+        End Get
+        Set
+            Dim parts As Array Of String = Array.AsResizable(String.Split(value, ","))
+            Dim cleaned As Array Of String = []
+            For Each part As String In parts
+                Dim e As String = part.Trim()
+                If Not ClassicValidWidth(e) Then Throw New InvalidArgumentException("Invalid ColumnWidths entry '" + e + "'")
+                cleaned.Append(e)
+            Next
+            If Array.Count(cleaned) > Me.mColumns Then Throw New OutOfBoundsException("ColumnWidths has more entries than ColumnCount")
+            Me.RequireNative("ListBox column widths")
+            While Array.Count(cleaned) < Me.mColumns
+                cleaned.Append("")
+            Wend
+            Me.mWidthExpressions = cleaned
+            Me.ApplyWidths()
+        End Set
+    End Property
+
+    ''' API 1 `Column(index)`: a ListColumn view of one column's width and
+    ''' resize behavior.
+    Public Function Column(index As Integer) As ClassicListColumn
+        Me.CheckColumn(index)
+        Return New ClassicListColumn(Me, index)
+    End Function
+
+    Public Function ColumnWidthExpression(column As Integer) As String
+        Me.CheckColumn(column)
+        Return Me.WidthExpressionAt(column)
+    End Function
+
+    Public Sub SetColumnWidthExpression(column As Integer, expression As String)
+        Me.CheckColumn(column)
+        Dim e As String = expression.Trim()
+        If Not ClassicValidWidth(e) Then Throw New InvalidArgumentException("Invalid column width '" + e + "'")
+        Me.RequireNative("ListBox column widths")
+        While Array.Count(Me.mWidthExpressions) < Me.mColumns
+            Me.mWidthExpressions.Append("")
+        Wend
+        Me.mWidthExpressions(column) = e
+        Me.ApplyWidths()
+    End Sub
+
+    ''' Actual native width in points (read back, so it includes a user drag).
+    Public Function ColumnWidthActual(column As Integer) As Integer
+        Me.CheckColumn(column)
+        Me.RequireNative("ListBox column widths")
+        Return Me.mBridge.ColumnWidth(column)
+    End Function
+
+    Public Function ColumnUserResizable(column As Integer) As Boolean
+        Me.CheckColumn(column)
+        If Not Me.mNative Then Return False
+        Return Me.mBridge.ColumnResizable(column)
+    End Function
+
+    Public Sub SetColumnUserResizable(column As Integer, value As Boolean)
+        Me.CheckColumn(column)
+        Me.RequireNative("Resizable ListBox columns")
+        Call Me.mBridge.SetColumnResizable(column, value)
+    End Sub
+
+    ' ── Tags ───────────────────────────────────────────────────────────
+
+    ''' API 1 `RowTag(row) As Variant`; unset tags are Variant.Empty().
+    Public Function RowTag(row As Integer) As Variant
+        Me.SyncRecords()
+        Me.CheckRow(row)
+        Return Me.mRecords(row).Tag
+    End Function
+
+    Public Sub RowTag(row As Integer, Assigns value As Variant)
+        Me.SyncRecords()
+        Me.CheckRow(row)
+        Me.mRecords(row).Tag = value
+    End Sub
+
+    ''' API 1 `CellTag(row, column) As Variant`.
+    Public Function CellTag(row As Integer, column As Integer) As Variant
+        Me.SyncRecords()
+        Me.CheckRow(row)
+        Me.CheckColumn(column)
+        Dim tags As Array Of Variant = Me.mRecords(row).CellTags
+        If column >= Array.Count(tags) Then Return Variant.Empty()
+        Return tags(column)
+    End Function
+
+    Public Sub CellTag(row As Integer, column As Integer, Assigns value As Variant)
+        Me.SyncRecords()
+        Me.CheckRow(row)
+        Me.CheckColumn(column)
+        Dim tags As Array Of Variant = Me.mRecords(row).CellTags
+        While Array.Count(tags) <= column
+            tags.Append(Variant.Empty())
+        Wend
+        tags(column) = value
+    End Sub
+
+    ' ── Sorting ────────────────────────────────────────────────────────
+
+    ''' API 1 `SortedColumn` (-1 = none). Assigning does not sort; call Sort.
+    ''' The native header indicator follows it.
+    Public Property SortedColumn As Integer
+        Get
+            Return Me.mSortedColumn
+        End Get
+        Set
+            If value < -1 Or value >= Me.ColumnCount Then
+                Throw New OutOfBoundsException("SortedColumn " + String.From(value) + " is out of range")
+            End If
+            Me.mSortedColumn = value
+            Me.ApplySortIndicator()
+        End Set
+    End Property
+
+    ''' API 1 `ColumnSortDirection(column)`: SortAscending (default),
+    ''' SortNone or SortDescending.
+    Public Function ColumnSortDirection(column As Integer) As Integer
+        Me.CheckColumn(column)
+        If column >= Array.Count(Me.mSortDirections) Then Return ClassicListBox.SortAscending
+        Return Me.mSortDirections(column)
+    End Function
+
+    Public Sub ColumnSortDirection(column As Integer, Assigns value As Integer)
+        Me.CheckColumn(column)
+        If value < -1 Or value > 1 Then
+            Throw New InvalidArgumentException("ColumnSortDirection must be SortDescending, SortNone or SortAscending")
+        End If
+        While Array.Count(Me.mSortDirections) <= column
+            Me.mSortDirections.Append(ClassicListBox.SortAscending)
+        Wend
+        Me.mSortDirections(column) = value
+        If column = Me.mSortedColumn Then Me.ApplySortIndicator()
+    End Sub
+
+    ''' API 1 `PressHeader(column)`: as if the header were clicked, raising
+    ''' HeaderPressed and sorting, but without reversing the direction.
+    Public Sub PressHeader(column As Integer)
+        Me.CheckColumn(column)
+        Me.HeaderClick(column, False)
+    End Sub
+
+    ''' A header click: HeaderPressed may cancel; clicking the sorted column
+    ''' again reverses its direction (a SortNone column is never sorted).
+    Private Sub HeaderClick(column As Integer, toggle As Boolean)
+        If RaiseEvent HeaderPressed(column) Then
+            Me.ApplySortIndicator()
+            Return
+        End If
+        Dim direction As Integer = Me.ColumnSortDirection(column)
+        If toggle And column = Me.mSortedColumn And direction <> ClassicListBox.SortNone Then
+            Me.ColumnSortDirection(column) = 0 - direction
+        End If
+        Me.mSortedColumn = column
+        Me.Sort()
+        Me.ApplySortIndicator()
+    End Sub
+
+    Private Function CompareForSort(row1 As Integer, row2 As Integer, column As Integer, direction As Integer) As Integer
+        Dim outcome As New ClassicCompareResult()
+        Dim order As Integer
+        If RaiseEvent CompareRows(row1, row2, column, outcome) Then
+            order = outcome.Value
+        Else
+            order = String.Compare(Me.CellTextAt(row1, column), Me.CellTextAt(row2, column))
+        End If
+        If direction < 0 Then order = 0 - order
+        Return order
+    End Function
+
+    ''' API 1 `Sort()`: stable sort on SortedColumn in its
+    ''' ColumnSortDirection, after SortColumn (which may cancel). Rows keep
+    ''' their tags; selected rows stay selected and Change is not raised.
+    Public Sub Sort()
+        Me.SyncRecords()
+        Dim column As Integer = Me.mSortedColumn
+        If column < 0 Then Return
+        Dim direction As Integer = Me.ColumnSortDirection(column)
+        If direction = ClassicListBox.SortNone Then Return
+        If RaiseEvent SortColumn(column) Then Return
+        Dim n As Integer = Array.Count(Me.Rows)
+        Dim order As Array Of Integer = []
+        Dim i As Integer = 0
+        While i < n
+            order.Append(i)
+            i = i + 1
+        Wend
+        ' Stable insertion sort; CompareRows sees pre-sort row numbers.
+        i = 1
+        While i < n
+            Dim item As Integer = order(i)
+            Dim j As Integer = i - 1
+            While j >= 0
+                If Me.CompareForSort(order(j), item, column, direction) <= 0 Then Exit While
+                order(j + 1) = order(j)
+                j = j - 1
+            Wend
+            order(j + 1) = item
+            i = i + 1
+        Wend
+        Dim newRows As Array Of Array Of String = []
+        Dim newRecords As Array Of ClassicListRow = []
+        Dim newStringTags As Array Of String = []
+        i = 0
+        While i < n
+            newRows.Append(Me.Rows(order(i)))
+            newRecords.Append(Me.mRecords(order(i)))
+            newStringTags.Append(Me.RowTagAt(order(i)))
+            i = i + 1
+        Wend
+        Me.Rows = newRows
+        Me.mRecords = newRecords
+        i = 0
+        While i < n
+            Me.RowTagAt(i) = newStringTags(i)
+            i = i + 1
+        Wend
+        Me.ReloadData()
+    End Sub
+End Class
+
+''' API 1 `ListColumn`, as returned by ClassicListBox.Column(index).
+Public Class ClassicListColumn
+    Private Property mOwner As ClassicListBox
+    Private Property mIndex As Integer
+
+    Public Sub Constructor(owner As ClassicListBox, index As Integer)
+        Me.mOwner = owner
+        Me.mIndex = index
+    End Sub
+
+    ''' Width in points, read back from the native column. Assigning sets
+    ''' WidthExpression to that number of points.
+    Public Property WidthActual As Integer
+        Get
+            Return Me.mOwner.ColumnWidthActual(Me.mIndex)
+        End Get
+        Set
+            Me.mOwner.SetColumnWidthExpression(Me.mIndex, String.From(value))
+        End Set
+    End Property
+
+    ''' One ColumnWidths entry: points, "N%" or "*"/"N*".
+    Public Property WidthExpression As String
+        Get
+            Return Me.mOwner.ColumnWidthExpression(Me.mIndex)
+        End Get
+        Set
+            Me.mOwner.SetColumnWidthExpression(Me.mIndex, value)
+        End Set
+    End Property
+
+    ''' Whether the user can drag the column edge (native GTK resizable).
+    Public Property UserResizable As Boolean
+        Get
+            Return Me.mOwner.ColumnUserResizable(Me.mIndex)
+        End Get
+        Set
+            Me.mOwner.SetColumnUserResizable(Me.mIndex, value)
+        End Set
+    End Property
+End Class
+
+' Control, Alt (Mod1), Super and Meta GdkModifierType bits: a key with any
+' of them is a command, not type-to-select input.
+Const ClassicListCommandModifiers As Integer = &H1C000008 + 4
+
+''' API 1 KeyDown key strings: the legacy control codes for navigation keys
+''' (Left 28, Right 29, Up 30, Down 31, Home 1, End 4, PageUp 11,
+''' PageDown 12, Return 13, Enter 3, Tab 9, Backspace 8, Delete 127, Esc 27)
+''' or the typed character. "" for keys with neither (modifiers alone).
+Private Function ClassicListKeyString(keyval As Integer, codepoint As Integer) As String
+    Select Case keyval
+    Case &HFF0D
+        Return String.Chr(13)
+    Case &HFF8D
+        Return String.Chr(3)
+    Case &HFF09, &HFE20
+        Return String.Chr(9)
+    Case &HFF08
+        Return String.Chr(8)
+    Case &HFF1B
+        Return String.Chr(27)
+    Case &HFFFF, &HFF9F
+        Return String.Chr(127)
+    Case &HFF51, &HFF96
+        Return String.Chr(28)
+    Case &HFF53, &HFF98
+        Return String.Chr(29)
+    Case &HFF52, &HFF97
+        Return String.Chr(30)
+    Case &HFF54, &HFF99
+        Return String.Chr(31)
+    Case &HFF50, &HFF95
+        Return String.Chr(1)
+    Case &HFF57, &HFF9C
+        Return String.Chr(4)
+    Case &HFF55, &HFF9A
+        Return String.Chr(11)
+    Case &HFF56, &HFF9B
+        Return String.Chr(12)
+    End Select
+    If codepoint > 0 And codepoint <= &H10FFFF And (codepoint < &HD800 Or codepoint > &HDFFF) Then Return String.Chr(codepoint)
+    Return ""
+End Function
+
+Private Function ClassicNumberPart(expression As String) As Double
+    Dim digits As String = expression
+    If digits.EndsWith("%") Or digits.EndsWith("*") Then digits = String.Left(digits, digits.Length - 1)
+    Return digits.Trim().ToDouble()
+End Function
+
+Private Function ClassicStarWeight(expression As String) As Double
+    If expression = "*" Then Return 1.0
+    Return ClassicNumberPart(expression)
+End Function
+
+''' A ColumnWidths entry: "", "*", or a non-negative number optionally
+''' followed by "%" or "*".
+Private Function ClassicValidWidth(expression As String) As Boolean
+    If expression = "" Or expression = "*" Then Return True
+    Dim digits As String = expression
+    If digits.EndsWith("%") Or digits.EndsWith("*") Then digits = String.Left(digits, digits.Length - 1)
+    If digits = "" Then Return False
+    Dim dots As Integer = 0
+    For i As Integer = 0 To digits.Length - 1
+        Dim ch As String = String.Mid(digits, i + 1, 1)
+        If ch = "." Then
+            dots = dots + 1
+        ElseIf ch < "0" Or ch > "9" Then
+            Return False
+        End If
+    Next
+    Return dots <= 1 And digits <> "."
+End Function
+
+' ── PopupMenu / ComboBox ───────────────────────────────────────────────
+
+''' API 1 `PopupMenu`. The selection is tracked here because native pick-only
+''' combos auto-select item 0 when items are added and reset on rebuild;
+''' API 1 lists start at ListIndex -1.
+Public Class ClassicPopupMenu Inherits DesktopPopupMenu
+    ''' The selected item changed: user pick, or a ListIndex assignment to a
+    ''' different item. Removing rows never raises it.
+    Event Change()
+
+    Private Property mTags As Array Of Variant
+    Private Property mListIndex As Integer = -1
+    Private Property mQuiet As Integer = 0
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.mTags = []
+    End Sub
+
+    Private Sub PushSelection()
+        Me.mQuiet = Me.mQuiet + 1
+        Super.SelectedIndex = Me.mListIndex
+        Me.mQuiet = Me.mQuiet - 1
+    End Sub
+
+    Private Sub CheckRow(index As Integer)
+        If index < 0 Or index >= Array.Count(Me.mTags) Then
+            Throw New OutOfBoundsException("PopupMenu row " + String.From(index) + " is out of range")
+        End If
+    End Sub
+
+    Handle SelectionChanged()
+        If Me.mQuiet > 0 Then Return
+        Me.mListIndex = Super.SelectedIndex
+        RaiseEvent Change()
+    End Handle
+
+    ''' Re-create the native items in order (Buoy's ComboBox has no native
+    ''' insert or single-item removal).
+    Private Sub Rebuild(items As Array Of String)
+        Me.mQuiet = Me.mQuiet + 1
+        Super.RemoveAllItems()
+        Dim i As Integer = 0
+        While i < Array.Count(items)
+            Super.AddRow(items(i))
+            i = i + 1
+        Wend
+        Me.mQuiet = Me.mQuiet - 1
+        Me.PushSelection()
+    End Sub
+
+    Private Function Snapshot() As Array Of String
+        Dim items As Array Of String = []
+        Dim i As Integer = 0
+        While i < Array.Count(Me.mTags)
+            items.Append(Me.RowTextAt(i))
+            i = i + 1
+        Wend
+        Return items
+    End Function
+
+    ''' API 1 `ListCount`.
+    Public ReadOnly Property ListCount As Integer
+        Get
+            Return Array.Count(Me.mTags)
+        End Get
+    End Property
+
+    ''' API 1 `ListIndex`; -1 = no selection. Out of range raises
+    ''' OutOfBoundsException. A different value raises Change.
+    Public Property ListIndex As Integer
+        Get
+            Return Me.mListIndex
+        End Get
+        Set
+            If value < -1 Or value >= Array.Count(Me.mTags) Then
+                Throw New OutOfBoundsException("ListIndex " + String.From(value) + " is out of range")
+            End If
+            If value = Me.mListIndex Then Return
+            Me.mListIndex = value
+            Me.PushSelection()
+            RaiseEvent Change()
+        End Set
+    End Property
+
+    ''' API 2 `SelectedRowIndex`, routed through ListIndex.
+    @Shadows
+    Public Property SelectedRowIndex As Integer
+        Get
+            Return Me.ListIndex
+        End Get
+        Set
+            Me.ListIndex = value
+        End Set
+    End Property
+
+    ''' API 1 `Text` (read-only): the selected item, "" with no selection.
+    @Shadows
+    Public ReadOnly Property Text As String
+        Get
+            If Me.mListIndex < 0 Then Return ""
+            Return Me.RowTextAt(Me.mListIndex)
+        End Get
+    End Property
+
+    ''' API 1 `List(index)` (read-only).
+    Public Function List(index As Integer) As String
+        Me.CheckRow(index)
+        Return Me.RowTextAt(index)
+    End Function
+
+    Public Overrides Sub AddRow(item As String)
+        Me.mTags.Append(Variant.Empty())
+        Me.mQuiet = Me.mQuiet + 1
+        Super.AddRow(item)
+        Me.mQuiet = Me.mQuiet - 1
+        Me.PushSelection()
+    End Sub
+
+    ''' API 1 `AddRows(items())`.
+    Public Sub AddRows(items As Array Of String)
+        Dim i As Integer = 0
+        While i < Array.Count(items)
+            Me.AddRow(items(i))
+            i = i + 1
+        Wend
+    End Sub
+
+    ''' API 1 `InsertRow(index, text)`; the selected item stays selected.
+    Public Sub InsertRow(index As Integer, item As String)
+        If index < 0 Or index > Array.Count(Me.mTags) Then
+            Throw New OutOfBoundsException("PopupMenu insert row " + String.From(index) + " is out of range")
+        End If
+        Dim items As Array Of String = Me.Snapshot()
+        items.Insert(index, item)
+        Me.mTags.Insert(index, Variant.Empty())
+        If Me.mListIndex >= index Then Me.mListIndex = Me.mListIndex + 1
+        Me.Rebuild(items)
+    End Sub
+
+    Public Overrides Sub RemoveRowAt(index As Integer)
+        Me.CheckRow(index)
+        Dim items As Array Of String = Me.Snapshot()
+        items.RemoveAt(index)
+        Me.mTags.RemoveAt(index)
+        If Me.mListIndex = index Then
+            Me.mListIndex = -1
+        ElseIf Me.mListIndex > index Then
+            Me.mListIndex = Me.mListIndex - 1
+        End If
+        Me.Rebuild(items)
+    End Sub
+
+    ''' API 1 `RemoveRow(index)`.
+    Public Sub RemoveRow(index As Integer)
+        Me.RemoveRowAt(index)
+    End Sub
+
+    Public Overrides Sub RemoveAllItems()
+        Me.mTags = []
+        Me.mListIndex = -1
+        Me.mQuiet = Me.mQuiet + 1
+        Super.RemoveAllItems()
+        Me.mQuiet = Me.mQuiet - 1
+        Me.PushSelection()
+    End Sub
+
+    ''' API 1 `DeleteAllRows` (does not raise Change).
+    Public Sub DeleteAllRows()
+        Me.RemoveAllItems()
+    End Sub
+
+    ''' API 1 `RowTag(index) As Variant`; unset tags are Variant.Empty().
+    Public Function RowTag(index As Integer) As Variant
+        Me.CheckRow(index)
+        Return Me.mTags(index)
+    End Function
+
+    Public Sub RowTag(index As Integer, Assigns value As Variant)
+        Me.CheckRow(index)
+        Me.mTags(index) = value
+    End Sub
+End Class
+
+''' API 1 `ComboBox` (editable). ListIndex reads the native control, which
+''' reports -1 once the user types custom text; Text is read/write.
+Public Class ClassicComboBox Inherits DesktopComboBox
+    ''' The selected item changed: user pick, or a ListIndex assignment to a
+    ''' different item.
+    Event Change()
+    ''' The user edited the text.
+    Event TextChanged()
+
+    Private Property mTags As Array Of Variant
+    Private Property mQuiet As Integer = 0
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.mTags = []
+    End Sub
+
+    Private Sub CheckRow(index As Integer)
+        If index < 0 Or index >= Array.Count(Me.mTags) Then
+            Throw New OutOfBoundsException("ComboBox row " + String.From(index) + " is out of range")
+        End If
+    End Sub
+
+    Handle SelectionChanged()
+        If Me.mQuiet > 0 Then Return
+        RaiseEvent Change()
+    End Handle
+
+    Handle TextChanged()
+        If Me.mQuiet > 0 Then Return
+        RaiseEvent TextChanged()
+    End Handle
+
+    Private Function Snapshot() As Array Of String
+        Dim items As Array Of String = []
+        Dim i As Integer = 0
+        While i < Array.Count(Me.mTags)
+            items.Append(Me.RowTextAt(i))
+            i = i + 1
+        Wend
+        Return items
+    End Function
+
+    ''' Re-create native items, then restore the selection (or the typed text
+    ''' when nothing was selected) without raising events.
+    Private Sub Rebuild(items As Array Of String, selected As Integer, typed As String)
+        Me.mQuiet = Me.mQuiet + 1
+        Super.RemoveAllItems()
+        Dim i As Integer = 0
+        While i < Array.Count(items)
+            Super.AddRow(items(i))
+            i = i + 1
+        Wend
+        If selected >= 0 Then
+            Super.SelectedIndex = selected
+        Else
+            Super.SelectedIndex = -1
+            Super.Text = typed
+        End If
+        Me.mQuiet = Me.mQuiet - 1
+    End Sub
+
+    ''' API 1 `ListCount`.
+    Public ReadOnly Property ListCount As Integer
+        Get
+            Return Array.Count(Me.mTags)
+        End Get
+    End Property
+
+    ''' API 1 `ListIndex`. A different value raises Change; out of range
+    ''' raises OutOfBoundsException.
+    Public Property ListIndex As Integer
+        Get
+            Return Super.SelectedIndex
+        End Get
+        Set
+            If value < -1 Or value >= Array.Count(Me.mTags) Then
+                Throw New OutOfBoundsException("ListIndex " + String.From(value) + " is out of range")
+            End If
+            If value = Super.SelectedIndex Then Return
+            Me.mQuiet = Me.mQuiet + 1
+            Super.SelectedIndex = value
+            Me.mQuiet = Me.mQuiet - 1
+            RaiseEvent Change()
+        End Set
+    End Property
+
+    ''' API 2 `SelectedRowIndex`, routed through ListIndex.
+    @Shadows
+    Public Property SelectedRowIndex As Integer
+        Get
+            Return Me.ListIndex
+        End Get
+        Set
+            Me.ListIndex = value
+        End Set
+    End Property
+
+    ''' API 1 `List(index)` (read-only).
+    Public Function List(index As Integer) As String
+        Me.CheckRow(index)
+        Return Me.RowTextAt(index)
+    End Function
+
+    Public Overrides Sub AddRow(item As String)
+        Me.mTags.Append(Variant.Empty())
+        Me.mQuiet = Me.mQuiet + 1
+        Super.AddRow(item)
+        Me.mQuiet = Me.mQuiet - 1
+    End Sub
+
+    ''' API 1 `AddRows(items())`.
+    Public Sub AddRows(items As Array Of String)
+        Dim i As Integer = 0
+        While i < Array.Count(items)
+            Me.AddRow(items(i))
+            i = i + 1
+        Wend
+    End Sub
+
+    ''' API 1 `InsertRow(index, text)`; the selected item stays selected and
+    ''' typed text is kept.
+    Public Sub InsertRow(index As Integer, item As String)
+        If index < 0 Or index > Array.Count(Me.mTags) Then
+            Throw New OutOfBoundsException("ComboBox insert row " + String.From(index) + " is out of range")
+        End If
+        Dim selected As Integer = Super.SelectedIndex
+        Dim typed As String = Super.Text
+        Dim items As Array Of String = Me.Snapshot()
+        items.Insert(index, item)
+        Me.mTags.Insert(index, Variant.Empty())
+        If selected >= index Then selected = selected + 1
+        Me.Rebuild(items, selected, typed)
+    End Sub
+
+    Public Overrides Sub RemoveRowAt(index As Integer)
+        Me.CheckRow(index)
+        Dim selected As Integer = Super.SelectedIndex
+        Dim typed As String = Super.Text
+        Dim items As Array Of String = Me.Snapshot()
+        items.RemoveAt(index)
+        Me.mTags.RemoveAt(index)
+        If selected = index Then
+            selected = -1
+        ElseIf selected > index Then
+            selected = selected - 1
+        End If
+        Me.Rebuild(items, selected, typed)
+    End Sub
+
+    ''' API 1 `RemoveRow(index)`.
+    Public Sub RemoveRow(index As Integer)
+        Me.RemoveRowAt(index)
+    End Sub
+
+    Public Overrides Sub RemoveAllItems()
+        Me.mTags = []
+        Me.mQuiet = Me.mQuiet + 1
+        Super.RemoveAllItems()
+        Me.mQuiet = Me.mQuiet - 1
+    End Sub
+
+    ''' API 1 `DeleteAllRows` (does not raise Change; typed text is kept).
+    Public Sub DeleteAllRows()
+        Me.RemoveAllItems()
+    End Sub
+
+    ''' API 1 `RowTag(index) As Variant`; unset tags are Variant.Empty().
+    Public Function RowTag(index As Integer) As Variant
+        Me.CheckRow(index)
+        Return Me.mTags(index)
+    End Function
+
+    Public Sub RowTag(index As Integer, Assigns value As Variant)
+        Me.CheckRow(index)
+        Me.mTags(index) = value
+    End Sub
+End Class
+
+' ── CheckBox ───────────────────────────────────────────────────────────
+
+''' API 1 `CheckBox`: Boolean `Value`, tri-state `State`, and `Action`, which
+''' fires for user clicks and for programmatic changes of the state.
+Public Class ClassicCheckBox Inherits DesktopCheckBox
+    ''' API 1 `CheckBox.CheckedStates`.
+    Public Enum CheckedStates As Integer
+        Unchecked     = 0
+        Checked       = 1
+        Indeterminate = 2
+    End Enum
+
+    ''' Clicked, or Value/State/VisualState changed by code.
+    Event Action()
+
+    Private Property mQuiet As Integer = 0
+
+    Handle ValueChanged()
+        If Me.mQuiet > 0 Then Return
+        RaiseEvent Action()
+    End Handle
+
+    Private Sub ApplyState(target As Checkbox.CheckState)
+        If Super.Value = target Then Return
+        Me.mQuiet = Me.mQuiet + 1
+        Super.Value = target
+        Me.mQuiet = Me.mQuiet - 1
+        RaiseEvent Action()
+    End Sub
+
+    ''' API 1 `Value As Boolean`: True when Checked or Indeterminate.
+    ''' Assigning True selects Checked, False selects Unchecked.
+    @Shadows
+    Public Property Value As Boolean
+        Get
+            Return Super.Value <> Checkbox.CheckState.False
+        End Get
+        Set
+            If value Then
+                Me.ApplyState(Checkbox.CheckState.True)
+            Else
+                Me.ApplyState(Checkbox.CheckState.False)
+            End If
+        End Set
+    End Property
+
+    ''' API 1 `State As CheckBox.CheckedStates`.
+    Public Property State As ClassicCheckBox.CheckedStates
+        Get
+            Return CType(CType(Super.Value, Integer), ClassicCheckBox.CheckedStates)
+        End Get
+        Set
+            Me.ApplyState(CType(CType(value, Integer), Checkbox.CheckState))
+        End Set
+    End Property
+
+    ''' API 2 `VisualState`, same storage as State.
+    Public Property VisualState As DesktopCheckBox.VisualStates
+        Get
+            Return CType(CType(Super.Value, Integer), DesktopCheckBox.VisualStates)
+        End Get
+        Set
+            Me.ApplyState(CType(CType(value, Integer), Checkbox.CheckState))
+        End Set
+    End Property
+End Class

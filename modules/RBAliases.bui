@@ -1,0 +1,31 @@
+Import ClassicCore
+Import RBFoundation
+
+''' Readable casing helpers. Semantics are exactly Buoy String.LCase/UCase.
+Public Function Lowercase(text As String) As String
+    Return String.LCase(text)
+End Function
+
+Public Function Uppercase(text As String) As String
+    Return String.UCase(text)
+End Function
+
+''' Explicit first-only legacy replacement; native String.Replace defaults to all.
+Public Function Replace(text As String, target As String, replacement As String) As String
+    Return ClassicCore.ClassicReplace(text, target, replacement)
+End Function
+
+''' Classic inclusive upper-bound conversion, suitable for New array extents.
+Public Function ArrayExtent(upperBound As Integer) As Integer
+    Return ClassicCore.ClassicExtent(upperBound)
+End Function
+
+''' Vendor-neutral spelling for the installed one-button compatibility dialog.
+Public Function ShowMessageBox(message As String) As Boolean
+    Return RBFoundation.FoundationMessageBox(message)
+End Function
+
+''' Decode a hardware Mac key code without requiring a Mac host.
+Public Function KeyNameForMacKeyCode(code As Integer) As KeyName
+    Return RBFoundation.FoundationKeyNameForMacKeyCode(code)
+End Function

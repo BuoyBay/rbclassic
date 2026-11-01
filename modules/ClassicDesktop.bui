@@ -1,0 +1,2226 @@
+' ClassicDesktop — REALbasic / legacy API 1 desktop window, container, push-button,
+' text-selection and drag-and-drop adapters over Buoy's UI runtime and the
+' bundled legacy shim.
+'
+' Source rewrite for converted projects: Buoy's own `Window` is a different class
+' from API 1's, so API 1 window classes inherit `ClassicWindow`, container
+' controls inherit `ClassicContainerControl`, and push buttons that use
+' `Default`/`Cancel` become `ClassicPushButton`. The members and event handlers
+' inside keep their API 1 names (`Open`, `CancelClose(appQuitting)`, `Minimize`,
+' `SelStart`, `AcceptTextDrop`, `DropObject`, …).
+'
+' Also: API 1 Edit-command routing and contextual Edit items over the native
+' selection, ClassicQuit(exitCode)/ClassicExitCode, launch-document routing,
+' and an error handler for exceptions raised from native callbacks.
+'
+' Native behavior is real where it is implemented and raises
+' UnsupportedOperationException where it is not; see notes/desktop.md for the
+' per-platform matrix and the gaps that need core runtime hooks.
+
+Import RBFoundation
+' One-way: ClassicListNative imports only legacy. A focused native list gets
+' Return/Escape before the Default/Cancel buttons (API 1 KeyDown order).
+Import ClassicListNative
+Import ClassicListNative.{ ClassicListNativeSetDeclinedKeyHandler, ClassicListNativeOwnsKeys }
+
+' ── Native bindings ─────────────────────────────────────────────────────────
+
+#If TargetLinux Then
+    ' GtkTextIter is an opaque 80-byte stack struct on 64-bit GTK 4; reserve more.
+    Sequential Structure ClassicTextIter
+        A0 As Int64
+        A1 As Int64
+        A2 As Int64
+        A3 As Int64
+        A4 As Int64
+        A5 As Int64
+        A6 As Int64
+        A7 As Int64
+        A8 As Int64
+        A9 As Int64
+        A10 As Int64
+        A11 As Int64
+    End Structure
+
+    Private Optional Declare Function GtkNativeSurface Lib "libgtk-4.so.1" Alias "gtk_native_get_surface" (widget As Ptr) As Ptr
+    Private Optional Declare Function GdkToplevelState Lib "libgtk-4.so.1" Alias "gdk_toplevel_get_state" (surface As Ptr) As UInt32
+    Private Optional Declare Sub GtkWindowMinimize Lib "libgtk-4.so.1" Alias "gtk_window_minimize" (window As Ptr)
+    Private Optional Declare Sub GtkWindowUnminimize Lib "libgtk-4.so.1" Alias "gtk_window_unminimize" (window As Ptr)
+    Private Optional Declare Sub GtkWindowMaximize Lib "libgtk-4.so.1" Alias "gtk_window_maximize" (window As Ptr)
+    Private Optional Declare Sub GtkWindowUnmaximize Lib "libgtk-4.so.1" Alias "gtk_window_unmaximize" (window As Ptr)
+    Private Optional Declare Function GtkWindowIsMaximized Lib "libgtk-4.so.1" Alias "gtk_window_is_maximized" (window As Ptr) As Int32
+    Private Optional Declare Sub GtkWindowSetDefault Lib "libgtk-4.so.1" Alias "gtk_window_set_default_widget" (window As Ptr, widget As Ptr)
+    Private Optional Declare Function GtkWindowGetDefault Lib "libgtk-4.so.1" Alias "gtk_window_get_default_widget" (window As Ptr) As Ptr
+    Private Optional Declare Function GSignalConnect Lib "libgtk-4.so.1" Alias "g_signal_connect_data" (instance As Ptr, signal As String, handler As Ptr, data As Ptr, destroyNotify As Ptr, connectFlags As Int32) As UInt64
+    Private Optional Declare Sub GSignalDisconnect Lib "libgtk-4.so.1" Alias "g_signal_handler_disconnect" (instance As Ptr, handlerId As UInt64)
+    Private Optional Declare Function GTypeIsA Lib "libgtk-4.so.1" Alias "g_type_check_instance_is_a" (instance As Ptr, gtype As UInt64) As Int32
+    Private Optional Declare Function GtkEditableType Lib "libgtk-4.so.1" Alias "gtk_editable_get_type" () As UInt64
+    Private Optional Declare Function GtkTextViewType Lib "libgtk-4.so.1" Alias "gtk_text_view_get_type" () As UInt64
+    Private Optional Declare Function GtkScrolledType Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_type" () As UInt64
+    Private Optional Declare Function GtkButtonType Lib "libgtk-4.so.1" Alias "gtk_button_get_type" () As UInt64
+    Private Optional Declare Function GtkScrolledChild Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_child" (scrolled As Ptr) As Ptr
+    Private Optional Declare Function GtkWidgetRoot Lib "libgtk-4.so.1" Alias "gtk_widget_get_root" (widget As Ptr) As Ptr
+    Private Optional Declare Function GtkRootFocus Lib "libgtk-4.so.1" Alias "gtk_root_get_focus" (root As Ptr) As Ptr
+    Private Optional Declare Function GtkWidgetActivate Lib "libgtk-4.so.1" Alias "gtk_widget_activate" (widget As Ptr) As Int32
+    Private Optional Declare Function GtkWidgetMapped Lib "libgtk-4.so.1" Alias "gtk_widget_get_mapped" (widget As Ptr) As Int32
+    Private Optional Declare Sub GtkAddController Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (widget As Ptr, controller As Ptr)
+    Private Optional Declare Sub GtkRemoveController Lib "libgtk-4.so.1" Alias "gtk_widget_remove_controller" (widget As Ptr, controller As Ptr)
+    Private Optional Declare Function GtkShortcutControllerNew Lib "libgtk-4.so.1" Alias "gtk_shortcut_controller_new" () As Ptr
+    Private Optional Declare Sub GtkShortcutScope Lib "libgtk-4.so.1" Alias "gtk_shortcut_controller_set_scope" (controller As Ptr, scope As Int32)
+    Private Optional Declare Sub GtkControllerPhase Lib "libgtk-4.so.1" Alias "gtk_event_controller_set_propagation_phase" (controller As Ptr, phase As Int32)
+    Private Optional Declare Function GtkKeyvalTrigger Lib "libgtk-4.so.1" Alias "gtk_keyval_trigger_new" (keyval As UInt32, modifiers As UInt32) As Ptr
+    Private Optional Declare Function GtkAlternativeTrigger Lib "libgtk-4.so.1" Alias "gtk_alternative_trigger_new" (first As Ptr, second As Ptr) As Ptr
+    Private Optional Declare Function GtkCallbackAction Lib "libgtk-4.so.1" Alias "gtk_callback_action_new" (callback As Ptr, data As Ptr, destroyNotify As Ptr) As Ptr
+    Private Optional Declare Function GtkShortcutNew Lib "libgtk-4.so.1" Alias "gtk_shortcut_new" (trigger As Ptr, action As Ptr) As Ptr
+    Private Optional Declare Sub GtkAddShortcut Lib "libgtk-4.so.1" Alias "gtk_shortcut_controller_add_shortcut" (controller As Ptr, shortcut As Ptr)
+    Private Optional Declare Function GtkEditableBounds Lib "libgtk-4.so.1" Alias "gtk_editable_get_selection_bounds" (editable As Ptr, ByRef startPos As Int32, ByRef endPos As Int32) As Int32
+    Private Optional Declare Sub GtkEditableSelect Lib "libgtk-4.so.1" Alias "gtk_editable_select_region" (editable As Ptr, startPos As Int32, endPos As Int32)
+    Private Optional Declare Sub GtkEditableDeleteSelection Lib "libgtk-4.so.1" Alias "gtk_editable_delete_selection" (editable As Ptr)
+    Private Optional Declare Sub GtkEditableInsert Lib "libgtk-4.so.1" Alias "gtk_editable_insert_text" (editable As Ptr, text As String, length As Int32, ByRef position As Int32)
+    Private Optional Declare Sub GtkEditableSetPosition Lib "libgtk-4.so.1" Alias "gtk_editable_set_position" (editable As Ptr, position As Int32)
+    Private Optional Declare Function GtkTextViewBuffer Lib "libgtk-4.so.1" Alias "gtk_text_view_get_buffer" (view As Ptr) As Ptr
+    Private Optional Declare Function GtkBufferBounds Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_selection_bounds" (buffer As Ptr, ByRef first As ClassicTextIter, ByRef last As ClassicTextIter) As Int32
+    Private Optional Declare Function GtkIterOffset Lib "libgtk-4.so.1" Alias "gtk_text_iter_get_offset" (ByRef iter As ClassicTextIter) As Int32
+    Private Optional Declare Sub GtkBufferIterAt Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_iter_at_offset" (buffer As Ptr, ByRef iter As ClassicTextIter, offset As Int32)
+    Private Optional Declare Sub GtkBufferSelect Lib "libgtk-4.so.1" Alias "gtk_text_buffer_select_range" (buffer As Ptr, ByRef insertion As ClassicTextIter, ByRef bound As ClassicTextIter)
+    Private Optional Declare Function GtkBufferDeleteSelection Lib "libgtk-4.so.1" Alias "gtk_text_buffer_delete_selection" (buffer As Ptr, interactive As Int32, defaultEditable As Int32) As Int32
+    Private Optional Declare Sub GtkBufferInsertAtCursor Lib "libgtk-4.so.1" Alias "gtk_text_buffer_insert_at_cursor" (buffer As Ptr, text As String, length As Int32)
+    Private Optional Declare Sub GtkBufferBeginAction Lib "libgtk-4.so.1" Alias "gtk_text_buffer_begin_user_action" (buffer As Ptr)
+    Private Optional Declare Sub GtkBufferEndAction Lib "libgtk-4.so.1" Alias "gtk_text_buffer_end_user_action" (buffer As Ptr)
+    Private Optional Declare Function GtkWidgetParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+    Private Optional Declare Function GtkWidgetIsAncestor Lib "libgtk-4.so.1" Alias "gtk_widget_is_ancestor" (widget As Ptr, ancestor As Ptr) As Int32
+    Private Optional Declare Function GtkWidgetAncestor Lib "libgtk-4.so.1" Alias "gtk_widget_get_ancestor" (widget As Ptr, gtype As UInt64) As Ptr
+    Private Optional Declare Function GtkWidgetSensitive Lib "libgtk-4.so.1" Alias "gtk_widget_is_sensitive" (widget As Ptr) As Int32
+    Private Optional Declare Function GtkPopoverType Lib "libgtk-4.so.1" Alias "gtk_popover_get_type" () As UInt64
+    Private Optional Declare Function GtkObserveControllers Lib "libgtk-4.so.1" Alias "gtk_widget_observe_controllers" (widget As Ptr) As Ptr
+    Private Optional Declare Function GListModelCount Lib "libgtk-4.so.1" Alias "g_list_model_get_n_items" (model As Ptr) As UInt32
+    Private Optional Declare Function GListModelItem Lib "libgtk-4.so.1" Alias "g_list_model_get_item" (model As Ptr, position As UInt32) As Ptr
+    Private Optional Declare Sub GObjectUnref Lib "libgtk-4.so.1" Alias "g_object_unref" (instance As Ptr)
+    Private Optional Declare Function GtkKeyControllerType Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_get_type" () As UInt64
+    Private Optional Declare Function GtkKeyControllerIM Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_get_im_context" (controller As Ptr) As Ptr
+    Private Optional Declare Sub GtkIMPreedit Lib "libgtk-4.so.1" Alias "gtk_im_context_get_preedit_string" (context As Ptr, ByRef preedit As Ptr, ByRef attrs As Ptr, ByRef cursor As Int32)
+    Private Optional Declare Sub GFree Lib "libgtk-4.so.1" Alias "g_free" (memory As Ptr)
+    Private Optional Declare Sub PangoAttrListUnref Lib "libgtk-4.so.1" Alias "pango_attr_list_unref" (attrs As Ptr)
+#ElseIf TargetMac Then
+    Private Declare Function MacClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function MacSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+    Private Declare Function MacSendBool Lib "objc" Alias "objc_msgSend" (target As Ptr, action As Ptr) As UInt8
+    Private Declare Sub MacSendObject Lib "objc" Alias "objc_msgSend" (target As Ptr, action As Ptr, argument As Ptr)
+    Private Declare Function MacString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, text As String) As Ptr
+    Private Declare Sub MacSetKeyEquivalent Lib "AppKit" Selector "setKeyEquivalent:" (button As Ptr, key As Ptr)
+
+    Sequential Structure ClassicMacRange
+        Location As UInt64
+        Length As UInt64
+    End Structure
+
+    Private Declare Function MacInLiveResize Lib "AppKit" Selector "inLiveResize" (window As Ptr) As Boolean
+    Private Declare Function MacIsKind Lib "objc" Selector "isKindOfClass:" (obj As Ptr, cls As Ptr) As Boolean
+    Private Declare Function MacDocumentView Lib "AppKit" Selector "documentView" (scroll As Ptr) As Ptr
+    Private Declare Function MacCurrentEditor Lib "AppKit" Selector "currentEditor" (control As Ptr) As Ptr
+    Private Declare Function MacSelectedRange Lib "AppKit" Selector "selectedRange" (view As Ptr) As ClassicMacRange
+    Private Declare Sub MacSetSelectedRange Lib "AppKit" Selector "setSelectedRange:" (view As Ptr, range As ClassicMacRange)
+    Private Declare Function MacShouldChange Lib "AppKit" Selector "shouldChangeTextInRange:replacementString:" (view As Ptr, range As ClassicMacRange, text As Ptr) As Boolean
+    Private Declare Sub MacReplaceText Lib "AppKit" Selector "replaceCharactersInRange:withString:" (view As Ptr, range As ClassicMacRange, text As Ptr)
+    Private Declare Sub MacDidChangeText Lib "AppKit" Selector "didChangeText" (view As Ptr)
+    Private Declare Function MacSuperview Lib "AppKit" Selector "superview" (view As Ptr) As Ptr
+    Private Declare Function MacContentView Lib "AppKit" Selector "contentView" (window As Ptr) As Ptr
+    Private Declare Function MacIsDescendant Lib "AppKit" Selector "isDescendantOf:" (view As Ptr, ancestor As Ptr) As Boolean
+    Private Declare Function MacFirstResponder Lib "AppKit" Selector "firstResponder" (window As Ptr) As Ptr
+    Private Declare Function MacDelegate Lib "AppKit" Selector "delegate" (view As Ptr) As Ptr
+#ElseIf TargetWindows Then
+    ' Win32 MSG (48 bytes on 64-bit Windows).
+    Sequential Structure ClassicWinMsg
+        Window As Ptr
+        Message As UInt32
+        Padding As UInt32
+        WParam As Int64
+        LParam As Int64
+        Time As UInt32
+        PointX As Int32
+        PointY As Int32
+        Extra As UInt32
+    End Structure
+
+    ' EM_GETSEL's two DWORD out-parameters, read back from one 8-byte buffer.
+    Sequential Structure ClassicWinSelection
+        StartPos As UInt32
+        EndPos As UInt32
+    End Structure
+
+    ' Win32 CWPRETSTRUCT (40 bytes on 64-bit Windows).
+    Sequential Structure ClassicWinCallRet
+        Result As Int64
+        LParam As Int64
+        WParam As Int64
+        Message As UInt32
+        Padding As UInt32
+        Window As Ptr
+    End Structure
+
+    ' Win32 COMBOBOXINFO (64 bytes on 64-bit Windows).
+    Sequential Structure ClassicWinComboInfo
+        Size As UInt32
+        ItemLeft As Int32
+        ItemTop As Int32
+        ItemRight As Int32
+        ItemBottom As Int32
+        ButtonLeft As Int32
+        ButtonTop As Int32
+        ButtonRight As Int32
+        ButtonBottom As Int32
+        ButtonState As UInt32
+        Combo As Ptr
+        Item As Ptr
+        List As Ptr
+    End Structure
+
+    Private Optional Declare Function WinShowWindow Lib "user32" Alias "ShowWindow" (window As Ptr, command As Int32) As Int32
+    Private Optional Declare Function WinIsZoomed Lib "user32" Alias "IsZoomed" (window As Ptr) As Int32
+    Private Optional Declare Function WinIsIconic Lib "user32" Alias "IsIconic" (window As Ptr) As Int32
+    Private Optional Declare Function WinSetHook Lib "user32" Alias "SetWindowsHookExW" (hookId As Int32, callback As Ptr, moduleHandle As Ptr, threadId As UInt32) As Ptr
+    Private Optional Declare Function WinNextHook Lib "user32" Alias "CallNextHookEx" (hook As Ptr, code As Int32, wparam As Int64, lparam As Ptr) As Int64
+    Private Optional Declare Sub WinReadMessage Lib "kernel32" Alias "RtlMoveMemory" (ByRef target As ClassicWinMsg, source As Ptr, length As Integer)
+    Private Optional Declare Sub WinReadCallRet Lib "kernel32" Alias "RtlMoveMemory" (ByRef target As ClassicWinCallRet, source As Ptr, length As Integer)
+    Private Optional Declare Sub WinWriteMessage Lib "kernel32" Alias "RtlMoveMemory" (target As Ptr, ByRef source As ClassicWinMsg, length As Integer)
+    Private Optional Declare Function WinThreadId Lib "kernel32" Alias "GetCurrentThreadId" () As UInt32
+    Private Optional Declare Function WinFocus Lib "user32" Alias "GetFocus" () As Ptr
+    Private Optional Declare Function WinSetFocus Lib "user32" Alias "SetFocus" (window As Ptr) As Ptr
+    Private Optional Declare Function WinAncestor Lib "user32" Alias "GetAncestor" (window As Ptr, ancestorFlags As UInt32) As Ptr
+    Private Optional Declare Function WinKeyState Lib "user32" Alias "GetKeyState" (key As Int32) As Int16
+    Private Optional Declare Function WinSend Lib "user32" Alias "SendMessageW" (window As Ptr, message As UInt32, wparam As UInt64, lparam As Int64) As Int64
+    ' One signature per aliased symbol: Buoy 0.72 merges Optional Declares of the
+    ' same export, so pointers go to SendMessageW as integer addresses.
+    Private Optional Declare Sub WinReadSelection Lib "kernel32" Alias "RtlMoveMemory" (ByRef target As ClassicWinSelection, source As Ptr, length As Integer)
+    Private Optional Declare Function WinWide Lib "kernel32" Alias "MultiByteToWideChar" (codePage As UInt32, conversion As UInt32, text As String, byteCount As Int32, buffer As Ptr, wideCount As Int32) As Int32
+    Private Optional Declare Function WinLocalAlloc Lib "kernel32" Alias "LocalAlloc" (allocation As UInt32, size As UInt64) As Ptr
+    Private Optional Declare Function WinLocalFree Lib "kernel32" Alias "LocalFree" (memory As Ptr) As Ptr
+    Private Optional Declare Function WinEnabled Lib "user32" Alias "IsWindowEnabled" (window As Ptr) As Int32
+    Private Optional Declare Function WinVisible Lib "user32" Alias "IsWindowVisible" (window As Ptr) As Int32
+    Private Optional Declare Function WinIsWindow Lib "user32" Alias "IsWindow" (window As Ptr) As Int32
+    Private Optional Declare Function WinIsChild Lib "user32" Alias "IsChild" (parent As Ptr, window As Ptr) As Int32
+    Private Optional Declare Function WinParent Lib "user32" Alias "GetParent" (window As Ptr) As Ptr
+    Private Optional Declare Function WinComboInfo Lib "user32" Alias "GetComboBoxInfo" (combo As Ptr, ByRef info As ClassicWinComboInfo) As Int32
+    Private Optional Declare Function WinImmContext Lib "imm32" Alias "ImmGetContext" (window As Ptr) As Ptr
+    Private Optional Declare Function WinImmRelease Lib "imm32" Alias "ImmReleaseContext" (window As Ptr, context As Ptr) As Int32
+    Private Optional Declare Function WinImmComposition Lib "imm32" Alias "ImmGetCompositionStringW" (context As Ptr, index As UInt32, buffer As Ptr, length As UInt32) As Int32
+#End If
+
+Private Sub ClassicNeedWindow(w As Window)
+    If w = Nil Then Throw New NilObjectException("ClassicDesktop: window is Nil")
+    If w.NativeWidget = Nil Then Throw New UnsupportedOperationException("ClassicDesktop: the window has no native window yet; show it first")
+End Sub
+
+' ── Exceptions at the native callback boundary ──────────────────────────────
+' GTK signals and Win32 hooks call into this module from C frames. An exception
+' must not unwind through them, so each callback catches it here. A registered
+' ClassicCallbackErrorHandler may handle it (return True). Otherwise it is
+' rethrown unchanged from a Timer tick on the next run-loop turn, where Buoy's
+' normal uncaught-exception path (Application.UnhandledException, then abort)
+' applies exactly as for any other event handler.
+
+''' Receives exceptions raised by event handlers that ClassicDesktop invoked from
+''' a native callback. `origin` names the callback. Return True when handled;
+''' False lets the exception continue as an uncaught exception.
+Public Interface ClassicCallbackErrorHandler
+    Function CallbackError(e As Exception, origin As String) As Boolean
+End Interface
+
+Private Class ClassicCallbackErrors
+    Public Shared Property Handler As ClassicCallbackErrorHandler = Nil
+    Public Shared Property Pending As Array Of Exception = []
+    Public Shared Property Rethrower As ClassicRethrowTimer = Nil
+End Class
+
+Private Class ClassicRethrowTimer Inherits Timer
+    Public Overrides Sub NotifyTick()
+        Me.Stop()
+        If ClassicCallbackErrors.Pending.Count = 0 Then Return
+        Dim e As Exception = ClassicCallbackErrors.Pending(0)
+        Array.RemoveAt(ClassicCallbackErrors.Pending, 0)
+        If ClassicCallbackErrors.Pending.Count > 0 Then Me.Start()
+        Throw e
+    End Sub
+End Class
+
+''' Installs (or, with Nil, removes) the handler for exceptions that escape event
+''' handlers ClassicDesktop raises from native callbacks.
+Public Sub ClassicSetCallbackErrorHandler(handler As ClassicCallbackErrorHandler)
+    ClassicCallbackErrors.Handler = handler
+End Sub
+
+Private Sub ClassicReportCallbackError(e As Exception, origin As String)
+    Dim failure As Exception = e
+    Dim handler As ClassicCallbackErrorHandler = ClassicCallbackErrors.Handler
+    If handler <> Nil Then
+        Dim handled As Boolean = False
+        Try
+            handled = handler.CallbackError(e, origin)
+        Catch inner As Exception
+            ' The handler's own failure is the one that escapes.
+            failure = inner
+        End Try
+        If handled And failure Is e Then Return
+    End If
+    StdErr.WriteLine("ClassicDesktop: exception escaped " + origin + "; rethrowing it outside the native callback")
+    ClassicCallbackErrors.Pending.Append(failure)
+    If ClassicCallbackErrors.Rethrower = Nil Then ClassicCallbackErrors.Rethrower = New ClassicRethrowTimer()
+    ClassicCallbackErrors.Rethrower.Period = 1
+    ClassicCallbackErrors.Rethrower.Start()
+End Sub
+
+' ── Window state: Minimize / Maximize / Restore ─────────────────────────────
+
+Private Function ClassicIsMinimized(w As Window) As Boolean
+    #If TargetLinux Then
+        Dim surface As Ptr = GtkNativeSurface(w.NativeWidget)
+        If surface = Nil Then Return False
+        Return (GdkToplevelState(surface) And 1) <> 0
+    #ElseIf TargetMac Then
+        Return MacSendBool(w.NativeWidget, MacSelector("isMiniaturized")) <> 0
+    #ElseIf TargetWindows Then
+        Return WinIsIconic(w.NativeWidget) <> 0
+    #Else
+        Throw New UnsupportedOperationException("ClassicDesktop: window state is not available on this target")
+    #End If
+End Function
+
+Private Function ClassicIsMaximized(w As Window) As Boolean
+    #If TargetLinux Then
+        Return GtkWindowIsMaximized(w.NativeWidget) <> 0
+    #ElseIf TargetMac Then
+        Return MacSendBool(w.NativeWidget, MacSelector("isZoomed")) <> 0
+    #ElseIf TargetWindows Then
+        Return WinIsZoomed(w.NativeWidget) <> 0
+    #Else
+        Throw New UnsupportedOperationException("ClassicDesktop: window state is not available on this target")
+    #End If
+End Function
+
+''' API 1 `Window.Minimize`: minimizes (macOS: miniaturizes) the window.
+Public Extension Sub Minimize(recv As Window)
+    ClassicNeedWindow(recv)
+    #If TargetLinux Then
+        GtkWindowMinimize(recv.NativeWidget)
+    #ElseIf TargetMac Then
+        MacSendObject(recv.NativeWidget, MacSelector("miniaturize:"), Nil)
+    #ElseIf TargetWindows Then
+        WinShowWindow(recv.NativeWidget, 6)
+    #Else
+        Throw New UnsupportedOperationException("ClassicDesktop: Minimize is not available on this target")
+    #End If
+End Sub
+
+''' API 1 `Window.Maximize`: maximizes (macOS: zooms) the window. As in API 1, a
+''' window that is already maximized is restored to its prior state instead.
+Public Extension Sub Maximize(recv As Window)
+    ClassicNeedWindow(recv)
+    #If TargetLinux Then
+        If GtkWindowIsMaximized(recv.NativeWidget) <> 0 Then
+            GtkWindowUnmaximize(recv.NativeWidget)
+        Else
+            GtkWindowMaximize(recv.NativeWidget)
+        End If
+    #ElseIf TargetMac Then
+        ' zoom: toggles between the user and standard frames itself.
+        MacSendObject(recv.NativeWidget, MacSelector("zoom:"), Nil)
+    #ElseIf TargetWindows Then
+        If WinIsZoomed(recv.NativeWidget) <> 0 Then
+            WinShowWindow(recv.NativeWidget, 9)
+        Else
+            WinShowWindow(recv.NativeWidget, 3)
+        End If
+    #Else
+        Throw New UnsupportedOperationException("ClassicDesktop: Maximize is not available on this target")
+    #End If
+End Sub
+
+''' API 1 `Window.Restore`: un-minimizes a minimized window (back to its prior
+''' state, which may be maximized), otherwise un-maximizes a maximized one.
+Public Extension Sub Restore(recv As Window)
+    ClassicNeedWindow(recv)
+    If ClassicIsMinimized(recv) Then
+        #If TargetLinux Then
+            GtkWindowUnminimize(recv.NativeWidget)
+        #ElseIf TargetMac Then
+            MacSendObject(recv.NativeWidget, MacSelector("deminiaturize:"), Nil)
+        #ElseIf TargetWindows Then
+            WinShowWindow(recv.NativeWidget, 9)
+        #End If
+    ElseIf ClassicIsMaximized(recv) Then
+        #If TargetLinux Then
+            GtkWindowUnmaximize(recv.NativeWidget)
+        #ElseIf TargetMac Then
+            MacSendObject(recv.NativeWidget, MacSelector("zoom:"), Nil)
+        #ElseIf TargetWindows Then
+            WinShowWindow(recv.NativeWidget, 9)
+        #End If
+    End If
+End Sub
+
+' ── Window size limits (REALbasic spellings) ────────────────────────────────
+' These share the legacy shim's per-window MinimumWidth/… table, which also
+' reaches the runtime's SetMinSize/SetMaxSize (GTK 4 has no maximum size).
+
+''' REALbasic `Window.MinWidth`; same value as `MinimumWidth`.
+Public Extension Function MinWidth(recv As Window) As Integer
+    Return recv.MinimumWidth
+End Function
+
+Public Extension Sub MinWidth(recv As Window, Assigns value As Integer)
+    recv.MinimumWidth = value
+End Sub
+
+''' REALbasic `Window.MinHeight`; same value as `MinimumHeight`.
+Public Extension Function MinHeight(recv As Window) As Integer
+    Return recv.MinimumHeight
+End Function
+
+Public Extension Sub MinHeight(recv As Window, Assigns value As Integer)
+    recv.MinimumHeight = value
+End Sub
+
+''' REALbasic `Window.MaxWidth`; same value as `MaximumWidth`.
+Public Extension Function MaxWidth(recv As Window) As Integer
+    Return recv.MaximumWidth
+End Function
+
+Public Extension Sub MaxWidth(recv As Window, Assigns value As Integer)
+    recv.MaximumWidth = value
+End Sub
+
+''' REALbasic `Window.MaxHeight`; same value as `MaximumHeight`.
+Public Extension Function MaxHeight(recv As Window) As Integer
+    Return recv.MaximumHeight
+End Function
+
+Public Extension Sub MaxHeight(recv As Window, Assigns value As Integer)
+    recv.MaximumHeight = value
+End Sub
+
+' ── Drag and drop (API 1 Accept*Drop / DragEnter / DragOver / DragExit / DropObject) ──
+
+''' API 1 drop events for a control. A converted control subclass implements this
+''' interface (its former event handlers become these methods) and calls
+''' `AcceptTextDrop`/`AcceptPictureDrop`/`AcceptFileDrop` on itself.
+''' Returning True from DragEnter or DragOver rejects the drag, as in API 1.
+Public Interface ClassicDropHandler
+    Function DragEnter(obj As DragItem, action As Integer) As Boolean
+    Function DragOver(x As Integer, y As Integer, obj As DragItem, action As Integer) As Boolean
+    Sub DragExit(obj As DragItem, action As Integer)
+    Sub DropObject(obj As DragItem, action As Integer)
+End Interface
+
+''' API 1 `DragItem.DragActionDefault`/`Copy`/`Move`/`Link` codes.
+Public Class ClassicDragAction
+    Public Const DragActionDefault As Integer = 0
+    Public Const DragActionCopy As Integer = 1
+    Public Const DragActionMove As Integer = 2
+    Public Const DragActionLink As Integer = 3
+
+    Public Shared Function FromAction(action As DragAction) As Integer
+        If (action And DragAction.Copy) = DragAction.Copy Then Return 1
+        If (action And DragAction.Move) = DragAction.Move Then Return 2
+        If (action And DragAction.Link) = DragAction.Link Then Return 3
+        Return 0
+    End Function
+End Class
+
+''' The IDropTarget behind the API 1 Accept*Drop methods. Owns the accepted
+''' kinds, the file-type filter and the drag in progress (Buoy's DragLeft has
+''' no payload; API 1's DragExit receives the item that entered).
+''' The control is held weakly, so a target never keeps its control alive; when
+''' the handler is the control itself it is looked up through that weak
+''' reference. Once the control is gone every drag is refused.
+Public Class ClassicDropTarget Implements IDropTarget
+    Private Property mControl As Weak UIControl
+    Private Property mHandler As ClassicDropHandler = Nil
+    Private Property mHandlerIsControl As Boolean = False
+    Private Property mText As Boolean = False
+    Private Property mPicture As Boolean = False
+    Private Property mAnyFile As Boolean = False
+    Private Property mFileTypes As Array Of FileType = []
+    Private Property mCurrent As DragItem = Nil
+    Private Property mCurrentAction As Integer = 0
+    Private Property mRejected As Boolean = False
+    Private Property mOverRejected As Boolean = False
+
+    Public Sub Constructor(control As UIControl, handler As ClassicDropHandler)
+        If control = Nil Then Throw New NilObjectException("ClassicDropTarget: control is Nil")
+        If TryCast(control, Window) <> Nil Then Throw New UnsupportedOperationException("ClassicDropTarget: a Buoy Window is not a drop target")
+        If handler = Nil Then Throw New NilObjectException("ClassicDropTarget: handler is Nil")
+        Me.mControl = control
+        Dim handlerControl As UIControl = TryCast(handler, UIControl)
+        If handlerControl Is control Then
+            Me.mHandlerIsControl = True
+        Else
+            Me.mHandler = handler
+        End If
+    End Sub
+
+    ''' The control this target was created for, or Nil once it has been destroyed.
+    Public ReadOnly Property Control As UIControl
+        Get
+            Return Me.mControl
+        End Get
+    End Property
+
+    Private Function Handler() As ClassicDropHandler
+        If Me.mHandlerIsControl Then
+            Dim owner As UIControl = Me.mControl
+            If owner = Nil Then Return Nil
+            Return TryCast(owner, ClassicDropHandler)
+        End If
+        Return Me.mHandler
+    End Function
+
+    Public Sub AcceptTextDrop()
+        Me.mText = True
+        Me.Register()
+    End Sub
+
+    Public Sub AcceptPictureDrop()
+        Me.mPicture = True
+        Me.Register()
+    End Sub
+
+    ''' Accepts files whose path matches `type` (`FileType.Matches`).
+    Public Sub AcceptFileDrop(type As FileType)
+        If type = Nil Then Throw New NilObjectException("AcceptFileDrop: file type is Nil")
+        Me.mFileTypes.Append(type)
+        Me.Register()
+    End Sub
+
+    ''' Accepts any file for `"special/any"` (or `""`). Other names refer to IDE
+    ''' FileTypeSet entries that do not exist here; pass the FileType instead.
+    Public Sub AcceptFileDrop(typeName As String)
+        If typeName <> "" And typeName <> "special/any" Then
+            Throw New InvalidArgumentException("AcceptFileDrop: unknown file type name '" + typeName + "'; pass a FileType or \"special/any\"")
+        End If
+        Me.mAnyFile = True
+        Me.Register()
+    End Sub
+
+    Private Sub Register()
+        Dim kinds As Array Of DragType = []
+        If Me.mText Then kinds.Append(DragType.Text)
+        If Me.mPicture Then kinds.Append(DragType.Picture)
+        If Me.mAnyFile Or Me.mFileTypes.Count > 0 Then kinds.Append(DragType.FileList)
+        Dim owner As UIControl = Me.mControl
+        If owner = Nil Then Throw New NilObjectException("ClassicDropTarget: the control has been destroyed")
+        owner.RegisterDropTarget(Me, kinds)
+    End Sub
+
+    ''' True when the payload carries a representation this target accepts.
+    Public Function Accepts(payload As DragItem) As Boolean
+        If payload = Nil Then Return False
+        If Me.mText And payload.HasType(DragType.Text) Then Return True
+        If Me.mPicture And payload.HasType(DragType.Picture) Then Return True
+        If payload.HasType(DragType.FileList) Then
+            If Me.mAnyFile Then Return True
+            For Each f As FileSystemItem In payload.AsFiles()
+                For Each t As FileType In Me.mFileTypes
+                    If t.Matches(f.FullPath()) Then Return True
+                Next
+            Next
+        End If
+        Return False
+    End Function
+
+    Private Function Answer(requested As DragAction) As DragAction
+        If requested = DragAction.None Then Return DragAction.Copy
+        Return requested
+    End Function
+
+    Public Overrides Function DragEntered(payload As DragItem, requested As DragAction) As DragAction
+        Me.mCurrent = Nil
+        Me.mRejected = True
+        Me.mOverRejected = False
+        If Not Me.Accepts(payload) Then Return DragAction.None
+        Dim h As ClassicDropHandler = Me.Handler()
+        If h = Nil Then Return DragAction.None
+        Dim code As Integer = ClassicDragAction.FromAction(requested)
+        If h.DragEnter(payload, code) Then Return DragAction.None
+        Me.mCurrent = payload
+        Me.mCurrentAction = code
+        Me.mRejected = False
+        Return Me.Answer(requested)
+    End Function
+
+    Public Overrides Function DragOver(payload As DragItem, requested As DragAction, pt As Point) As DragAction
+        If Me.mRejected Then Return DragAction.None
+        If Not Me.Accepts(payload) Then Return DragAction.None
+        Dim h As ClassicDropHandler = Me.Handler()
+        If h = Nil Then Return DragAction.None
+        Dim x As Integer = Math.Floor(pt.X)
+        Dim y As Integer = Math.Floor(pt.Y)
+        Dim code As Integer = ClassicDragAction.FromAction(requested)
+        Me.mOverRejected = h.DragOver(x, y, payload, code)
+        If Me.mOverRejected Then Return DragAction.None
+        Me.mCurrentAction = code
+        Return Me.Answer(requested)
+    End Function
+
+    Public Overrides Sub DragLeft()
+        Dim item As DragItem = Me.mCurrent
+        Me.mCurrent = Nil
+        Me.mRejected = False
+        Me.mOverRejected = False
+        If item = Nil Then Return
+        Dim h As ClassicDropHandler = Me.Handler()
+        If h <> Nil Then h.DragExit(item, Me.mCurrentAction)
+    End Sub
+
+    Public Overrides Function DragDropped(payload As DragItem, action As DragAction, pt As Point) As Boolean
+        Me.mCurrent = Nil
+        Dim rejected As Boolean = Me.mRejected Or Me.mOverRejected
+        Me.mRejected = False
+        Me.mOverRejected = False
+        If rejected Then Return False
+        If Not Me.Accepts(payload) Then Return False
+        Dim h As ClassicDropHandler = Me.Handler()
+        If h = Nil Then Return False
+        h.DropObject(payload, ClassicDragAction.FromAction(action))
+        Return True
+    End Function
+End Class
+
+Private Class ClassicDropTable
+    Public Shared Property Targets As Map Of Integer, ClassicDropTarget = New Map Of Integer, ClassicDropTarget()
+
+    Public Shared Function For(control As UIControl) As ClassicDropTarget
+        If control = Nil Then Throw New NilObjectException("Accept*Drop: control is Nil")
+        If TryCast(control, Window) <> Nil Then
+            Throw New UnsupportedOperationException("Accept*Drop: a Buoy Window is not a drop target; accept the drop on a control in the window")
+        End If
+        ClassicDropTable.Prune()
+        Dim o As Object = control
+        Dim key As Integer = o.Hash()
+        Dim found As Optional Of ClassicDropTarget = ClassicDropTable.Targets.Get(key)
+        If found.HasValue Then
+            ' A destroyed control's address can be reused; only a live match counts.
+            If found.Value.Control Is control Then Return found.Value
+            ClassicDropTable.Targets.Remove(key)
+        End If
+        Dim handler As ClassicDropHandler = TryCast(control, ClassicDropHandler)
+        If handler = Nil Then
+            Throw New UnsupportedOperationException("Accept*Drop: the control must implement ClassicDropHandler to receive DragEnter/DragOver/DragExit/DropObject")
+        End If
+        Dim fresh As New ClassicDropTarget(control, handler)
+        ClassicDropTable.Targets.Set(key, fresh)
+        Return fresh
+    End Function
+
+    ''' Drops the entries whose control has been destroyed.
+    Public Shared Sub Prune()
+        For Each key As Integer In ClassicDropTable.Targets.Keys()
+            Dim entry As Optional Of ClassicDropTarget = ClassicDropTable.Targets.Get(key)
+            If entry.HasValue Then
+                If entry.Value.Control = Nil Then ClassicDropTable.Targets.Remove(key)
+            End If
+        Next
+    End Sub
+End Class
+
+''' API 1 `RectControl.AcceptTextDrop` for a control implementing ClassicDropHandler.
+Public Extension Sub AcceptTextDrop(recv As UIControl)
+    ClassicDropTable.For(recv).AcceptTextDrop()
+End Sub
+
+''' API 1 `RectControl.AcceptPictureDrop`.
+Public Extension Sub AcceptPictureDrop(recv As UIControl)
+    ClassicDropTable.For(recv).AcceptPictureDrop()
+End Sub
+
+''' API 1 `RectControl.AcceptFileDrop(fileType)`.
+Public Extension Sub AcceptFileDrop(recv As UIControl, type As FileType)
+    ClassicDropTable.For(recv).AcceptFileDrop(type)
+End Sub
+
+''' API 1 `RectControl.AcceptFileDrop("special/any")`.
+Public Extension Sub AcceptFileDrop(recv As UIControl, typeName As String)
+    ClassicDropTable.For(recv).AcceptFileDrop(typeName)
+End Sub
+
+' ── ClassicWindow ───────────────────────────────────────────────────────────
+
+Private Class ClassicWindowTable
+    Public Shared Property Windows As Map Of Integer, ClassicWindow = New Map Of Integer, ClassicWindow()
+    Public Shared Property NextKey As Integer = 1
+End Class
+
+Private Class ClassicQuitState
+    Public Shared Property Active As Boolean = False
+    Public Shared Property Deferred As Boolean = False
+    Public Shared Property DeferredCode As Integer = 0
+    Public Shared Property ExitCode As Integer = 0
+End Class
+
+#If TargetLinux Then
+    Private Sub ClassicWindowStateChanged(surface As Ptr, pspec As Ptr, data As Ptr)
+        Try
+            Dim found As Optional Of ClassicWindow = ClassicWindowTable.Windows.Get(CType(data, Integer))
+            If found.HasValue Then found.Value.NoteNativeState(GdkToplevelState(surface))
+        Catch e As Exception
+            ClassicReportCallbackError(e, "ClassicWindow Minimize/Maximize/Restore (GDK notify::state)")
+        End Try
+    End Sub
+#End If
+
+#If TargetWindows Then
+    Private Class ClassicFrameHook
+        Public Shared Property Hook As Ptr = Nil
+    End Class
+
+    ' WH_CALLWNDPROCRET hook: WM_SIZE (after the window processed it) re-reads
+    ' the minimized/maximized state; WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE bracket a
+    ' live user resize, which is what separates Resizing from Resized.
+    Private Function ClassicFrameHookProc(code As Int32, wparam As Int64, lparam As Ptr) As Int64
+        If code = 0 And lparam <> Nil Then
+            Dim m As ClassicWinCallRet
+            WinReadCallRet(m, lparam, 40)
+            If m.Message = 5 Or m.Message = 561 Or m.Message = 562 Then
+                Try
+                    For Each w As Window In Application.Windows
+                        Dim classic As ClassicWindow = TryCast(w, ClassicWindow)
+                        If classic <> Nil Then
+                            If classic.NativeWidget = m.Window Then classic.NoteFrameMessage(m.Message)
+                        End If
+                    Next
+                Catch e As Exception
+                    ClassicReportCallbackError(e, "ClassicWindow Minimize/Maximize/Restore (WH_CALLWNDPROCRET)")
+                End Try
+            End If
+        End If
+        Return WinNextHook(Nil, code, wparam, lparam)
+    End Function
+#End If
+
+''' API 1 `Window`. Inherit this instead of Buoy's `Window` and keep API 1 event
+''' handler names. Event mapping:
+''' Open ← Opening; Close ← Closed (raised after the native close, so it cannot be
+''' cancelled — as in API 1); CancelClose(appQuitting) ← Closing; Activate/Deactivate
+''' ← Activated/Deactivated; Resizing/Resized ← Resized(finished False/True).
+''' Minimize/Maximize/Restore follow the native window state (Linux: GDK state
+''' notifications; Windows: WM_SIZE; macOS: re-read on Buoy's Shown/Hidden/Resized). Buoy's
+''' own window events are re-raised, so subclasses may still handle them. EnableMenuItems, window ConstructContextualMenu and
+''' KeyDown/Mouse*/Moved/Paint are not bridged (see notes). Window-level drops are
+''' not available: Buoy's Window is not a drop target, so Accept*Drop raises
+''' UnsupportedOperationException; accept drops on a control instead.
+Public Class ClassicWindow Inherits Window
+    Event Open()
+    Event Close()
+    Event CancelClose(appQuitting As Boolean) As Boolean
+    Event Activate()
+    Event Deactivate()
+    Event Resized()
+    Event Resizing()
+    Event Minimize()
+    Event Maximize()
+    Event Restore()
+
+    ' Buoy's own Window events, re-declared and re-raised after the bridge runs:
+    ' a subclass Handle would otherwise replace this class's handler.
+    Event Opening()
+    Event Opened()
+    Event Closing() As Boolean
+    Event Closed()
+    Event Activated()
+    Event Deactivated()
+    Event Resized(width As Double, height As Double, finished As Boolean)
+    Event Shown()
+    Event Hidden()
+
+    Private Property mKey As Integer = 0
+    Private Property mState As UInt32 = 0
+    Private Property mStateSignal As UInt64 = 0
+    Private Property mStateSource As Ptr = Nil
+    Private Property mWasMinimized As Boolean = False
+    Private Property mWasMaximized As Boolean = False
+    Private Property mInSizeMove As Boolean = False
+    Private Property mCloseApproved As Boolean = False
+    Private Property mClosing As Boolean = False
+    Private Property mClosed As Boolean = False
+    Private Property mConsultingClose As Boolean = False
+
+    Internal ReadOnly Property ClosingOrClosed As Boolean
+        Get
+            Return Me.mClosing Or Me.mClosed
+        End Get
+    End Property
+
+    Internal ReadOnly Property CloseDecisionPending As Boolean
+        Get
+            Return Me.mConsultingClose
+        End Get
+    End Property
+
+    Handle Opening()
+        RaiseEvent Open()
+        RaiseEvent Opening()
+    End Handle
+
+    Handle Opened()
+        Me.WatchNativeState()
+        #If TargetWindows Then
+            If ClassicFrameHook.Hook = Nil Then
+                ClassicFrameHook.Hook = WinSetHook(12, CType(AddressOf ClassicFrameHookProc, Ptr), Nil, WinThreadId())
+                If ClassicFrameHook.Hook = Nil Then Throw New UnsupportedOperationException("ClassicWindow: SetWindowsHookEx(WH_CALLWNDPROCRET) failed")
+            End If
+            Me.PollFrameState()
+        #End If
+        RaiseEvent Opened()
+    End Handle
+
+    Handle Closing() As Boolean
+        If Me.mCloseApproved Then Return False
+        If Me.mConsultingClose Then Return True
+        Me.mConsultingClose = True
+        Dim veto As Boolean = False
+        Try
+            veto = RaiseEvent CancelClose(False)
+            If Not veto Then veto = RaiseEvent Closing()
+        Catch e As Exception
+            Me.mConsultingClose = False
+            ClassicQuitState.Deferred = False
+            Throw e
+        Finally
+            Me.mConsultingClose = False
+        End Try
+        If veto Then
+            ClassicQuitState.Deferred = False
+            Return True
+        End If
+        Me.mClosing = True
+        Return False
+    End Handle
+
+    ''' Quit sequence, step 1: CancelClose(True), then Buoy's Closing. True = veto.
+    Internal Function ConsultQuit() As Boolean
+        If Me.mConsultingClose Then Return True
+        Me.mConsultingClose = True
+        Dim veto As Boolean = False
+        Try
+            veto = RaiseEvent CancelClose(True)
+            If Not veto Then veto = RaiseEvent Closing()
+        Catch e As Exception
+            Me.mConsultingClose = False
+            Throw e
+        Finally
+            Me.mConsultingClose = False
+        End Try
+        Return veto
+    End Function
+
+    ''' Quit sequence, step 2: close without asking again (macOS closes later).
+    Internal Sub CloseForQuit()
+        Me.mCloseApproved = True
+        Me.mClosing = True
+        Me.Close()
+    End Sub
+
+    Handle Closed()
+        Me.mClosed = True
+        Me.mClosing = True
+        Me.StopWatchingNativeState()
+        RaiseEvent Close()
+        RaiseEvent Closed()
+        If ClassicQuitState.Deferred And Not ClassicQuitState.Active Then
+            ClassicQuitState.Deferred = False
+            ClassicQuit(ClassicQuitState.DeferredCode)
+        End If
+    End Handle
+
+    Handle Activated()
+        RaiseEvent Activate()
+        RaiseEvent Activated()
+    End Handle
+
+    Handle Deactivated()
+        RaiseEvent Deactivate()
+        RaiseEvent Deactivated()
+    End Handle
+
+    Handle Shown()
+        Me.PollFrameState()
+        RaiseEvent Shown()
+    End Handle
+
+    Handle Hidden()
+        Me.PollFrameState()
+        RaiseEvent Hidden()
+    End Handle
+
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.PollFrameState()
+        Dim done As Boolean = finished
+        #If TargetWindows Then
+            ' Buoy reports programmatic and maximize/restore resizes as unfinished;
+            ' only a size-move loop is a live user resize.
+            If Not done And Not Me.mInSizeMove Then done = True
+        #ElseIf TargetMac Then
+            If Not done And Me.NativeWidget <> Nil Then
+                If Not MacInLiveResize(Me.NativeWidget) Then done = True
+            End If
+        #End If
+        If done Then
+            RaiseEvent Resized()
+        Else
+            RaiseEvent Resizing()
+        End If
+        RaiseEvent Resized(width, height, finished)
+    End Handle
+
+    #If TargetWindows Then
+        Internal Sub NoteFrameMessage(message As UInt32)
+            If message = 561 Then
+                Me.mInSizeMove = True
+            ElseIf message = 562 Then
+                Me.mInSizeMove = False
+            Else
+                Me.PollFrameState()
+            End If
+        End Sub
+    #End If
+
+    ' Windows/macOS: the native minimized and maximized flags are re-read on
+    ' every WM_SIZE (Windows) and whenever Buoy reports a show, hide or resize.
+    Private Sub PollFrameState()
+        #If TargetWindows Or TargetMac Then
+            If Me.NativeWidget = Nil Then Return
+            Dim isMin As Boolean = ClassicIsMinimized(Me)
+            Dim isMax As Boolean = ClassicIsMaximized(Me)
+            Dim wasMin As Boolean = Me.mWasMinimized
+            Dim wasMax As Boolean = Me.mWasMaximized
+            Me.mWasMinimized = isMin
+            Me.mWasMaximized = isMax
+            If isMin And Not wasMin Then
+                RaiseEvent Minimize()
+            ElseIf wasMin And Not isMin Then
+                RaiseEvent Restore()
+            ElseIf isMax And Not wasMax Then
+                RaiseEvent Maximize()
+            ElseIf wasMax And Not isMax Then
+                RaiseEvent Restore()
+            End If
+        #End If
+    End Sub
+
+    Private Sub WatchNativeState()
+        #If TargetLinux Then
+            If Me.mKey <> 0 Then Return
+            Dim surface As Ptr = GtkNativeSurface(Me.NativeWidget)
+            If surface = Nil Then Return
+            Me.mKey = ClassicWindowTable.NextKey
+            ClassicWindowTable.NextKey += 1
+            ClassicWindowTable.Windows.Set(Me.mKey, Me)
+            Me.mState = GdkToplevelState(surface)
+            Me.mStateSource = surface
+            Me.mStateSignal = GSignalConnect(surface, "notify::state", CType(AddressOf ClassicWindowStateChanged, Ptr), CType(Me.mKey, Ptr), Nil, 0)
+        #End If
+    End Sub
+
+    Private Sub StopWatchingNativeState()
+        #If TargetLinux Then
+            If Me.mKey = 0 Then Return
+            If Me.mStateSignal <> 0 And Me.mStateSource <> Nil Then GSignalDisconnect(Me.mStateSource, Me.mStateSignal)
+            ClassicWindowTable.Windows.Remove(Me.mKey)
+            Me.mKey = 0
+            Me.mStateSignal = 0
+            Me.mStateSource = Nil
+        #End If
+    End Sub
+
+    ''' Called from the native state-notify callback with GdkToplevelState bits.
+    Internal Sub NoteNativeState(state As UInt32)
+        Dim wasMin As Boolean = (Me.mState And 1) <> 0
+        Dim wasMax As Boolean = (Me.mState And 2) <> 0
+        Dim isMin As Boolean = (state And 1) <> 0
+        Dim isMax As Boolean = (state And 2) <> 0
+        Me.mState = state
+        If isMin And Not wasMin Then
+            RaiseEvent Minimize()
+        ElseIf wasMin And Not isMin Then
+            RaiseEvent Restore()
+        ElseIf isMax And Not wasMax Then
+            RaiseEvent Maximize()
+        ElseIf wasMax And Not isMax Then
+            RaiseEvent Restore()
+        End If
+    End Sub
+End Class
+
+' ── Quit with the API 1 CancelClose(appQuitting) sequence ───────────────────
+
+Private Function ClassicWindowIsOpen(w As Window) As Boolean
+    For Each open As Window In Application.Windows
+        If open Is w Then Return True
+    Next
+    Return False
+End Function
+
+''' Runs API 1's quit sequence without quitting: each open window, in order, is
+''' asked CancelClose(True) (ClassicWindow) and then closed; a plain Buoy Window
+''' is closed and must be gone afterwards. Returns False as soon as one window
+''' refuses; windows already closed stay closed.
+Public Function ClassicCloseWindowsForQuit() As Boolean
+    If ClassicQuitState.Active Then Return False
+    ClassicQuitState.Active = True
+    Try
+        Dim snapshot As Array Of Window = []
+        For Each w As Window In Application.Windows
+            snapshot.Append(w)
+        Next
+        For Each w As Window In snapshot
+            If ClassicWindowIsOpen(w) Then
+                Dim classic As ClassicWindow = TryCast(w, ClassicWindow)
+                If classic <> Nil Then
+                    If classic.ClosingOrClosed Then Continue For
+                    If classic.CloseDecisionPending Then
+                        ClassicQuitState.Deferred = True
+                        ClassicQuitState.Active = False
+                        Return False
+                    End If
+                    If classic.ConsultQuit() Then
+                        ClassicQuitState.Active = False
+                        Return False
+                    End If
+                    classic.CloseForQuit()
+                Else
+                    ' macOS finishes Close() on a later run-loop turn, so a plain
+                    ' window that is still listed counts as a veto there.
+                    w.Close()
+                    If ClassicWindowIsOpen(w) Then
+                        ClassicQuitState.Active = False
+                        Return False
+                    End If
+                End If
+            End If
+        Next
+        ClassicQuitState.Active = False
+        Return True
+    Catch e As Exception
+        ClassicQuitState.Active = False
+        Throw e
+    Finally
+        ClassicQuitState.Active = False
+    End Try
+End Function
+
+Private Class ClassicQuitTimer Inherits Timer
+    Public Shared Property Pending As ClassicQuitTimer = Nil
+
+    Public Overrides Sub NotifyTick()
+        Me.Stop()
+        Application.Quit()
+    End Sub
+End Class
+
+''' API 1 `Quit([exitCode])` with window vetoes honored (Buoy's Application.Quit
+''' consults no window). Returns without quitting when a window's CancelClose
+''' returns True; otherwise records `exitCode` (see ClassicExitCode) and quits on
+''' the next run-loop turn, after the windows' Close events.
+Public Sub ClassicQuit(exitCode As Integer = 0)
+    If ClassicQuitState.Active Then Return
+    For Each window As Window In Application.Windows
+        Dim classic As ClassicWindow = TryCast(window, ClassicWindow)
+        If classic <> Nil Then
+            If classic.CloseDecisionPending Then
+                ClassicQuitState.Deferred = True
+                ClassicQuitState.DeferredCode = exitCode
+                Return
+            End If
+        End If
+    Next
+    ClassicQuitState.Deferred = False
+    If Not ClassicCloseWindowsForQuit() Then Return
+    ClassicQuitState.ExitCode = exitCode
+    If ClassicQuitTimer.Pending = Nil Then ClassicQuitTimer.Pending = New ClassicQuitTimer()
+    ClassicQuitTimer.Pending.Period = 1
+    ClassicQuitTimer.Pending.Start()
+End Sub
+
+''' The exit code of the last ClassicQuit that went ahead (0 before any).
+''' Buoy sets a process exit code only through `Function Main() As Integer`, so
+''' return it after Application.Run: `Return ClassicExitCode()`.
+Public Function ClassicExitCode() As Integer
+    Return ClassicQuitState.ExitCode
+End Function
+
+' ── ClassicPushButton: Default / Cancel keyboard mapping ────────────────────
+
+' Live Default/Cancel buttons, held weakly: a closed window's buttons are
+' destroyed normally and their entries are pruned. Native callbacks carry the
+' entry key, never an object pointer, so a stale callback finds nothing.
+Private Class ClassicButtonRef
+    Public Property Button As Weak ClassicPushButton
+    Public Property Key As Integer = 0
+End Class
+
+Private Class ClassicButtonTable
+    Public Shared Property Refs As Array Of ClassicButtonRef = []
+    Public Shared Property NextKey As Integer = 1
+
+    Public Shared Sub Prune()
+        Dim i As Integer = ClassicButtonTable.Refs.Count - 1
+        While i >= 0
+            If ClassicButtonTable.Refs(i).Button = Nil Then Array.RemoveAt(ClassicButtonTable.Refs, i)
+            i -= 1
+        End While
+    End Sub
+
+    Public Shared Function Add(b As ClassicPushButton) As Integer
+        ClassicButtonTable.Prune()
+        Dim entry As New ClassicButtonRef()
+        entry.Button = b
+        entry.Key = ClassicButtonTable.NextKey
+        ClassicButtonTable.NextKey += 1
+        ClassicButtonTable.Refs.Append(entry)
+        Return entry.Key
+    End Function
+
+    Public Shared Sub Remove(key As Integer)
+        Dim i As Integer = ClassicButtonTable.Refs.Count - 1
+        While i >= 0
+            Dim entry As ClassicButtonRef = ClassicButtonTable.Refs(i)
+            If entry.Key = key Or entry.Button = Nil Then Array.RemoveAt(ClassicButtonTable.Refs, i)
+            i -= 1
+        End While
+    End Sub
+
+    Public Shared Function Find(key As Integer) As ClassicPushButton
+        For Each entry As ClassicButtonRef In ClassicButtonTable.Refs
+            If entry.Key = key Then Return entry.Button
+        Next
+        Return Nil
+    End Function
+
+    ''' Strong snapshot of the live buttons, so a handler that closes a window
+    ''' cannot change the list being walked.
+    Public Shared Function Live() As Array Of ClassicPushButton
+        ClassicButtonTable.Prune()
+        Dim buttons As Array Of ClassicPushButton = []
+        For Each entry As ClassicButtonRef In ClassicButtonTable.Refs
+            Dim b As ClassicPushButton = entry.Button
+            If b <> Nil Then buttons.Append(b)
+        Next
+        Return buttons
+    End Function
+
+    ''' Number of live registered Default/Cancel buttons.
+    Public Shared Function Count() As Integer
+        ClassicButtonTable.Prune()
+        Return ClassicButtonTable.Refs.Count
+    End Function
+End Class
+
+#If TargetLinux Then
+    ' True while the widget's input method holds uncommitted (preedit) text:
+    ' Return and Escape then belong to the input method, which commits or
+    ' cancels the composition. GtkText and GtkTextView attach their IM context
+    ' to a key controller.
+    Private Function ClassicGtkComposing(widget As Ptr) As Boolean
+        Dim controllers As Ptr = GtkObserveControllers(widget)
+        If controllers = Nil Then Return False
+        Dim composing As Boolean = False
+        Dim keyType As UInt64 = GtkKeyControllerType()
+        Dim count As UInt32 = GListModelCount(controllers)
+        Dim index As UInt32 = 0
+        While index < count And Not composing
+            Dim controller As Ptr = GListModelItem(controllers, index)
+            If controller <> Nil Then
+                If GTypeIsA(controller, keyType) <> 0 Then
+                    Dim context As Ptr = GtkKeyControllerIM(controller)
+                    If context <> Nil Then
+                        Dim preedit As Ptr = Nil
+                        Dim attrs As Ptr = Nil
+                        Dim cursor As Int32 = 0
+                        GtkIMPreedit(context, preedit, attrs, cursor)
+                        If preedit <> Nil Then
+                            If CType(preedit, String).LenBytes() > 0 Then composing = True
+                            GFree(preedit)
+                        End If
+                        If attrs <> Nil Then PangoAttrListUnref(attrs)
+                    End If
+                End If
+                GObjectUnref(controller)
+            End If
+            index += 1
+        End While
+        GObjectUnref(controllers)
+        Return composing
+    End Function
+
+    ' The button a Default/Cancel shortcut should press now, or Nil to let the
+    ' key continue to the focused widget: while an input method is composing,
+    ' inside an open popover (a dropdown list or menu closes itself on Escape
+    ' and picks on Return), and for Return in a multi-line text view or on
+    ' another focused button.
+    Private Function ClassicShortcutButton(widget As Ptr, tag As Integer) As ClassicPushButton
+        Dim b As ClassicPushButton = ClassicButtonTable.Find(tag \ 4)
+        If b = Nil Then Return Nil
+        If GtkWidgetMapped(widget) = 0 Or GtkWidgetSensitive(widget) = 0 Then Return Nil
+        Dim focus As Ptr = GtkRootFocus(GtkWidgetRoot(widget))
+        If focus <> Nil Then
+            If ClassicGtkComposing(focus) Then Return Nil
+            If GtkWidgetAncestor(focus, GtkPopoverType()) <> Nil Then Return Nil
+            ' A focused ClassicListBox raises KeyDown first; a key it declines
+            ' comes back through ClassicDefaultKeyRouter.
+            If ClassicListNativeOwnsKeys(focus) Then Return Nil
+            If tag Mod 4 = 1 And focus <> widget Then
+                If GTypeIsA(focus, GtkTextViewType()) <> 0 Then Return Nil
+                If GTypeIsA(focus, GtkButtonType()) <> 0 Then Return Nil
+            End If
+        End If
+        Return b
+    End Function
+
+    ' Capture-phase shortcut callback; data is ButtonTable key * 4 + kind
+    ' (1 Default, 2 Cancel); returning 0 lets the key pass. PerformClick raises
+    ' Action through the button's native clicked signal, so it runs outside
+    ' any Try here: an exception from Action takes Buoy's uncaught path in
+    ' place, exactly as for a mouse click. Catching it would unwind through the
+    ' GLib signal emission (see notes/desktop.md, CWD-001).
+    Private Function ClassicButtonShortcut(widget As Ptr, args As Ptr, data As Ptr) As Int32
+        Dim b As ClassicPushButton = Nil
+        Try
+            b = ClassicShortcutButton(widget, CType(data, Integer))
+        Catch e As Exception
+            ClassicReportCallbackError(e, "ClassicPushButton Default/Cancel key check (GTK shortcut)")
+            Return 0
+        End Try
+        If b = Nil Then Return 0
+        b.PerformClick()
+        Return 1
+    End Function
+
+    ' Receives Return/Enter/Escape that a focused ClassicListBox's KeyDown
+    ' declined, and presses the matching Default/Cancel button of the list's
+    ' window. PerformClick runs outside any Try (CWD-001).
+    Private Class ClassicDefaultKeyRouter Implements ClassicDeclinedKeyHandler
+        Public Shared Property Instance As ClassicDefaultKeyRouter = Nil
+
+        Public Function ClassicDeclinedKey(listWidget As Ptr, keyval As Integer) As Boolean
+            Dim root As Ptr = GtkWidgetRoot(listWidget)
+            If root = Nil Then Return False
+            Dim wantDefault As Boolean = keyval = &hFF0D Or keyval = &hFF8D
+            Dim target As ClassicPushButton = Nil
+            For Each b As ClassicPushButton In ClassicButtonTable.Live()
+                Dim widget As Ptr = b.NativeWidget
+                If widget <> Nil And target = Nil Then
+                    If GtkWidgetRoot(widget) = root And GtkWidgetMapped(widget) <> 0 And GtkWidgetSensitive(widget) <> 0 Then
+                        If (wantDefault And b.Default) Or (Not wantDefault And b.Cancel) Then target = b
+                    End If
+                End If
+            Next
+            If target = Nil Then Return False
+            target.PerformClick()
+            Return True
+        End Function
+    End Class
+
+    Private Sub ClassicButtonRooted(widget As Ptr, pspec As Ptr, data As Ptr)
+        Dim root As Ptr = GtkWidgetRoot(widget)
+        If root <> Nil Then GtkWindowSetDefault(root, widget)
+    End Sub
+
+    Private Function ClassicButtonController(widget As Ptr, kind As Integer, key As Integer) As Ptr
+        Dim trigger As Ptr
+        If kind = 1 Then
+            trigger = GtkAlternativeTrigger(GtkKeyvalTrigger(&hFF0D, 0), GtkKeyvalTrigger(&hFF8D, 0))
+        Else
+            trigger = GtkKeyvalTrigger(&hFF1B, 0)
+        End If
+        Dim controller As Ptr = GtkShortcutControllerNew()
+        GtkShortcutScope(controller, 2)
+        GtkControllerPhase(controller, 1)
+        GtkAddShortcut(controller, GtkShortcutNew(trigger, GtkCallbackAction(CType(AddressOf ClassicButtonShortcut, Ptr), CType(key * 4 + kind, Ptr), Nil)))
+        GtkAddController(widget, controller)
+        Return controller
+    End Function
+#ElseIf TargetWindows Then
+    Private Class ClassicButtonHook
+        Public Shared Property Hook As Ptr = Nil
+    End Class
+
+    ' True when Return/Escape belongs to an open combo box dropdown (which
+    ' closes, and on Return picks, itself) for the focused window or its combo.
+    Private Function ClassicWinComboDropped(target As Ptr) As Boolean
+        Dim candidate As Ptr = target
+        For depth As Integer = 0 To 1
+            If candidate = Nil Then Return False
+            Dim info As ClassicWinComboInfo
+            info.Size = 64
+            If WinComboInfo(candidate, info) <> 0 Then
+                ' CB_GETDROPPEDSTATE
+                Return WinSend(info.Combo, 343, 0, 0) <> 0
+            End If
+            candidate = WinParent(candidate)
+        Next
+        Return False
+    End Function
+
+    ' True while an IME composition string is pending for the focused window.
+    Private Function ClassicWinComposing(target As Ptr) As Boolean
+        Dim context As Ptr = WinImmContext(target)
+        If context = Nil Then Return False
+        ' GCS_COMPSTR
+        Dim length As Int32 = WinImmComposition(context, 8, Nil, 0)
+        WinImmRelease(target, context)
+        Return length > 0
+    End Function
+
+    ' WH_GETMESSAGE hook: sees every WM_KEYDOWN the thread retrieves (typed or
+    ' posted). Return/Enter → Default, Escape → Cancel for buttons in the
+    ' target's window; a handled key is rewritten to WM_NULL so the control never
+    ' receives it. Multi-line edits (DLGC_WANTALLKEYS) and focused buttons
+    ' (DLGC_BUTTON) keep Return; an open combo dropdown and a pending IME
+    ' composition keep both keys. Destroyed buttons and stale HWNDs are skipped.
+    Private Function ClassicButtonKeyHook(code As Int32, wparam As Int64, lparam As Ptr) As Int64
+        If code = 0 And wparam = 1 And lparam <> Nil Then
+            Dim m As ClassicWinMsg
+            WinReadMessage(m, lparam, 48)
+            Dim key As Int64 = m.WParam
+            If m.Message = 256 And (key = 13 Or key = 27) And WinKeyState(17) >= 0 And WinKeyState(18) >= 0 Then
+                Dim target As Ptr = m.Window
+                Dim allow As Boolean = target <> Nil
+                If allow Then allow = WinIsWindow(target) <> 0
+                If allow And key = 13 Then
+                    Dim dialogCode As Int64 = WinSend(target, 135, 13, 0)
+                    If (dialogCode And 4) <> 0 Or (dialogCode And &h2000) <> 0 Then allow = False
+                End If
+                If allow Then allow = Not ClassicWinComboDropped(target)
+                If allow Then allow = Not ClassicWinComposing(target)
+                If allow Then
+                    Dim root As Ptr = WinAncestor(target, 2)
+                    For Each b As ClassicPushButton In ClassicButtonTable.Live()
+                        Dim h As Ptr = b.NativeWidget
+                        If h <> Nil Then
+                            If WinIsWindow(h) <> 0 Then
+                                If WinAncestor(h, 2) = root And WinEnabled(h) <> 0 And WinVisible(h) <> 0 Then
+                                    If (key = 13 And b.Default) Or (key = 27 And b.Cancel) Then
+                                        m.Message = 0
+                                        WinWriteMessage(lparam, m, 48)
+                                        ' The key press must not move focus to the button.
+                                        ' Not inside a Try: Action is raised through the
+                                        ' native button notification (see the GTK note).
+                                        Dim prior As Ptr = WinFocus()
+                                        b.PerformClick()
+                                        If prior <> Nil And WinFocus() = h Then WinSetFocus(prior)
+                                        Return WinNextHook(Nil, code, wparam, lparam)
+                                    End If
+                                End If
+                            End If
+                        End If
+                    Next
+                End If
+            End If
+        End If
+        Return WinNextHook(Nil, code, wparam, lparam)
+    End Function
+#End If
+
+''' Number of live ClassicPushButtons registered for Default/Cancel keys. The
+''' registry holds them weakly; this is exposed for lifetime diagnostics.
+Public Function ClassicDefaultButtonCount() As Integer
+    Return ClassicButtonTable.Count()
+End Function
+
+''' API 1 `PushButton` with working `Default` (Return/Enter) and `Cancel`
+''' (Escape; macOS also Command-Period) keys. Action and Caption are Buoy's own.
+Public Class ClassicPushButton Inherits Button
+    Private Property mDefault As Boolean = False
+    Private Property mCancel As Boolean = False
+    Private Property mDefaultController As Ptr = Nil
+    Private Property mCancelController As Ptr = Nil
+    Private Property mRootSignal As UInt64 = 0
+    Private Property mKey As Integer = 0
+
+    ''' API 1 `PushButton.Default`: Return and Enter press this button.
+    Public Property Default As Boolean
+        Get
+            Return Me.mDefault
+        End Get
+        Set
+            If value = Me.mDefault Then Return
+            Me.CheckKeyConflict(value And Me.mCancel)
+            Me.mDefault = value
+            Me.ApplyKeys()
+        End Set
+    End Property
+
+    ''' API 1 `PushButton.Cancel`: Escape presses this button.
+    Public Property Cancel As Boolean
+        Get
+            Return Me.mCancel
+        End Get
+        Set
+            If value = Me.mCancel Then Return
+            Me.CheckKeyConflict(value And Me.mDefault)
+            Me.mCancel = value
+            Me.ApplyKeys()
+        End Set
+    End Property
+
+    ''' API 1 `PushButton.Push`: presses the button and raises Action.
+    Public Sub Push()
+        Me.PerformClick()
+    End Sub
+
+    Public Sub Destructor()
+        If Me.mKey <> 0 Then ClassicButtonTable.Remove(Me.mKey)
+    End Sub
+
+    ' An NSButton has a single key equivalent, so macOS cannot map both keys.
+    Private Sub CheckKeyConflict(both As Boolean)
+        #If TargetMac Then
+            If both Then Throw New UnsupportedOperationException("ClassicPushButton: a macOS button cannot be both Default and Cancel")
+        #End If
+    End Sub
+
+    ' Registered while Default or Cancel is set.
+    Private Sub Track()
+        If Me.mDefault Or Me.mCancel Then
+            If Me.mKey = 0 Then Me.mKey = ClassicButtonTable.Add(Me)
+        ElseIf Me.mKey <> 0 Then
+            ClassicButtonTable.Remove(Me.mKey)
+            Me.mKey = 0
+        End If
+    End Sub
+
+    Private Sub ApplyKeys()
+        #If TargetLinux Then
+            Dim widget As Ptr = Me.NativeWidget
+            If widget = Nil Then Throw New UnsupportedOperationException("ClassicPushButton: native button is not available")
+            Me.Track()
+            If ClassicDefaultKeyRouter.Instance = Nil Then
+                ClassicDefaultKeyRouter.Instance = New ClassicDefaultKeyRouter()
+                ClassicListNativeSetDeclinedKeyHandler(ClassicDefaultKeyRouter.Instance)
+            End If
+            If Me.mDefault And Me.mDefaultController = Nil Then
+                Me.mDefaultController = ClassicButtonController(widget, 1, Me.mKey)
+                Me.mRootSignal = GSignalConnect(widget, "notify::root", CType(AddressOf ClassicButtonRooted, Ptr), Nil, Nil, 0)
+                ClassicButtonRooted(widget, Nil, Nil)
+            ElseIf Not Me.mDefault And Me.mDefaultController <> Nil Then
+                GtkRemoveController(widget, Me.mDefaultController)
+                Me.mDefaultController = Nil
+                GSignalDisconnect(widget, Me.mRootSignal)
+                Me.mRootSignal = 0
+                Dim root As Ptr = GtkWidgetRoot(widget)
+                If root <> Nil Then
+                    If GtkWindowGetDefault(root) = widget Then GtkWindowSetDefault(root, Nil)
+                End If
+            End If
+            If Me.mCancel And Me.mCancelController = Nil Then
+                Me.mCancelController = ClassicButtonController(widget, 2, Me.mKey)
+            ElseIf Not Me.mCancel And Me.mCancelController <> Nil Then
+                GtkRemoveController(widget, Me.mCancelController)
+                Me.mCancelController = Nil
+            End If
+        #ElseIf TargetMac Then
+            Dim key As String = ""
+            If Me.mDefault Then
+                key = "\r"
+            ElseIf Me.mCancel Then
+                key = RBFoundation.Chr(27)
+            End If
+            MacSetKeyEquivalent(Me.NativeWidget, MacString(MacClass("NSString"), key))
+        #ElseIf TargetWindows Then
+            Me.Track()
+            If Not (Me.mDefault Or Me.mCancel) Then Return
+            If ClassicButtonHook.Hook = Nil Then
+                ClassicButtonHook.Hook = WinSetHook(3, CType(AddressOf ClassicButtonKeyHook, Ptr), Nil, WinThreadId())
+                If ClassicButtonHook.Hook = Nil Then Throw New UnsupportedOperationException("ClassicPushButton: SetWindowsHookEx failed")
+            End If
+        #Else
+            Throw New UnsupportedOperationException("ClassicPushButton: Default/Cancel keys are not available on this target")
+        #End If
+    End Sub
+End Class
+
+' ── ClassicContainerControl: EmbedWithin / EmbedWithinPanel ─────────────────
+
+' Panel pages are held weakly (the panel itself roots its pages); entries
+' whose panel or page has been destroyed are pruned.
+Private Class ClassicPanelPage
+    Public Property Panel As Weak UIControl
+    Public Property Index As Integer
+    Public Property Page As Weak View
+End Class
+
+Private Class ClassicPanelPages
+    Public Shared Property Pages As Array Of ClassicPanelPage = []
+
+    Public Shared Sub Prune()
+        Dim i As Integer = ClassicPanelPages.Pages.Count - 1
+        While i >= 0
+            Dim entry As ClassicPanelPage = ClassicPanelPages.Pages(i)
+            If entry.Panel = Nil Or entry.Page = Nil Then Array.RemoveAt(ClassicPanelPages.Pages, i)
+            i -= 1
+        End While
+    End Sub
+
+    Public Shared Sub Remember(panel As UIControl, index As Integer, page As View)
+        ClassicPanelPages.Prune()
+        ' Re-registering an index replaces the earlier page.
+        Dim i As Integer = ClassicPanelPages.Pages.Count - 1
+        While i >= 0
+            Dim existing As ClassicPanelPage = ClassicPanelPages.Pages(i)
+            If existing.Panel Is panel And existing.Index = index Then Array.RemoveAt(ClassicPanelPages.Pages, i)
+            i -= 1
+        End While
+        Dim entry As New ClassicPanelPage()
+        entry.Panel = panel
+        entry.Index = index
+        entry.Page = page
+        ClassicPanelPages.Pages.Append(entry)
+    End Sub
+
+    Public Shared Function Count() As Integer
+        ClassicPanelPages.Prune()
+        Return ClassicPanelPages.Pages.Count
+    End Function
+
+    Public Shared Function Find(panel As UIControl, index As Integer) As View
+        ClassicPanelPages.Prune()
+        For Each entry As ClassicPanelPage In ClassicPanelPages.Pages
+            If entry.Panel Is panel And entry.Index = index Then
+                Dim page As View = entry.Page
+                If page <> Nil Then Return page
+            End If
+        Next
+        Throw New OutOfBoundsException("EmbedWithinPanel: page " + RBFoundation.Str(index) + " was not created with ClassicAddPage/ClassicAddTab or registered with ClassicRegisterPanelPage")
+    End Function
+End Class
+
+''' Adds a page and remembers it so EmbedWithinPanel can find it by index
+''' (PagePanel has no page-by-index accessor).
+Public Function ClassicAddPage(panel As PagePanel) As View
+    If panel = Nil Then Throw New NilObjectException("ClassicAddPage: panel is Nil")
+    Dim index As Integer = panel.PanelCount
+    Dim page As View = panel.AddPage()
+    ClassicPanelPages.Remember(panel, index, page)
+    Return page
+End Function
+
+''' Adds a tab and remembers its page for EmbedWithinPanel.
+Public Function ClassicAddTab(panel As TabView, caption As String) As View
+    If panel = Nil Then Throw New NilObjectException("ClassicAddTab: panel is Nil")
+    Dim index As Integer = panel.PanelCount
+    Dim page As View = panel.AddTab(caption)
+    ClassicPanelPages.Remember(panel, index, page)
+    Return page
+End Function
+
+''' Registers a page created elsewhere (for example by a Window block's Page).
+Public Sub ClassicRegisterPanelPage(panel As UIControl, index As Integer, page As View)
+    If panel = Nil Or page = Nil Then Throw New NilObjectException("ClassicRegisterPanelPage: panel and page are required")
+    If index < 0 Then Throw New OutOfBoundsException("ClassicRegisterPanelPage: page index " + RBFoundation.Str(index) + " is negative")
+    ClassicPanelPages.Remember(panel, index, page)
+End Sub
+
+''' Number of live registered panel pages (held weakly); for lifetime diagnostics.
+Public Function ClassicPanelPageCount() As Integer
+    Return ClassicPanelPages.Count()
+End Function
+
+' True when the native view already has a native parent.
+Private Function ClassicNativeHasParent(native As Ptr) As Boolean
+    If native = Nil Then Return False
+    #If TargetLinux Then
+        Return GtkWidgetParent(native) <> Nil
+    #ElseIf TargetMac Then
+        Return MacSuperview(native) <> Nil
+    #ElseIf TargetWindows Then
+        Return WinParent(native) <> Nil
+    #Else
+        Return False
+    #End If
+End Function
+
+' True when the child is natively inside the target (a window's or a view's own
+' native handle). Unverifiable cases count as attached: a target or child with
+' no native handle yet (Windows realizes buffered children at attach time).
+Private Function ClassicNativeInside(child As Ptr, target As Ptr, targetIsWindow As Boolean) As Boolean
+    If target = Nil Or child = Nil Then Return True
+    #If TargetLinux Then
+        Return GtkWidgetIsAncestor(child, target) <> 0
+    #ElseIf TargetMac Then
+        Dim ancestor As Ptr = target
+        If targetIsWindow Then ancestor = MacContentView(target)
+        If ancestor = Nil Then Return False
+        Return MacIsDescendant(child, ancestor)
+    #ElseIf TargetWindows Then
+        Return WinIsChild(target, child) <> 0
+    #Else
+        Return True
+    #End If
+End Function
+
+''' API 1 `ContainerControl`. Width/Height default to the container's own size
+''' (its design size); Left/Top are added to the container's own Left/Top.
+''' A container can be embedded once.
+Public Class ClassicContainerControl Inherits View
+    Private Property mEmbedded As Boolean = False
+
+    ''' API 1 `ContainerControl.Left` (Buoy's View.X).
+    Public Property Left As Integer
+        Get
+            Return Me.X
+        End Get
+        Set
+            Me.X = value
+        End Set
+    End Property
+
+    ''' API 1 `ContainerControl.Top` (Buoy's View.Y).
+    Public Property Top As Integer
+        Get
+            Return Me.Y
+        End Get
+        Set
+            Me.Y = value
+        End Set
+    End Property
+
+    ''' True once EmbedWithin/EmbedWithinPanel has placed the container.
+    Public ReadOnly Property IsEmbedded As Boolean
+        Get
+            Return Me.mEmbedded
+        End Get
+    End Property
+
+    ' Buoy has no subview removal, and adding a parented view again leaves it
+    ' where it was natively, so a container that already has a parent is refused
+    ' before anything changes.
+    Private Sub CheckDetached()
+        If Me.mEmbedded Then Throw New UnsupportedOperationException("EmbedWithin: this ContainerControl is already embedded")
+        If Me.ParentWindow <> Nil Or ClassicNativeHasParent(Me.NativeWidget) Then
+            Throw New UnsupportedOperationException("EmbedWithin: this ContainerControl already has a parent (Buoy cannot remove a subview)")
+        End If
+    End Sub
+
+    ' Places, attaches and verifies. Every check that can fail before
+    ' AddSubview (already embedded or parented, invalid size) changes nothing.
+    ' A failure from AddSubview itself or from the native-parent verification
+    ' afterwards restores the geometry and leaves IsEmbedded False, but is NOT
+    ' a full rollback: Buoy has no subview removal, so once AddSubview ran the
+    ' container stays added to the target on the Buoy side and may remain
+    ' natively parented. (The restore runs in Catch, before the rethrow:
+    ' BUI-015.)
+    Private Sub Attach(window As Window, view As View, targetNative As Ptr, left As Integer, top As Integer, width As Integer, height As Integer)
+        If width < -1 Or height < -1 Then Throw New InvalidArgumentException("EmbedWithin: width and height must be -1 (design size) or at least 0")
+        Me.CheckDetached()
+        Dim oldX As Integer = Me.X
+        Dim oldY As Integer = Me.Y
+        Dim oldW As Integer = Me.Width
+        Dim oldH As Integer = Me.Height
+        Dim w As Integer = width
+        Dim h As Integer = height
+        If w < 0 Then w = oldW
+        If h < 0 Then h = oldH
+        Try
+            Me.Move(oldX + left, oldY + top, w, h)
+            If window <> Nil Then
+                window.AddSubview(Me)
+            Else
+                view.AddSubview(Me)
+            End If
+            If Not ClassicNativeInside(Me.NativeWidget, targetNative, window <> Nil) Then
+                Throw New UnsupportedOperationException("EmbedWithin: the native view was not attached to its container")
+            End If
+        Catch e As Exception
+            Me.Move(oldX, oldY, oldW, oldH)
+            Throw e
+        End Try
+        Me.mEmbedded = True
+    End Sub
+
+    ''' API 1 `EmbedWithin(window, [left, top, width, height])`.
+    Public Sub EmbedWithin(containingWindow As Window, left As Integer = 0, top As Integer = 0, width As Integer = -1, height As Integer = -1)
+        If containingWindow = Nil Then Throw New NilObjectException("EmbedWithin: window is Nil")
+        Me.Attach(containingWindow, Nil, containingWindow.NativeWidget, left, top, width, height)
+    End Sub
+
+    ''' API 1 `EmbedWithin(container, [left, top, width, height])`.
+    Public Sub EmbedWithin(containingView As View, left As Integer = 0, top As Integer = 0, width As Integer = -1, height As Integer = -1)
+        If containingView = Nil Then Throw New NilObjectException("EmbedWithin: container is Nil")
+        Dim selfView As View = Me
+        If containingView Is selfView Then Throw New InvalidArgumentException("EmbedWithin: a container cannot embed itself")
+        Me.Attach(Nil, containingView, containingView.NativeWidget, left, top, width, height)
+    End Sub
+
+    ''' API 1 `EmbedWithinPanel(panel, page, [left, top, width, height])` for a
+    ''' PagePanel; pages must come from ClassicAddPage/ClassicRegisterPanelPage.
+    Public Sub EmbedWithinPanel(containingPanel As PagePanel, page As Integer, left As Integer = 0, top As Integer = 0, width As Integer = -1, height As Integer = -1)
+        If containingPanel = Nil Then Throw New NilObjectException("EmbedWithinPanel: panel is Nil")
+        Dim target As View = ClassicPanelPages.Find(containingPanel, page)
+        Me.Attach(Nil, target, target.NativeWidget, left, top, width, height)
+    End Sub
+
+    ''' API 1 `EmbedWithinPanel` for a TabPanel (Buoy TabView).
+    Public Sub EmbedWithinPanel(containingPanel As TabView, page As Integer, left As Integer = 0, top As Integer = 0, width As Integer = -1, height As Integer = -1)
+        If containingPanel = Nil Then Throw New NilObjectException("EmbedWithinPanel: panel is Nil")
+        Dim target As View = ClassicPanelPages.Find(containingPanel, page)
+        Me.Attach(Nil, target, target.NativeWidget, left, top, width, height)
+    End Sub
+End Class
+
+' ── Text selection: SelStart / SelLength / SelText and edit commands ────────
+' Positions are characters (Unicode code points), as Buoy's String functions
+' count them, so Text.Substring(SelStart, SelLength) = SelText.
+
+Private Class ClassicTextRange
+    Public Property Start As Integer = 0
+    Public Property Length As Integer = 0
+End Class
+
+Private Sub ClassicRange(r As ClassicTextRange, first As Integer, last As Integer)
+    If first <= last Then
+        r.Start = first
+        r.Length = last - first
+    Else
+        r.Start = last
+        r.Length = first - last
+    End If
+End Sub
+
+#If TargetLinux Then
+    ' The GtkEditable or GtkTextView behind a TextField/TextArea native widget
+    ' (a multi-line TextField is a scrolled GtkTextView on Linux).
+    Private Function ClassicEditable(widget As Ptr) As Ptr
+        If widget = Nil Then Return Nil
+        If GTypeIsA(widget, GtkEditableType()) <> 0 Then Return widget
+        Return Nil
+    End Function
+
+    Private Function ClassicTextView(widget As Ptr) As Ptr
+        If widget = Nil Then Return Nil
+        If GTypeIsA(widget, GtkTextViewType()) <> 0 Then Return widget
+        If GTypeIsA(widget, GtkScrolledType()) <> 0 Then
+            Dim child As Ptr = GtkScrolledChild(widget)
+            If child <> Nil And GTypeIsA(child, GtkTextViewType()) <> 0 Then Return child
+        End If
+        Return Nil
+    End Function
+#End If
+
+Private Sub ClassicTextUnsupported()
+    Throw New UnsupportedOperationException("SelStart/SelLength/SelText have no native selection bridge on this target")
+End Sub
+
+#If TargetMac Then
+    ' The NSTextView holding the selection: a TextArea's document view, or a
+    ' TextField's field editor. An NSTextField has no selection unless it is
+    ' being edited, so an unfocused field is an explicit error.
+    Private Function ClassicMacTextView(widget As Ptr) As Ptr
+        If widget = Nil Then Throw New NilObjectException("SelStart: the control has no native view")
+        Dim textViewClass As Ptr = MacClass("NSTextView")
+        If MacIsKind(widget, textViewClass) Then Return widget
+        If MacIsKind(widget, MacClass("NSScrollView")) Then
+            Dim doc As Ptr = MacDocumentView(widget)
+            If doc <> Nil And MacIsKind(doc, textViewClass) Then Return doc
+        End If
+        If MacIsKind(widget, MacClass("NSTextField")) Then
+            Dim editor As Ptr = MacCurrentEditor(widget)
+            If editor <> Nil Then Return editor
+            Throw New UnsupportedOperationException("SelStart/SelLength/SelText: a macOS TextField has a selection only while it has keyboard focus; call SetFocus first")
+        End If
+        Throw New UnsupportedOperationException("SelStart: unrecognized native text view")
+    End Function
+
+    Private Function ClassicMacRangeOf(content As String, start As Integer, finish As Integer) As ClassicMacRange
+        Dim r As ClassicMacRange
+        Dim first As Integer = ClassicUnitsBefore(content, start)
+        r.Location = first
+        r.Length = ClassicUnitsBefore(content, finish) - first
+        Return r
+    End Function
+#End If
+
+' Win32 EDIT and NSText positions are UTF-16 code units; Buoy's are code points.
+Private Function ClassicUnitsBefore(content As String, chars As Integer) As Integer
+    Dim prefix As String = content.Left(chars)
+    If prefix.LenBytes() = prefix.Len() Then Return prefix.Len()
+    Return prefix.AsUTF16LE().Count \ 2
+End Function
+
+Private Function ClassicCharsBefore(content As String, units As Integer) As Integer
+    If units <= 0 Then Return 0
+    Dim n As Integer = content.Len()
+    If content.LenBytes() = n Then
+        If units < n Then Return units
+        Return n
+    End If
+    Dim encoded As Bytes = content.AsUTF16LE()
+    Dim seen As Integer = 0
+    Dim chars As Integer = 0
+    Dim total As Integer = encoded.Count \ 2
+    While seen < total And seen < units
+        Dim word As Integer = encoded.Item(seen * 2) + encoded.Item(seen * 2 + 1) * 256
+        seen += 1
+        If word >= &HD800 And word <= &HDBFF And seen < total Then
+            Dim low As Integer = encoded.Item(seen * 2) + encoded.Item(seen * 2 + 1) * 256
+            If low >= &HDC00 And low <= &HDFFF Then seen += 1
+        End If
+        chars += 1
+    End While
+    Return chars
+End Function
+
+Private Function ClassicGetSelection(widget As Ptr, content As String) As ClassicTextRange
+    Dim r As New ClassicTextRange()
+    #If TargetLinux Then
+        Dim editable As Ptr = ClassicEditable(widget)
+        If editable <> Nil Then
+            Dim a As Int32 = 0
+            Dim b As Int32 = 0
+            GtkEditableBounds(editable, a, b)
+            ClassicRange(r, a, b)
+            Return r
+        End If
+        Dim view As Ptr = ClassicTextView(widget)
+        If view <> Nil Then
+            Dim first As ClassicTextIter
+            Dim last As ClassicTextIter
+            GtkBufferBounds(GtkTextViewBuffer(view), first, last)
+            ClassicRange(r, GtkIterOffset(first), GtkIterOffset(last))
+            Return r
+        End If
+        Throw New UnsupportedOperationException("SelStart: unrecognized native content widget")
+    #ElseIf TargetWindows Then
+        Dim buffer As Ptr = WinLocalAlloc(64, 8)
+        If buffer = Nil Then Throw New OutOfBoundsException("SelStart: out of memory")
+        Dim sel As ClassicWinSelection
+        Try
+            Dim address As Integer = CType(buffer, Integer)
+            WinSend(widget, 176, address, address + 4)
+            WinReadSelection(sel, buffer, 8)
+        Finally
+            WinLocalFree(buffer)
+        End Try
+        ClassicRange(r, ClassicCharsBefore(content, sel.StartPos), ClassicCharsBefore(content, sel.EndPos))
+        Return r
+    #ElseIf TargetMac Then
+        Dim range As ClassicMacRange = MacSelectedRange(ClassicMacTextView(widget))
+        Dim first As Integer = range.Location
+        Dim count As Integer = range.Length
+        ClassicRange(r, ClassicCharsBefore(content, first), ClassicCharsBefore(content, first + count))
+        Return r
+    #Else
+        ClassicTextUnsupported()
+    #End If
+    Return r
+End Function
+
+Private Sub ClassicSetSelection(widget As Ptr, content As String, start As Integer, length As Integer)
+    Dim textLength As Integer = content.Len()
+    Dim s As Integer = start
+    If s > textLength Then s = textLength
+    If s < 0 Then s = 0
+    Dim e As Integer = s
+    If length > 0 Then e = s + length
+    If e > textLength Then e = textLength
+    #If TargetLinux Then
+        Dim editable As Ptr = ClassicEditable(widget)
+        If editable <> Nil Then
+            GtkEditableSelect(editable, s, e)
+            Return
+        End If
+        Dim view As Ptr = ClassicTextView(widget)
+        If view <> Nil Then
+            Dim buffer As Ptr = GtkTextViewBuffer(view)
+            Dim insertion As ClassicTextIter
+            Dim bound As ClassicTextIter
+            GtkBufferIterAt(buffer, insertion, e)
+            GtkBufferIterAt(buffer, bound, s)
+            GtkBufferSelect(buffer, insertion, bound)
+            Return
+        End If
+        Throw New UnsupportedOperationException("SelStart: unrecognized native content widget")
+    #ElseIf TargetWindows Then
+        WinSend(widget, 177, ClassicUnitsBefore(content, s), ClassicUnitsBefore(content, e))
+    #ElseIf TargetMac Then
+        MacSetSelectedRange(ClassicMacTextView(widget), ClassicMacRangeOf(content, s, e))
+    #Else
+        ClassicTextUnsupported()
+    #End If
+End Sub
+
+' Replaces the selection natively (so the control's change notification and
+' undo history see an edit) and leaves the insertion point after the new text.
+Private Sub ClassicReplaceSelection(widget As Ptr, value As String)
+    #If TargetLinux Then
+        Dim editable As Ptr = ClassicEditable(widget)
+        If editable <> Nil Then
+            Dim a As Int32 = 0
+            Dim b As Int32 = 0
+            GtkEditableBounds(editable, a, b)
+            Dim position As Int32 = a
+            If b < a Then position = b
+            GtkEditableDeleteSelection(editable)
+            If value <> "" Then GtkEditableInsert(editable, value, -1, position)
+            GtkEditableSetPosition(editable, position)
+            Return
+        End If
+        Dim view As Ptr = ClassicTextView(widget)
+        If view <> Nil Then
+            Dim buffer As Ptr = GtkTextViewBuffer(view)
+            GtkBufferBeginAction(buffer)
+            GtkBufferDeleteSelection(buffer, 0, 1)
+            If value <> "" Then GtkBufferInsertAtCursor(buffer, value, -1)
+            GtkBufferEndAction(buffer)
+            Return
+        End If
+        Throw New UnsupportedOperationException("SelText: unrecognized native text widget")
+    #ElseIf TargetWindows Then
+        ' EM_REPLACESEL with an undoable edit; the EDIT control leaves the caret
+        ' after the inserted text.
+        Dim units As Int32 = WinWide(65001, 0, value, -1, Nil, 0)
+        If units <= 0 Then Throw New EncodingException("SelText: text cannot be converted to UTF-16")
+        Dim buffer As Ptr = WinLocalAlloc(64, units * 2)
+        If buffer = Nil Then Throw New OutOfBoundsException("SelText: out of memory")
+        Try
+            WinWide(65001, 0, value, -1, buffer, units)
+            WinSend(widget, 194, 1, CType(buffer, Integer))
+        Finally
+            WinLocalFree(buffer)
+        End Try
+    #ElseIf TargetMac Then
+        ' shouldChange… registers the edit with undo; didChangeText posts the
+        ' change notification the control's TextChanged is wired to.
+        Dim view As Ptr = ClassicMacTextView(widget)
+        Dim range As ClassicMacRange = MacSelectedRange(view)
+        Dim replacement As Ptr = MacString(MacClass("NSString"), value)
+        Dim allowed As Boolean = MacShouldChange(view, range, replacement)
+        If Not allowed Then Return
+        MacReplaceText(view, range, replacement)
+        MacDidChangeText(view)
+        Dim caret As ClassicMacRange
+        caret.Location = range.Location + ClassicUnitsBefore(value, value.Len())
+        caret.Length = 0
+        MacSetSelectedRange(view, caret)
+    #Else
+        ClassicTextUnsupported()
+    #End If
+End Sub
+
+''' API 1 `TextField.SelStart`: the insertion point / start of the selection.
+Public Extension Function SelStart(recv As TextField) As Integer
+    Return ClassicGetSelection(recv.NativeWidget, recv.Text).Start
+End Function
+
+''' Setting SelStart moves the insertion point and collapses the selection.
+Public Extension Sub SelStart(recv As TextField, Assigns value As Integer)
+    ClassicSetSelection(recv.NativeWidget, recv.Text, value, 0)
+End Sub
+
+''' API 1 `TextField.SelLength`: selected character count, extending from SelStart.
+Public Extension Function SelLength(recv As TextField) As Integer
+    Return ClassicGetSelection(recv.NativeWidget, recv.Text).Length
+End Function
+
+Public Extension Sub SelLength(recv As TextField, Assigns value As Integer)
+    Dim current As ClassicTextRange = ClassicGetSelection(recv.NativeWidget, recv.Text)
+    ClassicSetSelection(recv.NativeWidget, recv.Text, current.Start, value)
+End Sub
+
+''' API 1 `TextField.SelText`: the selected text.
+Public Extension Function SelText(recv As TextField) As String
+    Dim r As ClassicTextRange = ClassicGetSelection(recv.NativeWidget, recv.Text)
+    Return recv.Text.Substring(r.Start, r.Length)
+End Function
+
+''' Assigning SelText replaces the selection (inserting at the insertion point
+''' when nothing is selected) and leaves the insertion point after the text.
+Public Extension Sub SelText(recv As TextField, Assigns value As String)
+    If recv.IsReadOnly Then Return
+    ClassicReplaceSelection(recv.NativeWidget, value)
+End Sub
+
+''' API 1 `TextField.SelectAll`.
+Public Extension Sub SelectAll(recv As TextField)
+    Dim t As String = recv.Text
+    ClassicSetSelection(recv.NativeWidget, t, 0, t.Len())
+End Sub
+
+''' API 1 `TextField.Copy`: copies the selection to the clipboard (nothing when
+''' the selection is empty, or for a password field, which never exposes its
+''' text, as natively).
+Public Extension Sub Copy(recv As TextField)
+    If recv.FieldType = FieldType.Password Then Return
+    Dim selected As String = recv.SelText
+    If selected = "" Then Return
+    Dim c As New Clipboard()
+    c.Text = selected
+    c.Close()
+End Sub
+
+''' API 1 `TextField.Paste`: replaces the selection with the clipboard text.
+''' Does nothing for a read-only field or a clipboard without text.
+Public Extension Sub Paste(recv As TextField)
+    If recv.IsReadOnly Then Return
+    Dim c As New Clipboard()
+    If Not c.HasText Then Return
+    recv.SelText = c.Text
+End Sub
+
+''' API 1 `TextArea.SelStart`.
+Public Extension Function SelStart(recv As TextArea) As Integer
+    Return ClassicGetSelection(recv.NativeWidget, recv.Text).Start
+End Function
+
+Public Extension Sub SelStart(recv As TextArea, Assigns value As Integer)
+    ClassicSetSelection(recv.NativeWidget, recv.Text, value, 0)
+End Sub
+
+''' API 1 `TextArea.SelLength`.
+Public Extension Function SelLength(recv As TextArea) As Integer
+    Return ClassicGetSelection(recv.NativeWidget, recv.Text).Length
+End Function
+
+Public Extension Sub SelLength(recv As TextArea, Assigns value As Integer)
+    Dim current As ClassicTextRange = ClassicGetSelection(recv.NativeWidget, recv.Text)
+    ClassicSetSelection(recv.NativeWidget, recv.Text, current.Start, value)
+End Sub
+
+''' API 1 `TextArea.SelText`.
+Public Extension Function SelText(recv As TextArea) As String
+    Dim r As ClassicTextRange = ClassicGetSelection(recv.NativeWidget, recv.Text)
+    Return recv.Text.Substring(r.Start, r.Length)
+End Function
+
+Public Extension Sub SelText(recv As TextArea, Assigns value As String)
+    If recv.IsReadOnly Then Return
+    ClassicReplaceSelection(recv.NativeWidget, value)
+End Sub
+
+''' API 1 `TextArea.SelectAll`.
+Public Extension Sub SelectAll(recv As TextArea)
+    Dim t As String = recv.Text
+    ClassicSetSelection(recv.NativeWidget, t, 0, t.Len())
+End Sub
+
+''' API 1 `TextArea.Copy` (plain text; Buoy's TextArea has no styled text).
+Public Extension Sub Copy(recv As TextArea)
+    Dim selected As String = recv.SelText
+    If selected = "" Then Return
+    Dim c As New Clipboard()
+    c.Text = selected
+    c.Close()
+End Sub
+
+''' API 1 `TextArea.Paste`.
+Public Extension Sub Paste(recv As TextArea)
+    If recv.IsReadOnly Then Return
+    Dim c As New Clipboard()
+    If Not c.HasText Then Return
+    recv.SelText = c.Text
+End Sub
+
+''' API 1 `TextField.Cut`: copies the selection to the clipboard and deletes it.
+''' Does nothing for a read-only or password field or an empty selection.
+Public Extension Sub Cut(recv As TextField)
+    If recv.IsReadOnly Or recv.FieldType = FieldType.Password Then Return
+    Dim selected As String = recv.SelText
+    If selected = "" Then Return
+    Dim c As New Clipboard()
+    c.Text = selected
+    c.Close()
+    recv.SelText = ""
+End Sub
+
+''' API 1 `TextArea.Cut`.
+Public Extension Sub Cut(recv As TextArea)
+    If recv.IsReadOnly Then Return
+    Dim selected As String = recv.SelText
+    If selected = "" Then Return
+    Dim c As New Clipboard()
+    c.Text = selected
+    c.Close()
+    recv.SelText = ""
+End Sub
+
+' ── Focus and the API 1 Edit menu commands ──────────────────────────────────
+
+''' True when keyboard focus is natively in this control (for a TextField or
+''' TextArea, in its editor). Buoy 0.72 has no Window.FocusedControl, so this is
+''' how converted EnableMenuItems/MenuSelected code finds the edit target.
+Public Function ClassicHasFocus(control As UIControl) As Boolean
+    If control = Nil Then Throw New NilObjectException("ClassicHasFocus: control is Nil")
+    Dim native As Ptr = control.NativeWidget
+    If native = Nil Then Return False
+    #If TargetLinux Then
+        Dim root As Ptr = GtkWidgetRoot(native)
+        If root = Nil Then Return False
+        Dim focus As Ptr = GtkRootFocus(root)
+        If focus = Nil Then Return False
+        Return focus = native Or GtkWidgetIsAncestor(focus, native) <> 0
+    #ElseIf TargetWindows Then
+        Dim focus As Ptr = WinFocus()
+        If focus = Nil Then Return False
+        Return focus = native Or WinIsChild(native, focus) <> 0
+    #ElseIf TargetMac Then
+        Dim owner As Window = control.ParentWindow
+        If owner = Nil Then Return False
+        If owner.NativeWidget = Nil Then Return False
+        Dim responder As Ptr = MacFirstResponder(owner.NativeWidget)
+        If responder = Nil Then Return False
+        If responder = native Then Return True
+        If Not MacIsKind(responder, MacClass("NSView")) Then Return False
+        If MacIsDescendant(responder, native) Then Return True
+        ' A focused NSTextField edits through the window's field editor.
+        If MacIsKind(responder, MacClass("NSTextView")) Then Return MacDelegate(responder) = native
+        Return False
+    #Else
+        Throw New UnsupportedOperationException("ClassicHasFocus: no native focus query on this target")
+    #End If
+End Function
+
+' Selection facts for the API 1 Edit commands; Nil for a non-text control.
+Private Class ClassicEditState
+    Public Property Editable As Boolean = False
+    Public Property Secret As Boolean = False
+    Public Property Selected As Integer = 0
+    Public Property TextLength As Integer = 0
+End Class
+
+Private Function ClassicEditStateOf(control As UIControl) As ClassicEditState
+    Dim field As TextField = TryCast(control, TextField)
+    If field <> Nil Then
+        Dim st As New ClassicEditState()
+        st.Editable = Not field.IsReadOnly
+        st.Secret = field.FieldType = FieldType.Password
+        st.Selected = field.SelLength
+        st.TextLength = field.Text.Len()
+        Return st
+    End If
+    Dim area As TextArea = TryCast(control, TextArea)
+    If area <> Nil Then
+        Dim st As New ClassicEditState()
+        st.Editable = Not area.IsReadOnly
+        st.Selected = area.SelLength
+        st.TextLength = area.Text.Len()
+        Return st
+    End If
+    Return Nil
+End Function
+
+''' Whether the API 1 Edit menu command (`EditCut`, `EditCopy`, `EditPaste`,
+''' `EditClear`, `EditSelectAll`) applies to this TextField/TextArea now, from
+''' its native selection, read-only state and the clipboard. False for other
+''' controls and other command names (including `EditUndo`, which has no
+''' native availability query here).
+Public Function ClassicEditCommandEnabled(control As UIControl, command As String) As Boolean
+    If control = Nil Then Return False
+    Dim st As ClassicEditState = ClassicEditStateOf(control)
+    If st = Nil Then Return False
+    Select Case command
+        Case "EditCut"
+            Return st.Editable And Not st.Secret And st.Selected > 0
+        Case "EditCopy"
+            Return Not st.Secret And st.Selected > 0
+        Case "EditClear"
+            Return st.Editable And st.Selected > 0
+        Case "EditPaste"
+            If Not st.Editable Then Return False
+            Dim c As New Clipboard()
+            Return c.HasText
+        Case "EditSelectAll"
+            Return st.TextLength > 0
+    End Select
+    Return False
+End Function
+
+''' Performs an API 1 Edit menu command on a TextField/TextArea. Returns True
+''' when the command applied (so a MenuSelected handler can stop there), False
+''' when it does not apply to this control or is not available right now.
+Public Function ClassicPerformEditCommand(control As UIControl, command As String) As Boolean
+    If Not ClassicEditCommandEnabled(control, command) Then Return False
+    Dim field As TextField = TryCast(control, TextField)
+    Dim area As TextArea = TryCast(control, TextArea)
+    Select Case command
+        Case "EditCut"
+            If field <> Nil Then
+                field.Cut()
+            Else
+                area.Cut()
+            End If
+        Case "EditCopy"
+            If field <> Nil Then
+                field.Copy()
+            Else
+                area.Copy()
+            End If
+        Case "EditPaste"
+            If field <> Nil Then
+                field.Paste()
+            Else
+                area.Paste()
+            End If
+        Case "EditClear"
+            If field <> Nil Then
+                field.SelText = ""
+            Else
+                area.SelText = ""
+            End If
+        Case "EditSelectAll"
+            If field <> Nil Then
+                field.SelectAll()
+            Else
+                area.SelectAll()
+            End If
+    End Select
+    Return True
+End Function
+
+''' Appends API 1's standard text Edit items (Cut, Copy, Paste, Delete, a
+''' separator, Select All) to a ConstructContextualMenu `base`, tagged with the
+''' Edit command names and enabled from the control's current state. In
+''' ContextualMenuAction, `ClassicPerformEditCommand(Me, hitItem.Tag)` runs one.
+''' Returns the number of items appended (0 for a non-text control).
+Public Function ClassicAddEditMenuItems(base As MenuItem, control As UIControl) As Integer
+    If base = Nil Then Throw New NilObjectException("ClassicAddEditMenuItems: base is Nil")
+    If ClassicEditStateOf(control) = Nil Then Return 0
+    Dim tags As Array Of String = ["EditCut", "EditCopy", "EditPaste", "EditClear", "EditSelectAll"]
+    Dim captions As Array Of String = ["Cut", "Copy", "Paste", "Delete", "Select All"]
+    For i As Integer = 0 To tags.Count - 1
+        If i = 4 Then base.AddSeparator()
+        Dim item As New MenuItem()
+        item.Caption = captions(i)
+        item.Tag = tags(i)
+        item.Enabled = ClassicEditCommandEnabled(control, tags(i))
+        base.AddMenuItem(item)
+    Next
+    Return tags.Count
+End Function
+
+' ── App.OpenDocument from the launch command line ───────────────────────────
+
+''' API 1 `App.OpenDocument(item)`, as a handler for ClassicOpenDocuments.
+Public Interface ClassicDocumentHandler
+    Sub OpenDocument(item As FolderItem)
+End Interface
+
+''' Routes the documents named on the launch command line (`Main`'s `args`,
+''' from args(1) on) to `handler.OpenDocument`, in order, as API 1 does at
+''' launch on Windows and Linux. Arguments that are not existing files
+''' (options, folders, missing paths) are skipped. Returns the number routed.
+''' Documents sent to an already running app, and macOS Finder open-document
+''' events, are not delivered (Buoy 0.72 has no hook for them).
+Public Function ClassicOpenDocuments(args As Array Of String, handler As ClassicDocumentHandler) As Integer
+    If args = Nil Then Throw New NilObjectException("ClassicOpenDocuments: args is Nil")
+    If handler = Nil Then Throw New NilObjectException("ClassicOpenDocuments: handler is Nil")
+    Dim routed As Integer = 0
+    For i As Integer = 1 To args.Count - 1
+        Dim argument As String = args(i)
+        If argument <> "" Then
+            Dim candidate As New FileSystemItem(argument)
+            If candidate.Exists() And Not candidate.IsFolder() Then
+                handler.OpenDocument(New FolderItem(candidate))
+                routed += 1
+            End If
+        End If
+    Next
+    Return routed
+End Function

@@ -1,0 +1,1042 @@
+' API 1 SQLite adapters. See ../notes/database.md for source rewrites and limits.
+Import RBFoundation
+
+' Checked FFI is necessary: bundled SQLiteRowSet loses sqlite3_step error codes.
+' Keep these private; use the SQLite payload already required by Import RBFoundation.
+Declare Function CDBOpen Lib "sqlite3" Alias "sqlite3_open_v2" (filename As String, ByRef db As Ptr, openFlags As Int32, vfs As Ptr) As Int32
+Declare Function CDBClose Lib "sqlite3" Alias "sqlite3_close" (db As Ptr) As Int32
+Declare Function CDBMessage Lib "sqlite3" Alias "sqlite3_errmsg" (db As Ptr) As String
+Declare Function CDBPrepare Lib "sqlite3" Alias "sqlite3_prepare_v2" (db As Ptr, sql As String, n As Int32, ByRef stmt As Ptr, ByRef tail As Ptr) As Int32
+Declare Function CDBStep Lib "sqlite3" Alias "sqlite3_step" (stmt As Ptr) As Int32
+Declare Function CDBFinalize Lib "sqlite3" Alias "sqlite3_finalize" (stmt As Ptr) As Int32
+Declare Function CDBBindCount Lib "sqlite3" Alias "sqlite3_bind_parameter_count" (stmt As Ptr) As Int32
+Declare Function CDBBindNull Lib "sqlite3" Alias "sqlite3_bind_null" (stmt As Ptr, idx As Int32) As Int32
+Declare Function CDBBindInteger Lib "sqlite3" Alias "sqlite3_bind_int64" (stmt As Ptr, idx As Int32, value As Int64) As Int32
+Declare Function CDBBindDouble Lib "sqlite3" Alias "sqlite3_bind_double" (stmt As Ptr, idx As Int32, value As Double) As Int32
+Declare Function CDBBindText Lib "sqlite3" Alias "sqlite3_bind_text" (stmt As Ptr, idx As Int32, value As String, n As Int32, destructor As Ptr) As Int32
+Declare Function CDBColumnCount Lib "sqlite3" Alias "sqlite3_column_count" (stmt As Ptr) As Int32
+Declare Function CDBColumnName Lib "sqlite3" Alias "sqlite3_column_name" (stmt As Ptr, idx As Int32) As String
+Declare Function CDBColumnType Lib "sqlite3" Alias "sqlite3_column_type" (stmt As Ptr, idx As Int32) As Int32
+Declare Function CDBColumnInteger Lib "sqlite3" Alias "sqlite3_column_int64" (stmt As Ptr, idx As Int32) As Int64
+Declare Function CDBColumnDouble Lib "sqlite3" Alias "sqlite3_column_double" (stmt As Ptr, idx As Int32) As Double
+Declare Function CDBColumnText Lib "sqlite3" Alias "sqlite3_column_text" (stmt As Ptr, idx As Int32) As String
+Declare Function CDBColumnBytes Lib "sqlite3" Alias "sqlite3_column_bytes" (stmt As Ptr, idx As Int32) As Int32
+Declare Function CDBReadOnly Lib "sqlite3" Alias "sqlite3_stmt_readonly" (stmt As Ptr) As Int32
+Declare Function CDBChanges Lib "sqlite3" Alias "sqlite3_changes64" (db As Ptr) As Int64
+Declare Function CDBLastId Lib "sqlite3" Alias "sqlite3_last_insert_rowid" (db As Ptr) As Int64
+
+Declare Function CDBReset Lib "sqlite3" Alias "sqlite3_reset" (stmt As Ptr) As Int32
+Declare Function CDBClearBindings Lib "sqlite3" Alias "sqlite3_clear_bindings" (stmt As Ptr) As Int32
+Declare Function CDBBindBlob Lib "sqlite3" Alias "sqlite3_bind_blob" (stmt As Ptr, idx As Int32, data As Ptr, n As Int32, destructor As Ptr) As Int32
+Declare Function CDBBindTextBytes Lib "sqlite3" Alias "sqlite3_bind_text" (stmt As Ptr, idx As Int32, data As Ptr, n As Int32, destructor As Ptr) As Int32
+Declare Function CDBBindEmptyBlob Lib "sqlite3" Alias "sqlite3_bind_zeroblob" (stmt As Ptr, idx As Int32, n As Int32) As Int32
+Declare Function CDBColumnBlob Lib "sqlite3" Alias "sqlite3_column_blob" (stmt As Ptr, idx As Int32) As Ptr
+Declare Function CDBColumnTextPtr Lib "sqlite3" Alias "sqlite3_column_text" (stmt As Ptr, idx As Int32) As Ptr
+Declare Function CDBDeclaredType Lib "sqlite3" Alias "sqlite3_column_decltype" (stmt As Ptr, idx As Int32) As String
+
+Private Function CDBQuote(name As String) As String
+    Return "\"" + name.Replace("\"", "\"\"") + "\""
+End Function
+
+' Owns a prepared statement. Implements the actual RowSet contract so legacy's
+' DatabaseRow(RowSet) is the single implementation of row snapshot conversion.
+Class ClassicSQLiteRows Inherits RowSet
+    Private Property mDB As Ptr
+    Private Property mStmt As Ptr
+    Private Property mNames As Array Of String = []
+    Private Property mAvailable As Boolean = False
+    Private Property mBorrowed As Boolean = False
+
+    Public Sub Constructor(db As Ptr, stmt As Ptr, borrowed As Boolean = False)
+        Me.mDB = db
+        Me.mStmt = stmt
+        Me.mBorrowed = borrowed
+        For i As Integer = 0 To CDBColumnCount(stmt) - 1
+            Array.Append(Me.mNames, CDBColumnName(stmt, i))
+        Next
+    End Sub
+
+    Public Overrides Function HasMoreRows() As Boolean
+        Return Me.mAvailable And Me.mStmt <> Nil
+    End Function
+
+    Public Overrides Sub NextRow()
+        If Me.mStmt = Nil Then Throw New UnsupportedOperationException("RowSet is closed")
+        Dim rc As Integer = CDBStep(Me.mStmt)
+        Me.mAvailable = rc = 100
+        If rc <> 100 And rc <> 101 Then Throw New DatabaseException(CDBMessage(Me.mDB), rc)
+    End Sub
+
+    Public Overrides Function ColumnCount() As Integer
+        Return Array.Count(Me.mNames)
+    End Function
+
+    Public Overrides Function ColumnName(index As Integer) As String
+        Return Me.mNames(index)
+    End Function
+
+    Public Overrides Function Value(column As String) As DbValue
+        For i As Integer = 0 To Array.Count(Me.mNames) - 1
+            If Me.mNames(i) = column Then Return Me.Value(i)
+        Next
+        Throw New DatabaseException("No such column: " + column)
+    End Function
+
+    Public Overrides Function Value(index As Integer) As DbValue
+        If Not Me.HasMoreRows() Then Throw New UnsupportedOperationException("No current row")
+        If index < 0 Or index >= Me.ColumnCount() Then Throw New OutOfBoundsException("Column index")
+        Select Case CDBColumnType(Me.mStmt, index)
+        Case 1
+            Return DbValue.OfInteger(CDBColumnInteger(Me.mStmt, index))
+        Case 2
+            Return DbValue.OfDouble(CDBColumnDouble(Me.mStmt, index))
+        Case 3
+            Dim s As String = CDBColumnText(Me.mStmt, index)
+            If String.LenBytes(s) <> CDBColumnBytes(Me.mStmt, index) Then
+                Throw New UnsupportedOperationException("Embedded NUL text is unsupported by the String FFI")
+            End If
+            Return DbValue.OfString(s)
+        Case 5
+            Return DbValue.OfNull()
+        Case Else
+            Throw New UnsupportedOperationException("BLOB fields require a binary SQLite core API")
+        End Select
+    End Function
+
+    Public Function Snapshot(index As Integer) As DatabaseField
+        Dim kind As Integer = CDBColumnType(Me.mStmt, index)
+        Dim raw As New Bytes()
+        Dim column As New DatabaseRow()
+        Dim name As String = Me.ColumnName(index)
+        If kind = 3 Or kind = 4 Then
+            Dim data As Ptr
+            If kind = 3 Then
+                data = CDBColumnTextPtr(Me.mStmt, index)
+            Else
+                data = CDBColumnBlob(Me.mStmt, index)
+            End If
+            Dim size As Integer = CDBColumnBytes(Me.mStmt, index)
+            If size > 0 Then
+                If data = Nil Then Throw New DatabaseException("SQLite returned no field data", 7)
+                raw.Append(data, size)
+            End If
+            If kind = 3 Then
+                Dim text As String = CDBColumnText(Me.mStmt, index)
+                If String.LenBytes(text) = size Then column.Column(name) = text
+            End If
+        Else
+            Select Case kind
+            Case 1
+                column.Column(name) = Variant.From(CDBColumnInteger(Me.mStmt, index))
+            Case 2
+                column.Column(name) = CDBColumnDouble(Me.mStmt, index)
+            Case Else
+                column.Column(name) = Variant.Empty()
+            End Select
+        End If
+        Return New DatabaseField(column.Column(name), kind, raw, CDBDeclaredType(Me.mStmt, index))
+    End Function
+
+    Public Overrides Sub Close()
+        If Me.mStmt <> Nil Then
+            If Me.mBorrowed Then
+                CDBReset(Me.mStmt)
+            Else
+                CDBFinalize(Me.mStmt)
+            End If
+            Me.mStmt = Nil
+            Me.mAvailable = False
+        End If
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+''' Read-only scalar/binary snapshot. SQLite metadata is explicit; legacy Type codes are not inferred.
+Public Class DatabaseField
+    Private Property mColumn As DatabaseColumn
+    Private Property mStorageType As Integer = 0
+    Private Property mBytes As Bytes
+    Private Property mDeclaredType As String = ""
+
+    Public Sub Constructor(column As DatabaseColumn, storageType As Integer, raw As Bytes, declaredType As String)
+        Me.mColumn = column
+        Me.mStorageType = storageType
+        Me.mBytes = raw
+        Me.mDeclaredType = declaredType
+    End Sub
+    Public ReadOnly Property SQLiteStorageType As Integer
+        Get
+            Return Me.mStorageType
+        End Get
+    End Property
+    Public ReadOnly Property DeclaredType As String
+        Get
+            Return Me.mDeclaredType
+        End Get
+    End Property
+    Public ReadOnly Property IsNull As Boolean
+        Get
+            Return Me.mStorageType = 5 Or (Me.mStorageType = 0 And Me.mColumn.Value.IsNil())
+        End Get
+    End Property
+    Public ReadOnly Property NativeBytes As Bytes
+        Get
+            If Me.mStorageType <> 3 And Me.mStorageType <> 4 Then Throw New TypeMismatchException("NativeBytes requires TEXT or BLOB")
+            Dim copied As New Bytes()
+            copied.Append(Me.mBytes)
+            Return copied
+        End Get
+    End Property
+    Public ReadOnly Property BlobBytes As Bytes
+        Get
+            If Me.mStorageType <> 4 Then Throw New TypeMismatchException("BlobBytes requires BLOB")
+            Return Me.NativeBytes
+        End Get
+    End Property
+    Private Sub RequireScalar()
+        If Me.mStorageType = 4 Then Throw New TypeMismatchException("BLOB requires BlobBytes; Variant has no binary kind")
+        If Me.mStorageType = 3 Then
+            If Me.mColumn.Value.IsNil() Then Throw New UnsupportedOperationException("NUL-containing TEXT requires NativeBytes")
+        End If
+    End Sub
+
+    Public Sub Constructor(column As DatabaseColumn)
+        Me.mColumn = column
+    End Sub
+
+    Public ReadOnly Property Name As String
+        Get
+            Return Me.mColumn.Name
+        End Get
+    End Property
+    Public ReadOnly Property Value As Variant
+        Get
+            Me.RequireScalar()
+            Return Me.mColumn.Value
+        End Get
+    End Property
+    Public ReadOnly Property StringValue As String
+        Get
+            Me.RequireScalar()
+            Return Me.mColumn.StringValue
+        End Get
+    End Property
+    Public ReadOnly Property IntegerValue As Integer
+        Get
+            Me.RequireScalar()
+            Return Me.mColumn.IntegerValue
+        End Get
+    End Property
+    Public ReadOnly Property Int64Value As Int64
+        Get
+            Me.RequireScalar()
+            Return Me.mColumn.Int64Value
+        End Get
+    End Property
+    Public ReadOnly Property DoubleValue As Double
+        Get
+            Me.RequireScalar()
+            Return Me.mColumn.DoubleValue
+        End Get
+    End Property
+    Public ReadOnly Property BooleanValue As Boolean
+        Get
+            Dim v As Variant = Me.Value
+            If v.IsString() Then
+                Dim s As String = String.LCase(Me.StringValue)
+                Return s = "true" Or s = "1"
+            End If
+            Return Me.mColumn.BooleanValue
+        End Get
+    End Property
+    Public Function GetString() As String
+        Return Me.StringValue
+    End Function
+End Class
+
+Class ClassicBufferedDatabaseRow
+    Public Property Fields As Array Of DatabaseField = []
+End Class
+
+''' Buffered read navigation, initially on the first row, or BOF and EOF if empty.
+Public Class RecordSet
+    Private Property mRows As Array Of ClassicBufferedDatabaseRow = []
+    Private Property mFieldCount As Integer = 0
+    Private Property mPosition As Integer = 0
+    Private Property mClosed As Boolean = False
+
+    Public Sub Constructor(rows As RowSet)
+        Try
+            Me.mFieldCount = rows.ColumnCount()
+            ' DatabaseRow uses named storage; do not silently merge duplicate columns.
+            For i As Integer = 0 To Me.mFieldCount - 1
+                For j As Integer = 0 To i - 1
+                    If String.LCase(rows.ColumnName(i)) = String.LCase(rows.ColumnName(j)) Then
+                        Throw New UnsupportedOperationException("Duplicate result names require unique SQL aliases")
+                    End If
+                Next
+            Next
+            While rows.HasMoreRows()
+                Dim buffered As New ClassicBufferedDatabaseRow()
+                Dim native As ClassicSQLiteRows = TryCast(rows, ClassicSQLiteRows)
+                If native <> Nil Then
+                    For i As Integer = 0 To Me.mFieldCount - 1
+                        Array.Append(buffered.Fields, native.Snapshot(i))
+                    Next
+                Else
+                    Dim foundation As New DatabaseRow(rows)
+                    For i As Integer = 0 To Me.mFieldCount - 1
+                        Array.Append(buffered.Fields, New DatabaseField(foundation.ColumnAt(i)))
+                    Next
+                End If
+                Array.Append(Me.mRows, buffered)
+                rows.NextRow()
+            End While
+        Finally
+            rows.Close()
+        End Try
+    End Sub
+
+    Private Sub RequireOpen()
+        If Me.mClosed Then Throw New UnsupportedOperationException("RecordSet is closed")
+    End Sub
+    Private Sub RequireRow()
+        Me.RequireOpen()
+        If Me.BOF Or Me.EOF Then Throw New UnsupportedOperationException("No current record")
+    End Sub
+    Public ReadOnly Property BOF As Boolean
+        Get
+            Me.RequireOpen()
+            Return Array.Count(Me.mRows) = 0 Or Me.mPosition < 0
+        End Get
+    End Property
+    Public ReadOnly Property EOF As Boolean
+        Get
+            Me.RequireOpen()
+            Return Me.mPosition >= Array.Count(Me.mRows)
+        End Get
+    End Property
+    Public ReadOnly Property FieldCount As Integer
+        Get
+            Me.RequireOpen()
+            Return Me.mFieldCount
+        End Get
+    End Property
+    Public Function RecordCount() As Integer
+        Me.RequireOpen()
+        Return Array.Count(Me.mRows)
+    End Function
+    Public Function IdxField(index As Integer) As DatabaseField
+        Me.RequireRow()
+        If index < 1 Or index > Me.mFieldCount Then Throw New OutOfBoundsException("IdxField is one-based")
+        Return Me.mRows(Me.mPosition).Fields(index - 1)
+    End Function
+    Public Function Field(name As String) As DatabaseField
+        Me.RequireRow()
+        Dim row As ClassicBufferedDatabaseRow = Me.mRows(Me.mPosition)
+        For i As Integer = 0 To Me.mFieldCount - 1
+            Dim col As DatabaseField = row.Fields(i)
+            If String.LCase(col.Name) = String.LCase(name) Then Return col
+        Next
+        Throw New DatabaseException("No such field: " + name)
+    End Function
+    Public Sub MoveNext()
+        Me.RequireOpen()
+        If Me.mPosition < Array.Count(Me.mRows) Then Me.mPosition += 1
+    End Sub
+    Public Sub MovePrevious()
+        Me.RequireOpen()
+        If Array.Count(Me.mRows) > 0 And Me.mPosition >= 0 Then Me.mPosition -= 1
+    End Sub
+    Public Sub MoveFirst()
+        Me.RequireOpen()
+        Me.mPosition = 0
+    End Sub
+    Public Sub MoveLast()
+        Me.RequireOpen()
+        Me.mPosition = Array.Count(Me.mRows) - 1
+        If Me.mPosition < 0 Then Me.mPosition = 0
+    End Sub
+    Public Sub Close()
+        Me.mClosed = True
+        Me.mRows = []
+    End Sub
+    Public Sub Edit()
+        Throw New UnsupportedOperationException("RecordSet editing is unsupported; use parameterized SQLExecute")
+    End Sub
+    Public Sub Update()
+        Throw New UnsupportedOperationException("RecordSet updating is unsupported; use parameterized SQLExecute")
+    End Sub
+    Public Sub DeleteRecord()
+        Throw New UnsupportedOperationException("RecordSet deletion is unsupported; use parameterized SQLExecute")
+    End Sub
+End Class
+
+''' DatabaseRecord collides with the stdlib ORM marker interface.
+Public Class ClassicDatabaseRecord
+    Private Property mRow As DatabaseRow = New DatabaseRow()
+    Public ReadOnly Property FieldCount As Integer
+        Get
+            Return Me.mRow.ColumnCount
+        End Get
+    End Property
+    Public Function FieldName(index As Integer) As String
+        Return Me.mRow.ColumnAt(index).Name
+    End Function
+    Public Function Column(name As String) As String
+        Return Me.mRow.Column(name).StringValue
+    End Function
+    Public Function Column(index As Integer) As String
+        If index < 1 Or index > Me.FieldCount Then Throw New OutOfBoundsException("Column is one-based")
+        Return Me.mRow.ColumnAt(index - 1).StringValue
+    End Function
+    Public Sub Column(name As String, Assigns value As String)
+        Me.mRow.Column(name) = value
+    End Sub
+    Public Function IntegerColumn(name As String) As Integer
+        Return Me.mRow.Column(name).IntegerValue
+    End Function
+    Public Sub IntegerColumn(name As String, Assigns value As Integer)
+        Me.mRow.Column(name) = value
+    End Sub
+    Public Function Int64Column(name As String) As Int64
+        Return Me.mRow.Column(name).Int64Value
+    End Function
+    Public Sub Int64Column(name As String, Assigns value As Int64)
+        Me.mRow.Column(name) = Variant.From(value)
+    End Sub
+    Public Function DoubleColumn(name As String) As Double
+        Return Me.mRow.Column(name).DoubleValue
+    End Function
+    Public Sub DoubleColumn(name As String, Assigns value As Double)
+        Me.mRow.Column(name) = value
+    End Sub
+    Public Function BooleanColumn(name As String) As Boolean
+        Return Me.mRow.Column(name).BooleanValue
+    End Function
+    Public Sub BooleanColumn(name As String, Assigns value As Boolean)
+        Me.mRow.Column(name) = value
+    End Sub
+    ' Explicit extension for SQL NULL and other supported Variant values.
+    Public Sub SetValue(name As String, value As Variant)
+        If value.IsUInt64() Then
+            Dim largest As UInt64 = &H7FFFFFFFFFFFFFFF
+            If value.AsUInt64().Or(0) > largest Then Throw New OverflowException("SQLite INTEGER is signed 64-bit")
+        End If
+        Me.mRow.Column(name) = value
+    End Sub
+    Public Function ToDatabaseRow() As DatabaseRow
+        Return Me.mRow
+    End Function
+End Class
+
+''' Boolean Connect and per-operation API 1 error state over checked SQLite.
+''' DatabaseFile Nil means an in-memory database. Connect(String) is an extension.
+Public Class ClassicSQLiteDatabase
+    Private Property mDB As Ptr
+    Private Property mErrorCode As Integer = 0
+    Private Property mErrorMessage As String = ""
+    Private Property mConnectionRevision As Integer = 0
+    Public ReadOnly Property ConnectionRevision As Integer
+        Get
+            Return Me.mConnectionRevision
+        End Get
+    End Property
+    Public Property DatabaseFile As FolderItem
+
+    Public ReadOnly Property Error As Boolean
+        Get
+            Return Me.mErrorCode <> 0
+        End Get
+    End Property
+    Public ReadOnly Property ErrorCode As Integer
+        Get
+            Return Me.mErrorCode
+        End Get
+    End Property
+    Public ReadOnly Property ErrorMessage As String
+        Get
+            Return Me.mErrorMessage
+        End Get
+    End Property
+    Public Sub ClearError()
+        Me.mErrorCode = 0
+        Me.mErrorMessage = ""
+    End Sub
+    Public Sub SaveError(e As Exception)
+        Me.mErrorCode = e.ErrorCode
+        If Me.mErrorCode = 0 Then Me.mErrorCode = -1
+        Me.mErrorMessage = e.Message
+    End Sub
+    Private Sub RequireConnected()
+        If Me.mDB = Nil Then Throw New DatabaseException("Database is not connected", 21)
+    End Sub
+    Public Function IsConnected() As Boolean
+        Return Me.mDB <> Nil
+    End Function
+    Public Function Connect() As Boolean
+        If Me.DatabaseFile = Nil Then Return Me.Connect(":memory:")
+        Return Me.Connect(Me.DatabaseFile.NativePath)
+    End Function
+    Public Function Connect(filename As String) As Boolean
+        Return Me.OpenDatabase(filename, False)
+    End Function
+    Public Function CreateDatabase() As Boolean
+        If Me.DatabaseFile = Nil Then Return Me.OpenDatabase(":memory:", True)
+        Return Me.OpenDatabase(Me.DatabaseFile.NativePath, True)
+    End Function
+    Private Function OpenDatabase(filename As String, create As Boolean) As Boolean
+        Me.ClearError()
+        Try
+            If Me.mDB <> Nil Then Throw New DatabaseException("Database is already connected", 21)
+            Dim handle As Ptr
+            Dim openFlags As Integer = 2
+            If create Then openFlags = 6
+            Dim rc As Integer = CDBOpen(filename, handle, openFlags, Nil)
+            If rc <> 0 Then
+                Dim msg As String = CDBMessage(handle)
+                CDBClose(handle)
+                Throw New DatabaseException(msg, rc)
+            End If
+            Me.mDB = handle
+            Me.mConnectionRevision += 1
+            Return True
+        Catch e As Exception
+            Me.SaveError(e)
+            Return False
+        End Try
+    End Function
+    Public Sub Close()
+        Me.ClearError()
+        If Me.mDB = Nil Then Return
+        Dim rc As Integer = CDBClose(Me.mDB)
+        If rc <> 0 Then
+            Me.mErrorCode = rc
+            Me.mErrorMessage = CDBMessage(Me.mDB)
+            Return
+        End If
+        Me.mDB = Nil
+        Me.mConnectionRevision += 1
+    End Sub
+    Public Sub Destructor()
+        If Me.mDB <> Nil Then CDBClose(Me.mDB)
+    End Sub
+
+    Private Function PrepareRows(sql As String, values As Array Of Variant, selecting As Boolean) As ClassicSQLiteRows
+        Me.RequireConnected()
+        Dim stmt As Ptr
+        Dim tail As Ptr
+        Dim rc As Integer = CDBPrepare(Me.mDB, sql, -1, stmt, tail)
+        If rc <> 0 Then
+            If stmt <> Nil Then CDBFinalize(stmt)
+            Throw New DatabaseException(CDBMessage(Me.mDB), rc)
+        End If
+        Try
+            If stmt = Nil Then Throw New InvalidArgumentException("SQL contains no statement")
+            If tail <> Nil Then
+                Dim rest As String = CType(CType(tail, CString), String)
+                If String.Trim(rest) <> "" Then Throw New UnsupportedOperationException("Only one SQL statement per call is supported")
+            End If
+            If selecting And (CDBReadOnly(stmt) = 0 Or CDBColumnCount(stmt) = 0) Then
+                Throw New UnsupportedOperationException("SQLSelect requires a read-only result statement")
+            End If
+            If CDBBindCount(stmt) <> Array.Count(values) Then Throw New InvalidArgumentException("SQL parameter count mismatch")
+            ' Let the legacy foundation validate and convert all Variant kinds.
+            Dim params As New DatabaseRow()
+            For i As Integer = 0 To Array.Count(values) - 1
+                Dim v As Variant = values(i)
+                If v.IsUInt64() Then
+                    Dim largest As UInt64 = &H7FFFFFFFFFFFFFFF
+                    If v.AsUInt64().Or(0) > largest Then Throw New OverflowException("SQLite INTEGER is signed 64-bit")
+                End If
+                params.Column(String.From(i)) = v
+            Next
+            For i As Integer = 0 To Array.Count(values) - 1
+                Dim col As DatabaseColumn = params.ColumnAt(i)
+                Select Case col.Type
+                Case DbValue.KindNull
+                    rc = CDBBindNull(stmt, i + 1)
+                Case DbValue.KindInteger
+                    rc = CDBBindInteger(stmt, i + 1, col.Int64Value)
+                Case DbValue.KindDouble
+                    rc = CDBBindDouble(stmt, i + 1, col.DoubleValue)
+                Case DbValue.KindBoolean
+                    Dim flag As Integer = 0
+                    If col.BooleanValue Then flag = 1
+                    rc = CDBBindInteger(stmt, i + 1, flag)
+                Case DbValue.KindString
+                    Dim s As String = col.StringValue
+                    rc = CDBBindText(stmt, i + 1, s, String.LenBytes(s), CType(-1, Ptr))
+                Case Else
+                    Throw New UnsupportedOperationException("Unsupported SQL parameter type")
+                End Select
+                If rc <> 0 Then Throw New DatabaseException(CDBMessage(Me.mDB), rc)
+            Next
+            Dim rows As New ClassicSQLiteRows(Me.mDB, stmt)
+            stmt = Nil
+            Return rows
+        Finally
+            If stmt <> Nil Then CDBFinalize(stmt)
+        End Try
+    End Function
+
+    Public Function Prepare(sql As String) As ClassicSQLitePreparedStatement
+        Me.ClearError()
+        Try
+            Me.RequireConnected()
+            Return New ClassicSQLitePreparedStatement(Me, Me.mDB, sql)
+        Catch e As Exception
+            Me.SaveError(e)
+            Return Nil
+        End Try
+    End Function
+    Public Function OpenEditableRecord(tableName As String, primaryKey As String, key As Variant) As ClassicEditableRecord
+        Me.ClearError()
+        Try
+            Me.RequireConnected()
+            If key.IsNil() Then Throw New InvalidArgumentException("Editable record key must not be NULL")
+            Dim table As RecordSet = Me.SQLSelect("SELECT name FROM main.sqlite_schema WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' AND name=?", Variant.From(tableName))
+            If table = Nil Then Return Nil
+            Dim exists As Boolean = table.RecordCount() = 1
+            table.Close()
+            If Not exists Then Throw New InvalidArgumentException("Editable records require an ordinary main-schema table")
+            Dim schema As RecordSet = Me.TableSchema(tableName)
+            If schema = Nil Then Return Nil
+            Dim keyCount As Integer = 0
+            Dim found As Boolean = False
+            While Not schema.EOF
+                If schema.Field("pk").IntegerValue > 0 Then
+                    keyCount += 1
+                    If schema.Field("name").StringValue = primaryKey Then found = True
+                End If
+                schema.MoveNext()
+            End While
+            schema.Close()
+            If keyCount <> 1 Or Not found Then Throw New UnsupportedOperationException("Editable record requires its exact single-column primary key")
+            Dim records As RecordSet = Me.SQLSelect("SELECT * FROM \"main\"." + CDBQuote(tableName) + " WHERE " + CDBQuote(primaryKey) + " IS ?", key)
+            If records = Nil Then Return Nil
+            If records.RecordCount() <> 1 Then
+                records.Close()
+                Throw New DatabaseException("Editable record identity did not match exactly one row")
+            End If
+            Return New ClassicEditableRecord(Me, tableName, primaryKey, key, records)
+        Catch e As Exception
+            Me.SaveError(e)
+            Return Nil
+        End Try
+    End Function
+    Public Function Changes() As Integer
+        Me.RequireConnected()
+        Return CDBChanges(Me.mDB)
+    End Function
+
+    Public Function TableSchema(tableName As String) As RecordSet
+        Return Me.SQLSelect("SELECT cid, name, type, [notnull], dflt_value, pk FROM pragma_table_info(?, 'main') ORDER BY cid", Variant.From(tableName))
+    End Function
+    Public Function Tables() As RecordSet
+        Return Me.SQLSelect("SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' ORDER BY name")
+    End Function
+
+    Public Function SQLSelect(sql As String, ParamArray values As Variant) As RecordSet
+        Return Me.SQLSelectBound(sql, values)
+    End Function
+    Public Function SQLSelectBound(sql As String, values As Array Of Variant) As RecordSet
+        Me.ClearError()
+        Dim rows As ClassicSQLiteRows
+        Try
+            rows = Me.PrepareRows(sql, values, True)
+            rows.NextRow()
+            Return New RecordSet(rows)
+        Catch e As Exception
+            Me.SaveError(e)
+            Return Nil
+        Finally
+            If rows <> Nil Then rows.Close()
+        End Try
+    End Function
+    Public Sub SQLExecute(sql As String, ParamArray values As Variant)
+        Me.SQLExecuteBound(sql, values)
+    End Sub
+    Public Sub SQLExecuteBound(sql As String, values As Array Of Variant)
+        Me.ClearError()
+        Dim rows As ClassicSQLiteRows
+        Try
+            rows = Me.PrepareRows(sql, values, False)
+            rows.NextRow()
+            While rows.HasMoreRows()
+                rows.NextRow()
+            End While
+        Catch e As Exception
+            Me.SaveError(e)
+        Finally
+            If rows <> Nil Then rows.Close()
+        End Try
+    End Sub
+    Public Sub InsertRecord(tableName As String, record As ClassicDatabaseRecord)
+        If record = Nil Then
+            Me.ClearError()
+            Me.SaveError(New InvalidArgumentException("InsertRecord requires a record"))
+            Return
+        End If
+        Me.InsertRecord(tableName, record.ToDatabaseRow())
+    End Sub
+    Public Sub InsertRecord(tableName As String, row As DatabaseRow)
+        Me.ClearError()
+        Try
+            If row = Nil Then Throw New InvalidArgumentException("InsertRecord requires a row")
+            Dim sql As String = "INSERT INTO " + CDBQuote(tableName)
+            Dim cols As String = ""
+            Dim marks As String = ""
+            Dim values As Array Of Variant = []
+            For i As Integer = 0 To row.ColumnCount - 1
+                Dim col As DatabaseColumn = row.ColumnAt(i)
+                If i > 0 Then
+                    cols += ", "
+                    marks += ", "
+                End If
+                cols += CDBQuote(col.Name)
+                marks += "?"
+                Array.Append(values, col.Value)
+            Next
+            If row.ColumnCount = 0 Then
+                sql += " DEFAULT VALUES"
+            Else
+                sql += " (" + cols + ") VALUES (" + marks + ")"
+            End If
+            Me.SQLExecuteBound(sql, values)
+        Catch e As Exception
+            Me.SaveError(e)
+        End Try
+    End Sub
+    Public Function LastRowID() As Integer
+        Me.RequireConnected()
+        Return CDBLastId(Me.mDB)
+    End Function
+End Class
+
+''' Reusable SQLite statement. Bind indexes are zero-based; missing binds fail.
+''' Binary APIs deliberately take Bytes rather than a lossy String/Variant.
+Public Class ClassicSQLitePreparedStatement
+    Public Const SQLITE_INTEGER As Integer = 1
+    Public Const SQLITE_DOUBLE As Integer = 2
+    Public Const SQLITE_TEXT As Integer = 3
+    Public Const SQLITE_BLOB As Integer = 4
+    Public Const SQLITE_NULL As Integer = 5
+    Public Const SQLITE_INT64 As Integer = 6
+    Public Const SQLITE_BOOLEAN As Integer = 7
+    Private Property mOwner As ClassicSQLiteDatabase
+    Private Property mDB As Ptr
+    Private Property mStmt As Ptr
+    Private Property mBound As Array Of Boolean = []
+    Private Property mTypes As Array Of Integer = []
+
+    Public Sub Constructor(owner As ClassicSQLiteDatabase, db As Ptr, sql As String)
+        Me.mOwner = owner
+        Me.mDB = db
+        Dim tail As Ptr
+        Dim rc As Integer = CDBPrepare(db, sql, -1, Me.mStmt, tail)
+        Try
+            If rc <> 0 Then Throw New DatabaseException(CDBMessage(db), rc)
+            If Me.mStmt = Nil Then Throw New InvalidArgumentException("SQL contains no statement")
+            If tail <> Nil Then
+                If String.Trim(CType(CType(tail, CString), String)) <> "" Then Throw New UnsupportedOperationException("Only one SQL statement per call is supported")
+            End If
+            For i As Integer = 0 To CDBBindCount(Me.mStmt) - 1
+                Array.Append(Me.mBound, False)
+                Array.Append(Me.mTypes, 0)
+            Next
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Public ReadOnly Property ParameterCount As Integer
+        Get
+            Me.RequireOpen()
+            Return Array.Count(Me.mBound)
+        End Get
+    End Property
+    Private Sub RequireOpen()
+        If Me.mStmt = Nil Then Throw New DatabaseException("Prepared statement is closed", 21)
+    End Sub
+    Private Sub RequireIndex(index As Integer)
+        Me.RequireOpen()
+        If index < 0 Or index >= Array.Count(Me.mBound) Then Throw New OutOfBoundsException("Bind index is zero-based")
+    End Sub
+    Private Sub CheckBind(index As Integer, rc As Integer)
+        If rc <> 0 Then Throw New DatabaseException(CDBMessage(Me.mDB), rc)
+        Me.mBound(index) = True
+    End Sub
+    Private Sub BindValue(index As Integer, value As Variant)
+        Me.RequireIndex(index)
+        If value.IsUInt64() Then
+            Dim largest As UInt64 = &H7FFFFFFFFFFFFFFF
+            If value.AsUInt64().Or(0) > largest Then Throw New OverflowException("SQLite INTEGER is signed 64-bit")
+        End If
+        Dim row As New DatabaseRow()
+        row.Column("value") = value
+        Dim col As DatabaseColumn = row.Column("value")
+        Dim rc As Integer
+        If Me.mTypes(index) <> 0 And Not value.IsNil() Then
+            Select Case Me.mTypes(index)
+            Case ClassicSQLitePreparedStatement.SQLITE_INTEGER, ClassicSQLitePreparedStatement.SQLITE_INT64
+                Me.CheckBind(index, CDBBindInteger(Me.mStmt, index + 1, col.Int64Value))
+            Case ClassicSQLitePreparedStatement.SQLITE_DOUBLE
+                Me.CheckBind(index, CDBBindDouble(Me.mStmt, index + 1, col.DoubleValue))
+            Case ClassicSQLitePreparedStatement.SQLITE_TEXT
+                Dim converted As String = col.StringValue
+                Me.CheckBind(index, CDBBindText(Me.mStmt, index + 1, converted, String.LenBytes(converted), CType(-1, Ptr)))
+            Case ClassicSQLitePreparedStatement.SQLITE_BOOLEAN
+                Dim flag As Integer = 0
+                If col.BooleanValue Then flag = 1
+                Me.CheckBind(index, CDBBindInteger(Me.mStmt, index + 1, flag))
+            Case ClassicSQLitePreparedStatement.SQLITE_NULL
+                Me.CheckBind(index, CDBBindNull(Me.mStmt, index + 1))
+            Case Else
+                Throw New TypeMismatchException("BLOB binding requires BindBlob Bytes")
+            End Select
+            Return
+        End If
+        Select Case col.Type
+        Case DbValue.KindNull
+            rc = CDBBindNull(Me.mStmt, index + 1)
+        Case DbValue.KindInteger
+            rc = CDBBindInteger(Me.mStmt, index + 1, col.Int64Value)
+        Case DbValue.KindDouble
+            rc = CDBBindDouble(Me.mStmt, index + 1, col.DoubleValue)
+        Case DbValue.KindBoolean
+            Dim flag As Integer = 0
+            If col.BooleanValue Then flag = 1
+            rc = CDBBindInteger(Me.mStmt, index + 1, flag)
+        Case DbValue.KindString
+            Dim text As String = col.StringValue
+            rc = CDBBindText(Me.mStmt, index + 1, text, String.LenBytes(text), CType(-1, Ptr))
+        Case Else
+            Throw New UnsupportedOperationException("Unsupported SQL parameter type")
+        End Select
+        Me.CheckBind(index, rc)
+    End Sub
+    Public Sub BindType(index As Integer, bindingType As Integer)
+        Me.mOwner.ClearError()
+        Try
+            Me.RequireIndex(index)
+            Me.mBound(index) = False
+            If bindingType < 1 Or bindingType > 7 Then Throw New InvalidArgumentException("Unsupported SQLite binding type")
+            Me.mTypes(index) = bindingType
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Public Sub Bind(index As Integer, value As Variant)
+        Me.mOwner.ClearError()
+        Try
+            Me.RequireIndex(index)
+            Me.mBound(index) = False
+            Me.BindValue(index, value)
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Private Sub BindBytes(index As Integer, data As Bytes, asText As Boolean)
+        Me.RequireIndex(index)
+        Me.mBound(index) = False
+        If data = Nil Then Throw New InvalidArgumentException("Bytes must not be Nil; Bind Variant.Empty for SQL NULL")
+        If data.Count > 2147483647 Then Throw New OverflowException("SQLite byte value exceeds Int32 length")
+        Dim rc As Integer
+        If asText Then
+            If Me.mTypes(index) <> 0 And Me.mTypes(index) <> ClassicSQLitePreparedStatement.SQLITE_TEXT Then Throw New TypeMismatchException("BindTextBytes requires TEXT binding type")
+            If data.Count = 0 Then
+                rc = CDBBindText(Me.mStmt, index + 1, "", 0, CType(-1, Ptr))
+            Else
+                ' Validate UTF-8 independently; preserve original bytes including NUL.
+                Dim validated As String = data.ToString(Text.Encodings.UTF8)
+                rc = CDBBindTextBytes(Me.mStmt, index + 1, data.DataPtr(), data.Count, CType(-1, Ptr))
+            End If
+        ElseIf Me.mTypes(index) <> 0 And Me.mTypes(index) <> ClassicSQLitePreparedStatement.SQLITE_BLOB Then
+            Throw New TypeMismatchException("BindBlob requires BLOB binding type")
+        ElseIf data.Count = 0 Then
+            rc = CDBBindEmptyBlob(Me.mStmt, index + 1, 0)
+        Else
+            rc = CDBBindBlob(Me.mStmt, index + 1, data.DataPtr(), data.Count, CType(-1, Ptr))
+        End If
+        Me.CheckBind(index, rc)
+    End Sub
+    Public Sub BindBlob(index As Integer, data As Bytes)
+        Me.mOwner.ClearError()
+        Try
+            Me.BindBytes(index, data, False)
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Public Sub BindTextBytes(index As Integer, data As Bytes)
+        Me.mOwner.ClearError()
+        Try
+            Me.BindBytes(index, data, True)
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Public Sub Reset(clearBindings As Boolean = False)
+        Me.mOwner.ClearError()
+        Try
+            Me.RequireOpen()
+            ' reset can repeat the previous step error; execution already captured it.
+            CDBReset(Me.mStmt)
+            If clearBindings Then
+                Dim rc As Integer = CDBClearBindings(Me.mStmt)
+                If rc <> 0 Then Throw New DatabaseException(CDBMessage(Me.mDB), rc)
+                For i As Integer = 0 To Array.Count(Me.mBound) - 1
+                    Me.mBound(i) = False
+                Next
+            End If
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Private Function Run(values As Array Of Variant, selecting As Boolean) As RecordSet
+        Me.mOwner.ClearError()
+        Dim rows As ClassicSQLiteRows
+        Try
+            Me.RequireOpen()
+            If Array.Count(values) > 0 Then
+                If Array.Count(values) <> Me.ParameterCount Then Throw New InvalidArgumentException("SQL parameter count mismatch")
+                For i As Integer = 0 To Array.Count(Me.mBound) - 1
+                    Me.mBound(i) = False
+                Next
+                For i As Integer = 0 To Array.Count(values) - 1
+                    Me.BindValue(i, values(i))
+                Next
+            End If
+            For Each bound As Boolean In Me.mBound
+                If Not bound Then Throw New InvalidArgumentException("Missing SQL binding")
+            Next
+            If selecting And (CDBReadOnly(Me.mStmt) = 0 Or CDBColumnCount(Me.mStmt) = 0) Then Throw New UnsupportedOperationException("SQLSelect requires a read-only result statement")
+            rows = New ClassicSQLiteRows(Me.mDB, Me.mStmt, True)
+            rows.NextRow()
+            If selecting Then Return New RecordSet(rows)
+            While rows.HasMoreRows()
+                rows.NextRow()
+            End While
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        Finally
+            If rows <> Nil Then rows.Close()
+        End Try
+        Return Nil
+    End Function
+    Public Function SQLSelect(ParamArray values As Variant) As RecordSet
+        Return Me.Run(values, True)
+    End Function
+    Public Sub SQLExecute(ParamArray values As Variant)
+        Me.Run(values, False)
+    End Sub
+    Public Sub Close()
+        If Me.mStmt <> Nil Then
+            CDBFinalize(Me.mStmt)
+            Me.mStmt = Nil
+        End If
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+''' Single-use edit session for a named table and schema-verified scalar primary key.
+''' Changes are staged explicitly; each Update/Delete is one atomic SQLite statement.
+Public Class ClassicEditableRecord
+    Private Property mOwner As ClassicSQLiteDatabase
+    Private Property mTable As String
+    Private Property mKeyName As String
+    Private Property mKey As Variant
+    Private Property mSnapshot As RecordSet
+    Private Property mRevision As Integer
+    Private Property mChanges As ClassicDatabaseRecord = New ClassicDatabaseRecord()
+    Private Property mClosed As Boolean = False
+
+    Public Sub Constructor(owner As ClassicSQLiteDatabase, tableName As String, primaryKey As String, key As Variant, snapshot As RecordSet)
+        Me.mOwner = owner
+        Me.mTable = tableName
+        Me.mKeyName = primaryKey
+        Me.mKey = key
+        Me.mSnapshot = snapshot
+        Me.mRevision = owner.ConnectionRevision
+    End Sub
+    Private Sub RequireOpen()
+        If Me.mClosed Then Throw New UnsupportedOperationException("Editable record session is closed")
+        If Not Me.mOwner.IsConnected() Or Me.mRevision <> Me.mOwner.ConnectionRevision Then Throw New DatabaseException("Editable record connection has changed", 21)
+    End Sub
+    Public Function Field(name As String) As DatabaseField
+        Me.RequireOpen()
+        Return Me.mSnapshot.Field(name)
+    End Function
+    Public Sub SetValue(name As String, value As Variant)
+        Me.RequireOpen()
+        Dim field As DatabaseField = Me.mSnapshot.Field(name)
+        If String.LCase(field.Name) = String.LCase(Me.mKeyName) Then Throw New UnsupportedOperationException("Primary key edits are unsupported")
+        Me.mChanges.SetValue(field.Name, value)
+    End Sub
+    Public Sub Update()
+        Me.mOwner.ClearError()
+        Try
+            Me.RequireOpen()
+            If Me.mChanges.FieldCount = 0 Then Throw New InvalidArgumentException("No staged changes")
+            Dim sql As String = "UPDATE \"main\"." + CDBQuote(Me.mTable) + " SET "
+            Dim values As Array Of Variant = []
+            Dim row As DatabaseRow = Me.mChanges.ToDatabaseRow()
+            For i As Integer = 0 To row.ColumnCount - 1
+                If i > 0 Then sql += ", "
+                Dim col As DatabaseColumn = row.ColumnAt(i)
+                sql += CDBQuote(col.Name) + "=?"
+                Array.Append(values, col.Value)
+            Next
+            sql += " WHERE " + CDBQuote(Me.mKeyName) + " IS ?"
+            Array.Append(values, Me.mKey)
+            Me.Perform(sql, values)
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Private Sub Perform(sql As String, values As Array Of Variant)
+        Dim active As Boolean = False
+        Try
+            Me.mOwner.SQLExecute("SAVEPOINT rbclassic_record_edit")
+            If Me.mOwner.Error Then Return
+            active = True
+            Dim current As ClassicEditableRecord = Me.mOwner.OpenEditableRecord(Me.mTable, Me.mKeyName, Me.mKey)
+            If current = Nil Then Throw New DatabaseException(Me.mOwner.ErrorMessage, Me.mOwner.ErrorCode)
+            current.Close()
+            Me.mOwner.SQLExecuteBound(sql, values)
+            If Me.mOwner.Error Then Throw New DatabaseException(Me.mOwner.ErrorMessage, Me.mOwner.ErrorCode)
+            If Me.mOwner.Changes() <> 1 Then Throw New DatabaseException("Editable record change did not affect exactly one row")
+            Me.mOwner.SQLExecute("RELEASE rbclassic_record_edit")
+            If Me.mOwner.Error Then Throw New DatabaseException(Me.mOwner.ErrorMessage, Me.mOwner.ErrorCode)
+            active = False
+            Me.Close()
+        Catch e As Exception
+            ' Explicit cleanup before returning: do not rely on rethrow/Finally.
+            If active Then
+                Me.mOwner.SQLExecute("ROLLBACK TO rbclassic_record_edit")
+                Me.mOwner.SQLExecute("RELEASE rbclassic_record_edit")
+            End If
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Public Sub DeleteRecord()
+        Me.mOwner.ClearError()
+        Try
+            Me.RequireOpen()
+            Dim values As Array Of Variant = [Me.mKey]
+            Me.Perform("DELETE FROM \"main\"." + CDBQuote(Me.mTable) + " WHERE " + CDBQuote(Me.mKeyName) + " IS ?", values)
+        Catch e As Exception
+            Me.mOwner.SaveError(e)
+        End Try
+    End Sub
+    Public Sub Close()
+        Me.mClosed = True
+        If Me.mSnapshot <> Nil Then Me.mSnapshot.Close()
+    End Sub
+End Class

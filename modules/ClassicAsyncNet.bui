@@ -1,0 +1,652 @@
+' API 1 client sockets. Native helper owns DNS and nonblocking descriptors.
+Import RBFoundation
+
+Private Optional Declare Function NetStart Lib "ClassicAsyncNet" Alias "cx_start" (host As String, port As Int32) As Ptr
+Private Optional Declare Sub NetClose Lib "ClassicAsyncNet" Alias "cx_close" (socket As Ptr)
+Private Optional Declare Function NetPoll Lib "ClassicAsyncNet" Alias "cx_poll" (socket As Ptr) As Int32
+Private Optional Declare Function NetValue Lib "ClassicAsyncNet" Alias "cx_value" (socket As Ptr, key As Int32) As Integer
+Private Optional Declare Function NetWrite Lib "ClassicAsyncNet" Alias "cx_write" (socket As Ptr, data As String, count As Integer) As Int32
+Private Optional Declare Sub NetCancel Lib "ClassicAsyncNet" Alias "cx_purge" (socket As Ptr)
+Private Optional Declare Function NetData Lib "ClassicAsyncNet" Alias "cx_data" (socket As Ptr) As Ptr
+Private Optional Declare Sub NetConsume Lib "ClassicAsyncNet" Alias "cx_consume" (socket As Ptr, count As Integer)
+Private Optional Declare Function NetAddress Lib "ClassicAsyncNet" Alias "cx_address" (socket As Ptr, remote As Int32) As String
+
+Private Sub CheckNetString(value As String)
+    Dim b As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To b.Count - 1
+        If b.Item(i) = 0 Then Throw New InvalidArgumentException("Socket String contains NUL; use byte reads for binary data")
+    Next
+End Sub
+
+Private Function DecodeNetText(data As Bytes, encoding As Text.Encodings) As String
+    If encoding <> Text.Encodings.UTF8 And encoding <> Text.Encodings.Latin1 And encoding <> Text.Encodings.ASCII And encoding <> Text.Encodings.WindowsANSI Then Throw New UnsupportedOperationException("Socket String reads support UTF8, Latin1, ASCII and WindowsANSI; use ReadBytes for other encodings")
+    For i As Integer = 0 To data.Count - 1
+        If data.Item(i) = 0 Then Throw New InvalidArgumentException("Socket String cannot represent NUL; use ReadBytes")
+    Next
+    Return data.ToString(encoding)
+End Function
+
+' HTTP field names are ASCII tokens, never whitespace-normalized names.
+Private Function IsHTTPFieldName(name As String) As Boolean
+    Dim encoded As Bytes = Bytes.FromString(name, Text.Encodings.UTF8)
+    If encoded.Count = 0 Then Return False
+    For i As Integer = 0 To encoded.Count - 1
+        Dim code As Integer = encoded.Item(i)
+        If code <= 32 Or code >= 127 Then Return False
+        Dim alphaNumeric As Boolean = (code >= 48 And code <= 57) Or (code >= 65 And code <= 90) Or (code >= 97 And code <= 122)
+        If Not alphaNumeric And String.IndexOf("!#$%&'*+-.^_`|~", String.Chr(code)) < 0 Then Return False
+    Next
+    Return True
+End Function
+
+Private Class ClassicNetTimer Inherits Timer
+    Public Property Owner As Weak ClassicTCPSocket
+    Public Overrides Sub NotifyTick()
+        Dim socket As ClassicTCPSocket = Me.Owner
+        If socket = Nil Then
+            Me.Stop()
+        Else
+            socket.Poll()
+        End If
+    End Sub
+End Class
+
+''' Main-thread client. Poll explicitly in console programs; GUI uses Timer.
+Public Class ClassicTCPSocket
+    Private Property Native As Ptr
+    Private Property Ticker As ClassicNetTimer
+    Private Property Polling As Boolean = False
+    Private Property Generation As Integer = 0
+    Private Property PendingSend As Boolean = False
+    Private Property SendBatch As Integer = 0
+    Private Property SavedInput As Bytes = New Bytes()
+    Private Property LastState As Integer = 0
+    Public Property Address As String = ""
+    Public Property Port As Integer = 0
+    Public Property LastErrorCode As Integer = 0
+    Public Event Connected()
+    Public Event DataAvailable()
+    Public Event Error(e As Exception)
+    Public Event SendProgress(bytesSent As Integer, bytesLeft As Integer) As Boolean
+    Public Event SendComplete(userAborted As Boolean)
+
+    ''' 0 idle, 1 resolving, 2 connecting, 3 connected, 4 EOF/closed, 5 failed.
+    Public Property State As Integer
+        Get
+            If Me.Native = Nil Then Return Me.LastState
+            Return NetValue(Me.Native, 0)
+        End Get
+    End Property
+    Public Property IsConnected As Boolean
+        Get
+            Return Me.State = 3
+        End Get
+    End Property
+    Public Property BytesAvailable As Integer
+        Get
+            If Me.Native = Nil Then Return Me.SavedInput.Count
+            Return Me.SavedInput.Count + NetValue(Me.Native, 2)
+        End Get
+    End Property
+    Public Property BytesLeftToSend As Integer
+        Get
+            If Me.Native = Nil Then Return 0
+            Return NetValue(Me.Native, 3)
+        End Get
+    End Property
+    Public Property Handle As Integer
+        Get
+            If Me.Native = Nil Then Return -1
+            Return NetValue(Me.Native, 7)
+        End Get
+    End Property
+    Public Property LocalPort As Integer
+        Get
+            If Me.Native = Nil Then Return 0
+            Return NetValue(Me.Native, 6)
+        End Get
+    End Property
+    Public Property LocalAddress As String
+        Get
+            If Me.Native = Nil Then Return ""
+            Return NetAddress(Me.Native, 0)
+        End Get
+    End Property
+    Public Property RemoteAddress As String
+        Get
+            If Me.Native = Nil Then Return ""
+            Return NetAddress(Me.Native, 1)
+        End Get
+    End Property
+
+    Public Sub Connect()
+        #If TargetWindows Then
+        Throw New UnsupportedOperationException("Classic async transport has no Windows native payload yet")
+        #Else
+        If Me.Native <> Nil Then Throw New InvalidArgumentException("Close before reconnecting")
+        CheckNetString(Me.Address)
+        If Me.Address = "" Or Me.Port < 1 Or Me.Port > 65535 Then Throw New InvalidArgumentException("Address and Port 1..65535 required")
+        Me.Native = NetStart(Me.Address, Me.Port)
+        If Me.Native = Nil Then Throw New Exception("Cannot start DNS worker")
+        Me.Generation += 1
+        Me.LastErrorCode = 0
+        Me.LastState = 1
+        Me.SavedInput = New Bytes()
+        Me.Ticker = New ClassicNetTimer()
+        Me.Ticker.Owner = Me
+        Me.Ticker.Period = 10
+        Me.Ticker.Start()
+        #End If
+    End Sub
+
+    Public Sub Write(data As String)
+        If Me.Native = Nil Or Me.State > 3 Then Throw New InvalidArgumentException("Write requires an active connection attempt or connection")
+        CheckNetString(data)
+        Dim count As Integer = String.LenBytes(data)
+        If count = 0 Then Return
+        If NetWrite(Me.Native, data, count) = 0 Then Throw New InvalidArgumentException("Send queue limit is 16 MiB")
+        If Not Me.PendingSend Then Me.SendBatch += 1
+        Me.PendingSend = True
+    End Sub
+
+    ''' Nonblocking: completion means accepted by OS, not acknowledged by peer.
+    Public Sub Poll()
+        If Me.Native = Nil Or Me.Polling Then Return
+        Me.Polling = True
+        Dim token As Integer = Me.Generation
+        Try
+            Dim batch As Integer = Me.SendBatch
+            Dim transitions As Integer = NetPoll(Me.Native)
+            Dim sent As Integer = NetValue(Me.Native, 4)
+            If (transitions And 1) <> 0 Then RaiseEvent Connected()
+            If Me.Generation <> token Then
+                Me.Polling = False
+                Return
+            End If
+            If sent > 0 Then
+                Dim cancelled As Boolean = RaiseEvent SendProgress(sent, Me.BytesLeftToSend)
+                If Me.Generation <> token Then
+                    Me.Polling = False
+                    Return
+                End If
+                ' A nested cancellation/completion may already have started a
+                ' successor. This callback's return value belongs to batch only.
+                If Me.SendBatch = batch And Me.PendingSend Then
+                    If cancelled Then NetCancel(Me.Native)
+                    If cancelled Or Me.BytesLeftToSend = 0 Then
+                        Me.PendingSend = False
+                        RaiseEvent SendComplete(cancelled)
+                    End If
+                End If
+            End If
+            If Me.Generation <> token Then
+                Me.Polling = False
+                Return
+            End If
+            If (transitions And 2) <> 0 Then RaiseEvent DataAvailable()
+            If Me.Generation <> token Then
+                Me.Polling = False
+                Return
+            End If
+            If (transitions And 24) <> 0 Then
+                If Me.Ticker <> Nil Then Me.Ticker.Stop()
+                Me.LastErrorCode = NetValue(Me.Native, 1)
+                If (transitions And 8) <> 0 Then Me.LastErrorCode = 102
+                Me.PendingSend = False
+                RaiseEvent Error(New Exception("Socket disconnected or failed", Me.LastErrorCode))
+            End If
+        Catch e As Exception
+            Me.Polling = False
+            Throw e
+        Finally
+            Me.Polling = False
+        End Try
+    End Sub
+
+    Public Function LookaheadBytes() As Bytes
+        Dim payload As New Bytes()
+        payload.Append(Me.SavedInput)
+        If Me.Native <> Nil Then payload.Append(NetData(Me.Native), NetValue(Me.Native, 2))
+        Return payload
+    End Function
+    Public Function ReadBytes(count As Integer) As Bytes
+        If count < 0 Then Throw New InvalidArgumentException("Negative read length")
+        Dim available As Bytes = Me.LookaheadBytes()
+        Dim payload As New Bytes()
+        Dim remainder As New Bytes()
+        For i As Integer = 0 To available.Count - 1
+            If i < count Then
+                payload.Append(available.Item(i))
+            Else
+                remainder.Append(available.Item(i))
+            End If
+        Next
+        Me.SavedInput = remainder
+        If Me.Native <> Nil Then NetConsume(Me.Native, NetValue(Me.Native, 2))
+        Return payload
+    End Function
+    Public Function Lookahead(encoding As Text.Encodings = Text.Encodings.UTF8) As String
+        Dim payload As String = DecodeNetText(Me.LookaheadBytes(), encoding)
+        CheckNetString(payload)
+        Return payload
+    End Function
+    Public Function Read(count As Integer, encoding As Text.Encodings = Text.Encodings.UTF8) As String
+        ' Validate/decode before consuming; decoding errors preserve the queue.
+        Dim all As Bytes = Me.LookaheadBytes()
+        Dim selected As New Bytes()
+        For i As Integer = 0 To Math.Min(count, all.Count) - 1
+            selected.Append(all.Item(i))
+        Next
+        If count < 0 Then Throw New InvalidArgumentException("Negative read length")
+        Dim payload As String = DecodeNetText(selected, encoding)
+        CheckNetString(payload)
+        Me.ReadBytes(selected.Count)
+        Return payload
+    End Function
+    Public Function ReadAll(encoding As Text.Encodings = Text.Encodings.UTF8) As String
+        Return Me.Read(Me.BytesAvailable, encoding)
+    End Function
+    Public Sub Purge()
+        Me.SavedInput = New Bytes()
+        If Me.Native <> Nil Then NetConsume(Me.Native, NetValue(Me.Native, 2))
+    End Sub
+    Public Sub CancelSend()
+        If Me.Native = Nil Or Not Me.PendingSend Then Return
+        NetCancel(Me.Native)
+        Me.PendingSend = False
+        Me.SendBatch += 1
+        RaiseEvent SendComplete(True)
+    End Sub
+    Public Sub Flush()
+        Me.Poll()
+    End Sub
+    Public Function EndOfFile() As Boolean
+        Return Me.State >= 4 And Me.BytesAvailable = 0
+    End Function
+    Public Sub Close()
+        Me.Generation += 1
+        If Me.Ticker <> Nil Then Me.Ticker.Stop()
+        Me.Ticker = Nil
+        If Me.Native <> Nil Then
+            Me.SavedInput = Me.LookaheadBytes()
+            NetClose(Me.Native)
+            Me.Native = Nil
+        End If
+        Me.PendingSend = False
+        Me.LastState = 4
+    End Sub
+    Public Sub Disconnect()
+        Me.Close()
+        Me.LastErrorCode = 102
+        RaiseEvent Error(New Exception("Socket disconnected", 102))
+    End Sub
+    Public Sub Destructor()
+        If Me.Ticker <> Nil Then Me.Ticker.Stop()
+        If Me.Native <> Nil Then NetClose(Me.Native)
+    End Sub
+End Class
+
+''' API 1-style headers; explicitly named because legacy ships no InternetHeaders.
+Public Class ClassicInternetHeaders
+    Private Property Names As Array Of String = []
+    Private Property Values As Array Of String = []
+    Public Property Count As Integer
+        Get
+            Return Me.Names.Count
+        End Get
+    End Property
+    Public Sub AppendHeader(name As String, value As String)
+        CheckNetString(name)
+        CheckNetString(value)
+        If Not IsHTTPFieldName(name) Then Throw New InvalidArgumentException("Invalid HTTP field name")
+        If String.IndexOf(value, "\r") >= 0 Or String.IndexOf(value, "\n") >= 0 Then Throw New InvalidArgumentException("Invalid header value")
+        Me.Names.Add(name)
+        Me.Values.Add(value)
+    End Sub
+    Public Function Name(index As Integer) As String
+        Return Me.Names(index)
+    End Function
+    Public Function Value(name As String) As String
+        For i As Integer = 0 To Me.Names.Count - 1
+            If String.LCase(Me.Names(i)) = String.LCase(name) Then Return Me.Values(i)
+        Next
+        Return ""
+    End Function
+    Public Function ValueAt(index As Integer) As String
+        Return Me.Values(index)
+    End Function
+End Class
+
+Private Class ClassicHTTPTransport Inherits ClassicTCPSocket
+    Public Property Owner As Weak ClassicHTTPSocket
+    Handle Connected()
+        Dim client As ClassicHTTPSocket = Me.Owner
+        If client <> Nil Then client.TransportConnected()
+    End Handle
+    Handle DataAvailable()
+        Dim client As ClassicHTTPSocket = Me.Owner
+        If client <> Nil Then client.TransportData()
+    End Handle
+    Handle Error(e As Exception)
+        Dim client As ClassicHTTPSocket = Me.Owner
+        If client <> Nil Then client.TransportError(e)
+    End Handle
+    Handle SendProgress(bytesSent As Integer, bytesLeft As Integer) As Boolean
+        Dim client As ClassicHTTPSocket = Me.Owner
+        If client <> Nil Then client.TransportProgress(bytesSent, bytesLeft)
+        Return False
+    End Handle
+End Class
+
+''' Classic HTTP/1.0 client, distinct from the foundation HTTPSocket and URLConnection.
+''' HTTP only. No silent TLS downgrade, redirects, proxy, chunking or compression.
+Public Class ClassicHTTPSocket
+    Private Property Socket As ClassicHTTPTransport
+    Private Property Active As Boolean = False
+    Private Property Serial As Integer = 0
+    Private Property RequestURL As String = ""
+    Private Property RequestText As String = ""
+    Private Property RequestContent As String = ""
+    Private Property ContentType As String = "application/octet-stream"
+    Private Property Response As Bytes = New Bytes()
+    Private Property GotHeaders As Boolean = False
+    Private Property Expected As Integer = -1
+    Private Property HeadOnly As Boolean = False
+    Private Property ResponseHeaders As ClassicInternetHeaders = New ClassicInternetHeaders()
+    Public Property RequestHeaders As ClassicInternetHeaders = New ClassicInternetHeaders()
+    Public Property HTTPStatusCode As Integer = 0
+    Public Property ErrorCode As Integer = 0
+    Public Event Connected()
+    Public Event HeadersReceived(headers As ClassicInternetHeaders, httpStatus As Integer)
+    Public Event PageReceived(url As String, httpStatus As Integer, headers As ClassicInternetHeaders, content As String)
+    Public Event ReceiveProgress(bytesReceived As Integer, totalBytes As Integer, newData As String)
+    Public Event SendProgress(bytesSent As Integer, bytesLeft As Integer)
+    Public Event Error(e As Exception)
+
+    Public Property IsConnected As Boolean
+        Get
+            If Me.Socket = Nil Then Return False
+            Return Me.Socket.IsConnected
+        End Get
+    End Property
+    Public Function PageHeaders() As ClassicInternetHeaders
+        Return Me.ResponseHeaders
+    End Function
+    Public Sub ClearRequestHeaders()
+        Me.RequestHeaders = New ClassicInternetHeaders()
+    End Sub
+    Public Sub SetRequestHeader(name As String, value As String)
+        Me.RequestHeaders.AppendHeader(name, value)
+    End Sub
+    Public Sub SetPostContent(content As String, contentType As String)
+        CheckNetString(content)
+        CheckNetString(contentType)
+        If String.IndexOf(contentType, "\r") >= 0 Or String.IndexOf(contentType, "\n") >= 0 Then Throw New InvalidArgumentException("Invalid content type")
+        Me.RequestContent = content
+        Me.ContentType = contentType
+    End Sub
+    Public Sub Get(url As String)
+        Me.BeginRequest("GET", url)
+    End Sub
+    Public Sub Post(url As String)
+        Me.BeginRequest("POST", url)
+    End Sub
+    Public Sub GetHeaders(url As String)
+        Me.BeginRequest("HEAD", url)
+    End Sub
+    Private Sub BeginRequest(method As String, url As String)
+        If Me.Active Then Throw New InvalidArgumentException("HTTP request already active")
+        CheckNetString(url)
+        If String.Left(url, 7) <> "http://" Then Throw New UnsupportedOperationException("ClassicHTTPSocket currently requires http://; TLS is unsupported")
+        Dim rest As String = String.Substring(url, 7)
+        ' The authority ends at either the path or query. A URL such as
+        ' http://host?key=value has an empty path and the target /?key=value.
+        Dim slash As Integer = String.IndexOf(rest, "/")
+        Dim query As Integer = String.IndexOf(rest, "?")
+        Dim boundary As Integer = slash
+        If query >= 0 And (boundary < 0 Or query < boundary) Then boundary = query
+        Dim authority As String = rest
+        Dim requestPath As String = "/"
+        If boundary >= 0 Then
+            authority = String.Left(rest, boundary)
+            requestPath = String.Substring(rest, boundary)
+            If boundary = query Then requestPath = "/" + requestPath
+        End If
+        If authority = "" Or String.IndexOf(authority, "@") >= 0 Or String.IndexOf(authority, "[") >= 0 Then Throw New InvalidArgumentException("HTTP URL requires a hostname; credentials and IPv6 literals unsupported")
+        Dim colon As Integer = String.IndexOf(authority, ":")
+        Dim host As String = authority
+        Dim port As Integer = 80
+        If colon >= 0 Then
+            host = String.Left(authority, colon)
+            Dim portText As String = String.Substring(authority, colon + 1)
+            If portText = "" Then Throw New InvalidArgumentException("Empty HTTP port")
+            For i As Integer = 0 To String.Len(portText) - 1
+                Dim digit As String = String.Substring(portText, i, 1)
+                If digit < "0" Or digit > "9" Then Throw New InvalidArgumentException("Invalid HTTP port")
+            Next
+            port = Integer.FromString(portText)
+        End If
+        Dim urlBytes As Bytes = Bytes.FromString(rest, Text.Encodings.UTF8)
+        For i As Integer = 0 To urlBytes.Count - 1
+            If urlBytes.Item(i) <= 32 Or urlBytes.Item(i) >= 127 Or urlBytes.Item(i) = 35 Then Throw New InvalidArgumentException("URL must be escaped ASCII without fragment")
+        Next
+        Dim request As String = method + " " + requestPath + " HTTP/1.0\r\nHost: " + authority + "\r\nConnection: close\r\n"
+        For i As Integer = 0 To Me.RequestHeaders.Count - 1
+            Dim name As String = Me.RequestHeaders.Name(i)
+            If Not IsHTTPFieldName(name) Then Throw New InvalidArgumentException("Invalid HTTP field name")
+            Dim lower As String = String.LCase(name)
+            If lower = "host" Or lower = "content-length" Or lower = "transfer-encoding" Or lower = "connection" Then Throw New InvalidArgumentException("HTTP framing headers are managed by adapter")
+            Dim value As String = Me.RequestHeaders.ValueAt(i)
+            CheckNetString(value)
+            If String.IndexOf(value, "\r") >= 0 Or String.IndexOf(value, "\n") >= 0 Then Throw New InvalidArgumentException("Invalid header value")
+            request += name + ": " + value + "\r\n"
+        Next
+        If method = "POST" Then request += "Content-Type: " + Me.ContentType + "\r\nContent-Length: " + String.From(String.LenBytes(Me.RequestContent)) + "\r\n"
+        request += "\r\n"
+        If method = "POST" Then request += Me.RequestContent
+        Me.Close()
+        Me.RequestURL = url
+        Me.RequestText = request
+        Me.Response = New Bytes()
+        Me.ResponseHeaders = New ClassicInternetHeaders()
+        Me.GotHeaders = False
+        Me.Expected = -1
+        Me.HeadOnly = method = "HEAD"
+        Me.HTTPStatusCode = 0
+        Me.ErrorCode = 0
+        Me.Socket = New ClassicHTTPTransport()
+        Me.Socket.Owner = Me
+        Me.Socket.Address = host
+        Me.Socket.Port = port
+        Me.Active = True
+        Try
+            Me.Socket.Connect()
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Public Sub TransportConnected()
+        Dim token As Integer = Me.Serial
+        RaiseEvent Connected()
+        If Me.Active And Me.Serial = token Then Me.Socket.Write(Me.RequestText)
+    End Sub
+    Public Sub TransportProgress(sent As Integer, left As Integer)
+        RaiseEvent SendProgress(sent, left)
+    End Sub
+    Public Sub TransportData()
+        If Not Me.Active Then Return
+        Dim token As Integer = Me.Serial
+        Dim previousCount As Integer = Me.Response.Count
+        Me.Response.Append(Me.Socket.ReadBytes(Me.Socket.BytesAvailable))
+        If Not Me.GotHeaders Then
+            Dim boundary As Integer = -1
+            For i As Integer = 0 To Me.Response.Count - 4
+                If Me.Response.Item(i) = 13 And Me.Response.Item(i + 1) = 10 And Me.Response.Item(i + 2) = 13 And Me.Response.Item(i + 3) = 10 Then
+                    boundary = i
+                    Exit For
+                End If
+            Next
+            If boundary < 0 Then
+                If Me.Response.Count > 65536 Then Me.Fail("HTTP headers exceed 64 KiB")
+                Return
+            End If
+            If boundary > 65536 Then
+                Me.Fail("HTTP headers exceed 64 KiB")
+                Return
+            End If
+            Dim headerBytes As New Bytes()
+            Dim body As New Bytes()
+            For i As Integer = 0 To Me.Response.Count - 1
+                If i < boundary Then
+                    If Me.Response.Item(i) = 0 Or Me.Response.Item(i) > 127 Then
+                        Me.Fail("HTTP headers must be non-NUL ASCII")
+                        Return
+                    End If
+                    headerBytes.Append(Me.Response.Item(i))
+                ElseIf i >= boundary + 4 Then
+                    body.Append(Me.Response.Item(i))
+                End If
+            Next
+            Dim lines As Array Of String = String.Split(headerBytes.ToString(Text.Encodings.ASCII), "\r\n")
+            Dim status As Array Of String = String.Split(lines(0), " ")
+            If status.Count < 2 Then
+                Me.Fail("Malformed HTTP status")
+                Return
+            End If
+            If status(0) <> "HTTP/1.0" And status(0) <> "HTTP/1.1" Then
+                Me.Fail("Unsupported HTTP version")
+                Return
+            End If
+            Dim code As String = status(1)
+            If String.Len(code) <> 3 Then
+                Me.Fail("Malformed HTTP status")
+                Return
+            End If
+            For i As Integer = 0 To 2
+                Dim digit As String = String.Substring(code, i, 1)
+                If digit < "0" Or digit > "9" Then
+                    Me.Fail("Malformed HTTP status")
+                    Return
+                End If
+            Next
+            Me.HTTPStatusCode = Integer.FromString(code)
+            If Me.HTTPStatusCode < 200 Then
+                Me.Fail("Interim HTTP responses unsupported")
+                Return
+            End If
+            Dim bodyless As Boolean = Me.HeadOnly Or Me.HTTPStatusCode = 204 Or Me.HTTPStatusCode = 304
+            Dim lengthSeen As Boolean = False
+            If bodyless Then Me.Expected = 0
+            For i As Integer = 1 To lines.Count - 1
+                Dim split As Integer = String.IndexOf(lines(i), ":")
+                If split < 1 Then
+                    Me.Fail("Malformed HTTP header")
+                    Return
+                End If
+                Dim name As String = String.Left(lines(i), split)
+                If Not IsHTTPFieldName(name) Then
+                    Me.Fail("Malformed HTTP field name")
+                    Return
+                End If
+                Dim value As String = String.Trim(String.Substring(lines(i), split + 1))
+                If String.LCase(name) = "content-length" Then
+                    If lengthSeen Or value = "" Then
+                        Me.Fail("Ambiguous Content-Length")
+                        Return
+                    End If
+                    lengthSeen = True
+                    Me.Expected = 0
+                    For j As Integer = 0 To String.Len(value) - 1
+                        Dim digit As String = String.Substring(value, j, 1)
+                        If digit < "0" Or digit > "9" Then
+                            Me.Fail("Invalid Content-Length")
+                            Return
+                        End If
+                        ' HEAD/204/304 length describes metadata, not a body
+                        ' to buffer. Validate its syntax without a body-size cap.
+                        If Not bodyless Then
+                            Me.Expected = Me.Expected * 10 + Integer.FromString(digit)
+                            If Me.Expected > 16777216 Then
+                                Me.Fail("HTTP body exceeds 16 MiB")
+                                Return
+                            End If
+                        End If
+                    Next
+                End If
+                If Not bodyless And (String.LCase(name) = "transfer-encoding" Or String.LCase(name) = "content-encoding") Then
+                    Me.Fail("HTTP transfer/content encoding unsupported")
+                    Return
+                End If
+                Me.ResponseHeaders.AppendHeader(name, value)
+            Next
+            If bodyless Then body = New Bytes()
+            Me.Response = body
+            previousCount = 0
+            Me.GotHeaders = True
+            RaiseEvent HeadersReceived(Me.ResponseHeaders, Me.HTTPStatusCode)
+            If Not Me.Active Or Me.Serial <> token Then Return
+        End If
+        If Me.HeadOnly Or Me.HTTPStatusCode = 204 Or Me.HTTPStatusCode = 304 Then
+            Me.Complete()
+            Return
+        End If
+        If Me.Response.Count > 16777216 Then
+            Me.Fail("HTTP body exceeds 16 MiB")
+            Return
+        End If
+        ' String payloads map wire bytes through Latin1; embedded NUL is rejected.
+        For i As Integer = 0 To Me.Response.Count - 1
+            If Me.Response.Item(i) = 0 Then
+                Me.Fail("HTTP String content cannot represent NUL")
+                Return
+            End If
+        Next
+        Dim fresh As New Bytes()
+        For i As Integer = previousCount To Me.Response.Count - 1
+            fresh.Append(Me.Response.Item(i))
+        Next
+        RaiseEvent ReceiveProgress(Me.Response.Count, Me.Expected, fresh.ToString(Text.Encodings.Latin1))
+        If Not Me.Active Or Me.Serial <> token Then Return
+        If Me.Expected >= 0 Then
+            If Me.Response.Count > Me.Expected Then
+                Me.Fail("HTTP body exceeds Content-Length")
+            ElseIf Me.Response.Count = Me.Expected Then
+                Me.Complete()
+            End If
+        End If
+    End Sub
+    Public Sub TransportError(e As Exception)
+        If Not Me.Active Then Return
+        If e.ErrorCode = 102 And Me.GotHeaders And Me.Expected < 0 Then
+            Me.Complete()
+        Else
+            Me.Fail("HTTP transport failed or response truncated", e.ErrorCode)
+        End If
+    End Sub
+    Private Sub Complete()
+        Dim content As String = Me.Response.ToString(Text.Encodings.Latin1)
+        Dim url As String = Me.RequestURL
+        Dim headers As ClassicInternetHeaders = Me.ResponseHeaders
+        Dim status As Integer = Me.HTTPStatusCode
+        Me.Close()
+        RaiseEvent PageReceived(url, status, headers, content)
+    End Sub
+    Private Sub Fail(message As String, code As Integer = -2)
+        Me.ErrorCode = code
+        Me.Close()
+        RaiseEvent Error(New Exception(message, code))
+    End Sub
+    Public Sub Poll()
+        If Me.Socket <> Nil Then Me.Socket.Poll()
+    End Sub
+    Public Sub Close()
+        Me.Serial += 1
+        Me.Active = False
+        If Me.Socket <> Nil Then Me.Socket.Close()
+        Me.Socket = Nil
+    End Sub
+    Public Sub Destructor()
+        If Me.Socket <> Nil Then Me.Socket.Close()
+    End Sub
+End Class

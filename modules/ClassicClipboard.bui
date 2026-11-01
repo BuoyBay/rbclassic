@@ -1,0 +1,277 @@
+Import RBFoundation
+
+' Convert a legacy type to the actual identifier used by this platform.
+Public Function ClassicClipboardFormat(dataType As String) As String
+    If dataType = "" Then Throw New InvalidArgumentException("Clipboard format is empty")
+    Dim encoded As Bytes = Bytes.FromString(dataType, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then Throw New InvalidArgumentException("Clipboard format contains NUL")
+    Next
+    #If TargetMac Then
+        If encoded.Count = 4 Then
+            Return CCPreferredType(dataType)
+        End If
+        For Each character As String In String.Chars(dataType)
+            Dim code As Integer = String.Asc(character)
+            If code < 128 And Not ((code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or (code >= 48 And code <= 57) Or character = "." Or character = "-") Then Throw New UnsupportedOperationException("macOS requires a literal UTI or four-byte MacType")
+        Next
+        Return dataType
+    #ElseIf TargetLinux Then
+        If dataType = "public.rtf" Then Return "text/rtf"
+        If dataType = "public.html" Then Return "text/html"
+        Dim slash As Integer = String.InStr(dataType, "/")
+        If slash <= 1 Or slash = String.Len(dataType) Then Throw New UnsupportedOperationException("Linux raw clipboard formats require a MIME target; public.rtf and public.html are mapped")
+        Dim slashes As Integer = 0
+        For Each character As String In String.Chars(dataType)
+            Dim code As Integer = String.Asc(character)
+            If character = "/" Then
+                slashes += 1
+            ElseIf Not ((code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or (code >= 48 And code <= 57) Or String.Contains("!#$%&'*+-.^_`|~", character)) Then
+                Throw New InvalidArgumentException("Linux MIME targets require type/subtype tokens without parameters")
+            End If
+        Next
+        If slashes <> 1 Then Throw New InvalidArgumentException("Invalid Linux MIME target")
+        Return dataType
+    #Else
+        If dataType = "public.rtf" Then Return "Rich Text Format"
+        If dataType = "public.html" Then Throw New UnsupportedOperationException("Use HTML Format with a complete CF_HTML envelope on Windows")
+        Return dataType
+    #End If
+End Function
+
+#If TargetMac Then
+    Private Declare Function CCClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function CCNew Lib "Foundation" Selector "new" (cls As Ptr) As Ptr
+    Private Declare Sub CCDrain Lib "Foundation" Selector "drain" (pool As Ptr)
+    Private Declare Sub CCRelease Lib "Foundation" Selector "release" (object As Ptr)
+    Private Declare Function CCBoard Lib "AppKit" Selector "generalPasteboard" (cls As Ptr) As Ptr
+    Private Declare Function CCChangeCount Lib "AppKit" Selector "changeCount" (board As Ptr) As Integer
+    Private Declare Function CCRead Lib "AppKit" Selector "dataForType:" (board As Ptr, typeName As Ptr) As Ptr
+    Private Declare Function CCDataLength Lib "Foundation" Selector "length" (data As Ptr) As Integer
+    Private Declare Function CCDataBytes Lib "Foundation" Selector "bytes" (data As Ptr) As Ptr
+    Private Declare Function CCDataCreate Lib "CoreFoundation" Alias "CFDataCreate" (allocator As Ptr, data As Ptr, length As Integer) As Ptr
+    Private Declare Function CCSetData Lib "AppKit" Selector "setData:forType:" (item As Ptr, data As Ptr, typeName As Ptr) As Boolean
+    Private Declare Function CCArray Lib "Foundation" Selector "arrayWithObject:" (cls As Ptr, item As Ptr) As Ptr
+    Private Declare Function CCClear Lib "AppKit" Selector "clearContents" (board As Ptr) As Integer
+    Private Declare Function CCWrite Lib "AppKit" Selector "writeObjects:" (board As Ptr, items As Ptr) As Boolean
+    ' CoreServices is a system framework but is not in Buoy's minimal link stubs.
+    ' Load its documented C functions explicitly instead of adding a vendored stub.
+    Private Declare Function CCOpenLibrary Lib "c" Alias "dlopen" (fileName As String, loadFlags As Int32) As Ptr
+    Private Declare Function CCFindSymbol Lib "c" Alias "dlsym" (handle As Ptr, name As String) As Ptr
+    Private Declare Function CCCloseLibrary Lib "c" Alias "dlclose" (handle As Ptr) As Int32
+    Private Delegate Function CCTypeStringAction(code As UInt32) As Ptr
+    Private Delegate Function CCPreferredUTIAction(tagClass As Ptr, tag As Ptr, conformsTo As Ptr) As Ptr
+
+    Private Function CCPreferredType(value As String) As String
+        Dim library As Ptr = CCOpenLibrary("/System/Library/Frameworks/CoreServices.framework/CoreServices", 1)
+        If library = Nil Then Throw New UnsupportedOperationException("CoreServices type registry unavailable")
+        Dim tagClass As CFStringRef = CType("com.apple.ostype", CFStringRef)
+        Dim dataType As CFStringRef = CType("public.data", CFStringRef)
+        Dim tag As Ptr = Nil
+        Dim preferred As Ptr = Nil
+        Try
+            Dim address As Ptr = CCFindSymbol(library, "UTTypeCreatePreferredIdentifierForTag")
+            If address = Nil Then Throw New UnsupportedOperationException("OSType-to-UTI API unavailable")
+            Dim createAddress As Ptr = CCFindSymbol(library, "UTCreateStringForOSType")
+            If createAddress = Nil Then Throw New UnsupportedOperationException("OSType string API unavailable")
+            Dim create As CCTypeStringAction = CType(createAddress, CCTypeStringAction)
+            Dim raw As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+            Dim code As Integer = 0
+            For i As Integer = 0 To 3
+                code = code * 256 + raw.Item(i)
+            Next
+            tag = create(code)
+            If tag = Nil Then Throw New InvalidArgumentException("Cannot create MacType tag")
+            Dim resolve As CCPreferredUTIAction = CType(address, CCPreferredUTIAction)
+            preferred = resolve(tagClass, tag, dataType)
+            If preferred = Nil Then Throw New InvalidArgumentException("Cannot resolve MacType")
+            Return CType(CType(preferred, CFStringRef), String)
+        Finally
+            If preferred <> Nil Then CCRelease(preferred)
+            If tag <> Nil Then CCRelease(tag)
+            CCRelease(dataType)
+            CCRelease(tagClass)
+            CCCloseLibrary(library)
+        End Try
+    End Function
+
+    Private Function CCReadBytes(typeName As String) As Bytes
+        Dim pool As Ptr = CCNew(CCClass("NSAutoreleasePool"))
+        Dim nativeType As CFStringRef = CType(typeName, CFStringRef)
+        Try
+            Dim board As Ptr = CCBoard(CCClass("NSPasteboard"))
+            If board = Nil Then Throw New IOException("System pasteboard unavailable")
+            Dim change As Integer = CCChangeCount(board)
+            Dim data As Ptr = CCRead(board, nativeType)
+            If data = Nil Then Return Nil
+            Dim captured As New Bytes
+            Dim count As Integer = CCDataLength(data)
+            If count < 0 Then Throw New IOException("Invalid pasteboard length")
+            If count > 0 Then
+                Dim address As Ptr = CCDataBytes(data)
+                If address = Nil Then Throw New IOException("Missing pasteboard bytes")
+                captured.Append(address, count)
+            End If
+            If CCChangeCount(board) <> change Then Throw New IOException("Clipboard changed during read")
+            Return captured
+        Finally
+            CCRelease(nativeType)
+            CCDrain(pool)
+        End Try
+    End Function
+
+    Private Sub CCWriteBytes(types As Array Of String, values As Array Of Bytes)
+        Dim pool As Ptr = CCNew(CCClass("NSAutoreleasePool"))
+        Dim item As Ptr = Nil
+        Try
+            item = CCNew(CCClass("NSPasteboardItem"))
+            If item = Nil Then Throw New IOException("Cannot allocate pasteboard item")
+            For i As Integer = 0 To Array.Count(types) - 1
+                Dim nativeType As CFStringRef = CType(types(i), CFStringRef)
+                Dim data As Ptr = CCDataCreate(Nil, values(i).DataPtr(), values(i).Count)
+                Try
+                    If data = Nil Then Throw New IOException("Cannot allocate pasteboard data")
+                    If Not CCSetData(item, data, nativeType) Then Throw New IOException("Cannot stage pasteboard data")
+                Finally
+                    If data <> Nil Then CCRelease(data)
+                    CCRelease(nativeType)
+                End Try
+            Next
+            Dim board As Ptr = CCBoard(CCClass("NSPasteboard"))
+            If board = Nil Then Throw New IOException("System pasteboard unavailable")
+            Dim objects As Ptr = CCArray(CCClass("NSArray"), item)
+            If objects = Nil Then Throw New IOException("Cannot allocate pasteboard item array")
+            CCClear(board)
+            If Not CCWrite(board, objects) Then Throw New IOException("Pasteboard write failed after clearing")
+        Finally
+            If item <> Nil Then CCRelease(item)
+            CCDrain(pool)
+        End Try
+    End Sub
+#End If
+
+' A single-use transaction. Reads are live; writes replace clipboard on Close.
+' RawData uses Bytes because Buoy String cannot preserve embedded NUL.
+Public Class ClassicClipboard
+    Private Property mTypes As Array Of String = []
+    Private Property mValues As Array Of Bytes = []
+    Private Property mText As String
+    Private Property mHasText As Boolean = False
+    Private Property mClosed As Boolean = False
+
+    Public Property IsClosed As Boolean
+        Get
+            Return Me.mClosed
+        End Get
+    End Property
+
+    Private Sub RequireOpen()
+        If Me.mClosed Then Throw New InvalidArgumentException("Clipboard transaction is closed")
+    End Sub
+
+    Public Property Text As String
+        Get
+            Me.RequireOpen()
+            Dim reader As New Clipboard
+            Return reader.Text
+        End Get
+        Set
+            Me.RequireOpen()
+            Me.mText = value
+            Me.mHasText = True
+        End Set
+    End Property
+
+    Public Function TextAvailable() As Boolean
+        Me.RequireOpen()
+        Dim reader As New Clipboard
+        ' A text read services GTK's initial remote-owner format discovery.
+        If reader.Text <> "" Then Return True
+        Return reader.HasText
+    End Function
+
+    Public Function RawData(dataType As String) As Bytes
+        Me.RequireOpen()
+        Dim nativeType As String = ClassicClipboardFormat(dataType)
+        #If TargetMac Then
+            Return CCReadBytes(nativeType)
+        #Else
+            Dim reader As New Clipboard
+            Return reader.GetData(nativeType)
+        #End If
+    End Function
+
+    Public Function RawDataAvailable(dataType As String) As Boolean
+        Return Me.RawData(dataType) <> Nil
+    End Function
+
+    Public Sub RawData(dataType As String, Assigns value As Bytes)
+        Me.SetRawData(dataType, value)
+    End Sub
+
+    Public Sub SetRawData(dataType As String, value As Bytes)
+        Me.RequireOpen()
+        Dim nativeType As String = ClassicClipboardFormat(dataType)
+        If value = Nil Then Throw New InvalidArgumentException("Raw clipboard data is Nil")
+        #If TargetMac Then
+            ' Native CFData can represent a zero-byte value.
+        #Else
+            If value.Count = 0 Then Throw New UnsupportedOperationException("Empty raw representations require the macOS native backend; zero-byte data is unsupported by this adapter on Windows/Linux")
+        #End If
+        If nativeType = "public.utf8-plain-text" Or nativeType = "text/plain;charset=utf-8" Or nativeType = "text/plain" Or nativeType = "CF_UNICODETEXT" Then Throw New UnsupportedOperationException("Use Text for the built-in plain text representation")
+        Dim copy As New Bytes
+        copy.Append(value)
+        For i As Integer = 0 To Array.Count(Me.mTypes) - 1
+            Dim sameType As Boolean = String.Compare(Me.mTypes(i), nativeType, True) = 0
+            #If TargetWindows Then
+                sameType = String.LCase(Me.mTypes(i)) = String.LCase(nativeType)
+            #End If
+            If sameType Then
+                Me.mValues(i) = copy
+                Return
+            End If
+        Next
+        Me.mTypes.Append(nativeType)
+        Me.mValues.Append(copy)
+    End Sub
+
+    ' Clears immediately and discards pending writes; keeps transaction open.
+    Public Sub Clear()
+        Me.RequireOpen()
+        Dim writer As New Clipboard
+        writer.Clear()
+        Me.mTypes = []
+        Me.mValues = []
+        Me.mHasText = False
+    End Sub
+
+    ' Discard pending writes without touching the system clipboard.
+    Public Sub Cancel()
+        Me.mTypes = []
+        Me.mValues = []
+        Me.mHasText = False
+        Me.mClosed = True
+    End Sub
+
+    Public Sub Close()
+        If Me.mClosed Then Return
+        ' Mark closed even on failure: native write may already have cleared ownership.
+        Me.mClosed = True
+        #If TargetMac Then
+            If Me.mHasText Then
+                Me.mTypes.Append("public.utf8-plain-text")
+                Me.mValues.Append(Bytes.FromString(Me.mText, Text.Encodings.UTF8))
+            End If
+            If Array.Count(Me.mTypes) > 0 Then CCWriteBytes(Me.mTypes, Me.mValues)
+        #Else
+            Dim writer As New Clipboard
+            If Me.mHasText Then writer.Text = Me.mText
+            For i As Integer = 0 To Array.Count(Me.mTypes) - 1
+                writer.SetData(Me.mTypes(i), Me.mValues(i))
+            Next
+            writer.Close()
+        #End If
+        Me.mTypes = []
+        Me.mValues = []
+    End Sub
+End Class

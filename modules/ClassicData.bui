@@ -1,0 +1,1056 @@
+Import RBFoundation
+
+Private Function DataDateLocale() As Locale
+#If TargetLinux Then
+    Dim identifier As String = System.EnvironmentVariable("LC_ALL").Or("")
+    If identifier.Len() = 0 Then identifier = System.EnvironmentVariable("LC_TIME").Or("")
+    If identifier.Len() = 0 Then identifier = System.EnvironmentVariable("LANG").Or("")
+    If identifier.Len() > 0 Then
+        Dim suffix As Integer = identifier.IndexOf(".")
+        If suffix >= 0 Then identifier = identifier.Left(suffix)
+        suffix = identifier.IndexOf("@")
+        If suffix >= 0 Then identifier = identifier.Left(suffix)
+        Return New Locale(identifier)
+    End If
+#End If
+    Return Locale.Current()
+End Function
+
+' Compatibility extensions are also callable without parentheses.
+Public Extension Function Count(recv As Dictionary) As Integer
+    Return recv.KeyCount
+End Function
+
+Public Extension Sub Clear(recv As Dictionary)
+    recv.RemoveAll()
+End Sub
+
+Public Extension Function IsNull(recv As Variant) As Boolean
+    If recv = Nil Then Return True
+    If recv.IsNil() Then Return True
+    If recv.IsObject() Then Return recv.AsObject().Value = Nil
+    Return False
+End Function
+
+' Strict, locale-independent decimal grammar; reject libc's NaN/Inf/hex forms.
+Private Function DataDecimalText(text As String) As String
+    Dim s As String = String.Trim(text)
+    Dim i As Integer = 0
+    Dim n As Integer = s.Len()
+    If n = 0 Then Throw New TypeMismatchException("Empty numeric string")
+    If s.Substring(i, 1) = "+" Or s.Substring(i, 1) = "-" Then i += 1
+    Dim digits As Integer = 0
+    While i < n
+        Dim ch As String = s.Substring(i, 1)
+        If ch < "0" Or ch > "9" Then Exit While
+        digits += 1
+        i += 1
+    End While
+    If i < n Then
+        If s.Substring(i, 1) = "." Then
+            i += 1
+            While i < n
+                Dim ch As String = s.Substring(i, 1)
+                If ch < "0" Or ch > "9" Then Exit While
+                digits += 1
+                i += 1
+            End While
+        End If
+    End If
+    If digits = 0 Then Throw New TypeMismatchException("Not a decimal number")
+    If i < n Then
+        If s.Substring(i, 1) = "e" Then
+            i += 1
+            If i < n Then
+                If s.Substring(i, 1) = "+" Or s.Substring(i, 1) = "-" Then i += 1
+            End If
+            Dim start As Integer = i
+            While i < n
+                Dim ch As String = s.Substring(i, 1)
+                If ch < "0" Or ch > "9" Then Exit While
+                i += 1
+            End While
+            If start = i Then Throw New TypeMismatchException("Missing exponent")
+        End If
+    End If
+    If i <> n Then Throw New TypeMismatchException("Trailing numeric characters")
+    Return s
+End Function
+
+Private Function DataNumberText(text As String) As Double
+    Dim s As String = DataDecimalText(text)
+    Dim parsed As Result Of Double, String = Double.Parse(s)
+    If parsed.IsErr Then Throw New TypeMismatchException(parsed.Error)
+    Dim convertedValue As Double = parsed.Value
+    If convertedValue.IsInfinite() Or convertedValue.IsNotANumber() Then Throw New OverflowException("Non-finite number")
+    Return convertedValue
+End Function
+
+Private Function DataWholeText(text As String) As String
+    Dim s As String = String.LCase(DataDecimalText(text))
+    Dim negative As Boolean = False
+    If s.Left(1) = "-" Or s.Left(1) = "+" Then
+        negative = s.Left(1) = "-"
+        s = s.Substring(1)
+    End If
+    Dim exponent As Integer = 0
+    Dim expAt As Integer = s.IndexOf("e")
+    If expAt >= 0 Then
+        ' Only the exponent uses the saturating parser; clamp before arithmetic.
+        Dim parsed As Result Of Integer, String = Integer.Parse(s.Substring(expAt + 1))
+        If parsed.IsErr Then Throw New TypeMismatchException("Invalid exponent")
+        exponent = parsed.Value
+        If exponent > 1000000 Then exponent = 1000000
+        If exponent < -1000000 Then exponent = -1000000
+        s = s.Left(expAt)
+    End If
+    Dim point As Integer = s.IndexOf(".")
+    Dim wholeDigits As Integer = s.Len()
+    If point >= 0 Then
+        wholeDigits = point
+        s = s.Replace(".", "")
+    End If
+    wholeDigits += exponent
+    If wholeDigits <= 0 Then Return "0"
+    While s.Len() > 0
+        If s.Left(1) <> "0" Then Exit While
+        s = s.Substring(1)
+        wholeDigits -= 1
+    End While
+    If s.Len() = 0 Or wholeDigits <= 0 Then Return "0"
+    If wholeDigits > 20 Then Throw New OverflowException("Integer string overflow")
+    If wholeDigits < s.Len() Then s = s.Left(wholeDigits)
+    While s.Len() < wholeDigits
+        s += "0"
+    End While
+    If negative Then s = "-" + s
+    Return s
+End Function
+
+' Accumulate negatively so -9223372036854775808 remains representable.
+' Integer.Parse saturates on overflow in the installed runtime.
+Private Function DataIntegerText(text As String) As Integer
+    Dim s As String = DataWholeText(text)
+    Dim negative As Boolean = False
+    Dim i As Integer = 0
+    If s.Len() > 0 Then
+        If s.Substring(0, 1) = "-" Then
+            negative = True
+            i = 1
+        ElseIf s.Substring(0, 1) = "+" Then
+            i = 1
+        End If
+    End If
+    If i = s.Len() Then Throw New TypeMismatchException("Missing integer digits")
+    Dim limit As Integer = -9223372036854775807
+    If negative Then limit = Integer.MinValue
+    Dim acc As Integer = 0
+    While i < s.Len()
+        Dim ch As String = s.Substring(i, 1)
+        If ch < "0" Or ch > "9" Then Throw New TypeMismatchException("Not an integer")
+        Dim digit As Integer = String.Asc(ch) - 48
+        If acc < limit \ 10 Then Throw New OverflowException("Integer overflow")
+        acc *= 10
+        If acc < limit + digit Then Throw New OverflowException("Integer overflow")
+        acc -= digit
+        i += 1
+    End While
+    If negative Then Return acc
+    Return -acc
+End Function
+
+Public Extension Function DoubleValue(recv As Variant) As Double
+    If recv.IsNull() Then Return 0.0
+    Select Case recv.Kind
+        Case Variant.KindInteger
+            Return recv.AsInteger().Value
+        Case Variant.KindDouble
+            Return recv.AsDouble().Value
+        Case Variant.KindBoolean
+            Return CType(recv.AsBoolean().Value, Double)
+        Case Variant.KindString
+            Return DataNumberText(recv.AsString().Value)
+        Case Variant.KindInt8
+            Return recv.AsInt8().Value
+        Case Variant.KindInt16
+            Return recv.AsInt16().Value
+        Case Variant.KindInt32
+            Return recv.AsInt32().Value
+        Case Variant.KindInt64
+            Return recv.AsInt64().Value
+        Case Variant.KindUInt8
+            Return recv.AsUInt8().Value
+        Case Variant.KindUInt16
+            Return recv.AsUInt16().Value
+        Case Variant.KindUInt32
+            Return recv.AsUInt32().Value
+        Case Variant.KindUInt64
+            Return recv.AsUInt64().Value
+    End Select
+    Throw New TypeMismatchException("Variant cannot convert to Double")
+End Function
+
+Public Extension Function IntegerValue(recv As Variant) As Integer
+    If recv.IsNull() Then Return 0
+    Select Case recv.Kind
+        Case Variant.KindInteger
+            Return recv.AsInteger().Value
+        Case Variant.KindString
+            Return DataIntegerText(recv.AsString().Value)
+        Case Variant.KindBoolean
+            Return CType(recv.AsBoolean().Value, Integer)
+        Case Variant.KindDouble
+            Return recv.AsDouble().Value
+        Case Variant.KindUInt64
+            Dim raw As UInt64 = recv.AsUInt64().Value
+            If raw > 9223372036854775807 Then Throw New OverflowException("UInt64 exceeds Integer range")
+            Return raw
+        Case Variant.KindInt8
+            Return recv.AsInt8().Value
+        Case Variant.KindInt16
+            Return recv.AsInt16().Value
+        Case Variant.KindInt32
+            Return recv.AsInt32().Value
+        Case Variant.KindInt64
+            Return recv.AsInt64().Value
+        Case Variant.KindUInt8
+            Return recv.AsUInt8().Value
+        Case Variant.KindUInt16
+            Return recv.AsUInt16().Value
+        Case Variant.KindUInt32
+            Return recv.AsUInt32().Value
+    End Select
+    Throw New TypeMismatchException("Variant cannot convert to Integer")
+End Function
+
+Public Extension Function Int64Value(recv As Variant) As Int64
+    Return recv.IntegerValue()
+End Function
+
+Public Extension Function Int32Value(recv As Variant) As Int32
+    Dim n As Integer = recv.IntegerValue()
+    If n < -2147483648 Or n > 2147483647 Then Throw New OverflowException("Int32 overflow")
+    Return n
+End Function
+
+Public Extension Function UInt32Value(recv As Variant) As UInt32
+    Dim n As Integer = recv.IntegerValue()
+    If n < 0 Or n > 4294967295 Then Throw New OverflowException("UInt32 overflow")
+    Return n
+End Function
+
+Public Extension Function UInt64Value(recv As Variant) As UInt64
+    If recv.IsNull() Then Return 0
+    If recv.Kind = Variant.KindUInt64 Then Return recv.AsUInt64().Value
+    If recv.IsString() Then
+        Dim s As String = DataWholeText(recv.AsString().Value)
+        If s.Left(1) = "-" Then Throw New OverflowException("Negative UInt64")
+        Dim acc As UInt64 = 0
+        For i As Integer = 0 To s.Len() - 1
+            Dim digit As Integer = String.Asc(s.Substring(i, 1)) - 48
+            If acc > 1844674407370955161 Then Throw New OverflowException("UInt64 overflow")
+            If acc = 1844674407370955161 And digit > 5 Then Throw New OverflowException("UInt64 overflow")
+            acc = acc * 10 + digit
+        Next
+        Return acc
+    End If
+    If recv.IsDouble() Then
+        ' Destination-specific checked float conversion in the runtime.
+        Return recv.AsDouble().Value
+    End If
+    Dim n As Integer = recv.IntegerValue()
+    If n < 0 Then Throw New OverflowException("Negative UInt64")
+    Return n
+End Function
+
+Public Extension Function BooleanValue(recv As Variant) As Boolean
+    If recv.IsNull() Then Return False
+    If recv.IsBoolean() Then Return recv.AsBoolean().Value
+    If recv.IsString() Then
+        Dim text As String = String.Trim(recv.AsString().Value)
+        If text = "True" Then Return True
+        If text = "False" Then Return False
+    End If
+    Return recv.DoubleValue() <> 0.0
+End Function
+
+Public Extension Function ObjectValue(recv As Variant) As Object
+    If recv.IsNull() Then Return Nil
+    If recv.IsObject() Then Return recv.AsObject().Value
+    Throw New TypeMismatchException("Variant does not contain an object")
+End Function
+
+Public Extension Function IsNumeric(recv As Variant) As Boolean
+    If recv.IsNull() Then Return False
+    If recv.IsObject() Then Return False
+    If recv.IsBoolean() Then Return False
+    If recv.IsString() Then
+        Try
+            Dim number As Double = DataNumberText(recv.AsString().Value)
+            Return True
+        Catch e As TypeMismatchException
+            Return False
+        Catch e As OverflowException
+            Return False
+        End Try
+    End If
+    Return True
+End Function
+
+Public Extension Function SingleValue(recv As Variant) As Single
+    Dim n As Double = recv.DoubleValue()
+    If Not n.IsInfinite() And Not n.IsNotANumber() Then
+        If Math.Abs(n) > 3.4028234663852886e38 Then Throw New OverflowException("Single overflow")
+    End If
+    Return CType(n, Single)
+End Function
+
+Private Function DataCurrencyText(text As String) As Currency
+    Dim s As String = String.LCase(DataDecimalText(text))
+    Dim negative As Boolean = s.Left(1) = "-"
+    If s.Left(1) = "-" Or s.Left(1) = "+" Then s = s.Substring(1)
+    Dim exponent As Integer = 0
+    Dim expAt As Integer = s.IndexOf("e")
+    If expAt >= 0 Then
+        exponent = Integer.Parse(s.Substring(expAt + 1)).Value
+        If exponent > 1000000 Then exponent = 1000000
+        If exponent < -1000000 Then exponent = -1000000
+        s = s.Left(expAt)
+    End If
+    Dim point As Integer = s.IndexOf(".")
+    Dim places As Integer = s.Len()
+    If point >= 0 Then
+        places = point
+        s = s.Replace(".", "")
+    End If
+    places += exponent + 4
+    While s.Len() > 0 And s.Left(1) = "0"
+        s = s.Substring(1)
+        places -= 1
+    End While
+    If s.Len() = 0 Then Return Currency.Zero
+    ' Round half-away from zero using the first discarded decimal digit.
+    Dim roundUp As Boolean = False
+    If places >= 0 And places < s.Len() Then roundUp = s.Substring(places, 1) >= "5"
+    Dim units As String = "0"
+    If places > 0 Then
+        units = s
+        If places < s.Len() Then units = s.Left(places)
+        While units.Len() < places
+            If units.Len() > 25 Then Throw New OverflowException("Currency overflow")
+            units += "0"
+        End While
+    End If
+    If negative Then units = "-" + units
+    Dim raw As Integer = DataIntegerText(units)
+    If roundUp Then
+        If negative Then
+            If raw = Integer.MinValue Then Throw New OverflowException("Currency overflow")
+            raw -= 1
+        Else
+            If raw = Integer.MaxValue Then Throw New OverflowException("Currency overflow")
+            raw += 1
+        End If
+    End If
+    Return Currency.FromMinorUnits(raw)
+End Function
+
+Public Extension Function CurrencyValue(recv As Variant) As Currency
+    If recv.IsNull() Then Return Currency.Zero
+    If recv.IsString() Then
+        Return DataCurrencyText(recv.AsString().Value)
+    End If
+    If recv.IsDouble() Then Return Currency.FromDouble(recv.AsDouble().Value)
+    Return Currency.FromInteger(recv.IntegerValue())
+End Function
+
+Public Extension Function ColorValue(recv As Variant) As Color
+    If recv.IsNull() Then Return Color.Black
+    If recv.IsObject() Then
+        Dim c As Color = TryCast(recv.AsObject().Value, Color)
+        If c IsNot Nil Then Return c
+    End If
+    Throw New TypeMismatchException("Variant does not contain a Color")
+End Function
+
+Public Extension Function PtrValue(recv As Variant) As Ptr
+    If recv.IsNull() Then Return Nil
+    Throw New TypeMismatchException("Foundation Variant has no pointer payload; use ClassicVariant")
+End Function
+
+' A distinct tagged value; the sealed foundation Variant's Kind is never changed.
+Public Class ClassicVariant
+    Private Property mScalar As Variant = Variant.Empty()
+    Private Property mType As Integer = 0
+    Private Property mSingle As Single
+    Private Property mCurrency As Currency = Currency.Zero
+    Private Property mColor As Color
+    Private Property mPtr As Ptr
+    Private Property mDate As ClassicDate
+    Private Property mItems As Array Of ClassicVariant
+    Private Property mElementType As Integer = 0
+
+    Public Shared Function From(value As Integer) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As Double) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As String) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As Boolean) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As Int8) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As Int16) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As Int32) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As Int64) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As UInt8) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As UInt16) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As UInt32) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As UInt64) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function FromObject(value As Object) As ClassicVariant
+        Return ClassicVariant.From(Variant.From(value))
+    End Function
+
+    Public Shared Function From(value As Variant) As ClassicVariant
+        Dim v As New ClassicVariant()
+        If value IsNot Nil Then v.mScalar = value
+        v.mType = v.mScalar.Type()
+        Return v
+    End Function
+
+    Public Shared Function From(value As Single) As ClassicVariant
+        Dim v As New ClassicVariant()
+        v.mSingle = value
+        v.mType = 4
+        Return v
+    End Function
+
+    Public Shared Function From(value As Currency) As ClassicVariant
+        Dim v As New ClassicVariant()
+        v.mCurrency = value
+        v.mType = 6
+        Return v
+    End Function
+
+    Public Shared Function From(value As Color) As ClassicVariant
+        Dim v As New ClassicVariant()
+        v.mColor = value
+        v.mType = 16
+        Return v
+    End Function
+
+    Public Shared Function From(value As Ptr) As ClassicVariant
+        Dim v As New ClassicVariant()
+        v.mPtr = value
+        v.mType = 26
+        Return v
+    End Function
+
+    Public Shared Function From(value As ClassicDate) As ClassicVariant
+        Dim v As New ClassicVariant()
+        If value IsNot Nil Then v.mDate = value.Copy()
+        v.mType = 7
+        Return v
+    End Function
+
+    Public Shared Function From(value As Array Of ClassicVariant) As ClassicVariant
+        Dim v As New ClassicVariant()
+        v.mItems = Array.AsResizable(value)
+        v.mType = 4096
+        Return v
+    End Function
+
+    Public Shared Function From(value As Array Of Integer) As ClassicVariant
+        Dim items As Array Of ClassicVariant = []
+        For Each n As Integer In value
+            items.Append(ClassicVariant.From(Variant.From(n)))
+        Next
+        Dim v As ClassicVariant = ClassicVariant.From(items)
+        v.mElementType = 3
+        v.mType = 4099
+        Return v
+    End Function
+
+    Public Shared Function From(value As Array Of Double) As ClassicVariant
+        Dim items As Array Of ClassicVariant = []
+        For Each n As Double In value
+            items.Append(ClassicVariant.From(Variant.From(n)))
+        Next
+        Dim v As ClassicVariant = ClassicVariant.From(items)
+        v.mElementType = 5
+        v.mType = 4101
+        Return v
+    End Function
+
+    Public Shared Function From(value As Array Of String) As ClassicVariant
+        Dim items As Array Of ClassicVariant = []
+        For Each n As String In value
+            items.Append(ClassicVariant.From(Variant.From(n)))
+        Next
+        Dim v As ClassicVariant = ClassicVariant.From(items)
+        v.mElementType = 8
+        v.mType = 4104
+        Return v
+    End Function
+
+    Public Function Type() As Integer
+        Return mType
+    End Function
+
+    Public Function IsArray() As Boolean
+        Return mType >= 4096
+    End Function
+
+    Public Function ArrayElementType() As Integer
+        If Not IsArray() Then Throw New TypeMismatchException("Not an array")
+        Return mElementType
+    End Function
+
+    Public Function ArrayValue() As Array Of ClassicVariant
+        If Not IsArray() Then Throw New TypeMismatchException("Not an array")
+        Return Array.AsResizable(mItems)
+    End Function
+
+    Public Function IntegerArrayValue() As Array Of Integer
+        If Not IsArray() Then Throw New TypeMismatchException("Not an array")
+        Dim convertedItems As Array Of Integer = []
+        For Each item As ClassicVariant In mItems
+            convertedItems.Append(item.IntegerValue())
+        Next
+        Return convertedItems
+    End Function
+
+    Public Function DoubleArrayValue() As Array Of Double
+        If Not IsArray() Then Throw New TypeMismatchException("Not an array")
+        Dim convertedItems As Array Of Double = []
+        For Each item As ClassicVariant In mItems
+            convertedItems.Append(item.DoubleValue())
+        Next
+        Return convertedItems
+    End Function
+
+    Public Function StringArrayValue() As Array Of String
+        If Not IsArray() Then Throw New TypeMismatchException("Not an array")
+        Dim convertedItems As Array Of String = []
+        For Each item As ClassicVariant In mItems
+            convertedItems.Append(item.StringValue())
+        Next
+        Return convertedItems
+    End Function
+
+    Public Function IsNull() As Boolean
+        If mType = 0 Then Return True
+        If mType = 16 Then Return mColor Is Nil
+        If mType = 26 Then Return mPtr = Nil
+        If mType = 7 Then Return mDate Is Nil
+        If mType = 9 Then Return mScalar.IsNull()
+        Return False
+    End Function
+
+    Public Function IsNumeric() As Boolean
+        If mType = 4 Or mType = 6 Then Return True
+        If IsArray() Or mType = 7 Or mType = 16 Or mType = 26 Then Return False
+        Return mScalar.IsNumeric()
+    End Function
+
+    Public Function ObjectValue() As Object
+        Return ToVariant().ObjectValue()
+    End Function
+
+    Public Function Int64Value() As Int64
+        Return IntegerValue()
+    End Function
+
+    Public Function Int32Value() As Int32
+        Return Variant.From(IntegerValue()).Int32Value()
+    End Function
+
+    Public Function UInt32Value() As UInt32
+        Return Variant.From(IntegerValue()).UInt32Value()
+    End Function
+
+    Public Function UInt64Value() As UInt64
+        If mType = 4 Then Return Variant.From(DoubleValue()).UInt64Value()
+        If mType = 6 Then
+            Dim n As Integer = IntegerValue()
+            If n < 0 Then Throw New OverflowException("Negative UInt64")
+            Return n
+        End If
+        Return ToVariant().UInt64Value()
+    End Function
+
+    Public Function DoubleValue() As Double
+        If mType = 4 Then Return mSingle
+        If mType = 6 Then Return mCurrency.ToDouble()
+        If mType = 7 Then
+            If mDate Is Nil Then Return 0.0
+            Return mDate.TotalSeconds
+        End If
+        Return ToVariant().DoubleValue()
+    End Function
+
+    Public Function IntegerValue() As Integer
+        If mType = 4 Then Return CType(mSingle, Integer)
+        If mType = 7 Then Return DoubleValue()
+        If mType = 6 Then Return mCurrency.ToMinorUnits() \ 10000
+        Return ToVariant().IntegerValue()
+    End Function
+
+    Public Function SingleValue() As Single
+        If mType = 4 Then Return mSingle
+        Return Variant.From(DoubleValue()).SingleValue()
+    End Function
+
+    Public Function CurrencyValue() As Currency
+        If mType = 6 Then Return mCurrency
+        If mType = 4 Then Return Currency.FromDouble(mSingle)
+        Return ToVariant().CurrencyValue()
+    End Function
+
+    Public Function ColorValue() As Color
+        If mType = 16 Then Return mColor
+        Return ToVariant().ColorValue()
+    End Function
+
+    Public Function PtrValue() As Ptr
+        If IsNull() Then Return Nil
+        If mType <> 26 Then Throw New TypeMismatchException("Not a pointer")
+        Return mPtr
+    End Function
+
+    Public Function DateValue() As ClassicDate
+        If IsNull() Then Return Nil
+        If mType <> 7 Then Throw New TypeMismatchException("Not a ClassicDate")
+        Return mDate.Copy()
+    End Function
+
+    Public Function BooleanValue() As Boolean
+        If mType = 4 Or mType = 6 Or mType = 7 Then Return DoubleValue() <> 0.0
+        Return ToVariant().BooleanValue()
+    End Function
+
+    Public Function StringValue() As String
+        If mType = 4 Then Return String.From(mSingle)
+        If mType = 6 Then Return String.From(mCurrency)
+        If mType = 7 Then
+            If mDate Is Nil Then Return ""
+            Return mDate.SQLDateTime
+        End If
+        If mScalar.Kind = Variant.KindUInt64 Then Return mScalar.AsUInt64().Value.ToString()
+        Return ToVariant().StringValue()
+    End Function
+
+    Public Function ToVariant() As Variant
+        Select Case mType
+            Case 4, 6, 7, 16, 26
+                Throw New TypeMismatchException("Foundation Variant cannot preserve this ClassicVariant payload kind")
+        End Select
+        If IsArray() Then Throw New TypeMismatchException("Foundation Variant cannot preserve an array payload")
+        Return mScalar
+    End Function
+
+    Public Operator CType() As Integer
+        Return IntegerValue()
+    End Operator
+    Public Operator CType() As Double
+        Return DoubleValue()
+    End Operator
+    Public Operator CType() As String
+        Return StringValue()
+    End Operator
+    Public Operator CType() As Boolean
+        Return BooleanValue()
+    End Operator
+    Public Operator CType() As Ptr
+        Return PtrValue()
+    End Operator
+    Public Operator CType() As ClassicDate
+        Return DateValue()
+    End Operator
+    Public Operator CType() As Color
+        Return ColorValue()
+    End Operator
+    Public Operator CType() As Variant
+        Return ToVariant()
+    End Operator
+End Class
+
+' Mutable Date adapter: rewrite source Date types/construction to ClassicDate.
+Public Class ClassicDate
+    Private Property mValue As DateTime
+
+    Public Sub Constructor()
+        mValue = DateTime.Now()
+    End Sub
+
+    Public Sub Constructor(copyDate As ClassicDate)
+        If copyDate = Nil Then Throw New InvalidArgumentException("Nil Date copy")
+        mValue = copyDate.ToDateTime()
+    End Sub
+
+    Public Sub Constructor(year As Integer, month As Integer = 1, day As Integer = 1, hour As Integer = 0, minute As Integer = 0, second As Integer = 0)
+        mValue = Normalize(year, month, day, hour, minute, second, TimeZone.Local)
+    End Sub
+
+    Public Sub Constructor(year As Integer, month As Integer, day As Integer, hour As Integer, minute As Integer, second As Integer, gmtOffset As Double)
+        mValue = Normalize(year, month, day, hour, minute, second, OffsetZone(gmtOffset))
+    End Sub
+
+    Public Sub Constructor(source As DateTime)
+        If source = Nil Then Throw New InvalidArgumentException("Nil DateTime")
+        CheckRange(source)
+        mValue = source
+    End Sub
+
+    ' Compare local civil TotalSeconds; CompareInstant explicitly compares UTC instants.
+    Public Function Compare(other As ClassicDate) As Integer
+        If other Is Nil Then Throw New InvalidArgumentException("Nil Date comparison")
+        If TotalSeconds < other.TotalSeconds Then Return -1
+        If TotalSeconds > other.TotalSeconds Then Return 1
+        Return 0
+    End Function
+
+    Public Function CompareInstant(other As ClassicDate) As Integer
+        If other Is Nil Then Throw New InvalidArgumentException("Nil Date comparison")
+        If mValue.SecondsFrom1970 < other.mValue.SecondsFrom1970 Then Return -1
+        If mValue.SecondsFrom1970 > other.mValue.SecondsFrom1970 Then Return 1
+        Return 0
+    End Function
+
+    Public Operator =(other As ClassicDate) As Boolean
+        If other Is Nil Then Return False
+        Return Compare(other) = 0
+    End Operator
+
+    Public Operator <>(other As ClassicDate) As Boolean
+        If other Is Nil Then Return True
+        Return Compare(other) <> 0
+    End Operator
+
+    Public Operator <(other As ClassicDate) As Boolean
+        Return Compare(other) < 0
+    End Operator
+
+    Public Operator <=(other As ClassicDate) As Boolean
+        Return Compare(other) <= 0
+    End Operator
+
+    Public Operator >(other As ClassicDate) As Boolean
+        Return Compare(other) > 0
+    End Operator
+
+    Public Operator >=(other As ClassicDate) As Boolean
+        Return Compare(other) >= 0
+    End Operator
+
+    Public Function Copy() As ClassicDate
+        Return New ClassicDate(Me)
+    End Function
+
+    ' One atomic calendar rebuild; milliseconds are discarded, as with component setters.
+    Public Sub AddCalendar(years As Integer = 0, months As Integer = 0, days As Integer = 0)
+        If years < -10000 Or years > 10000 Or months < -120000 Or months > 120000 Or days < -3660000 Or days > 3660000 Then Throw New InvalidArgumentException("Calendar delta exceeds limits")
+        mValue = Normalize(Year + years, Month + months, Day + days, Hour, Minute, Second, mValue.TimeZone)
+    End Sub
+
+    Public ReadOnly Property DaysInMonth As Integer
+        Get
+            Select Case Month
+                Case 4, 6, 9, 11
+                    Return 30
+                Case 2
+                    If IsLeapYear Then Return 29
+                    Return 28
+            End Select
+            Return 31
+        End Get
+    End Property
+
+    Public ReadOnly Property IsLeapYear As Boolean
+        Get
+            Return Year Mod 4 = 0 And (Year Mod 100 <> 0 Or Year Mod 400 = 0)
+        End Get
+    End Property
+
+    Public Function FormatDate(dateStyle As DateTime.Formats, timeStyle As DateTime.Formats, loc As Locale) As String
+        If loc Is Nil Then Throw New InvalidArgumentException("Date formatting requires a locale")
+        Return mValue.ToString(dateStyle, timeStyle, loc)
+    End Function
+
+    Public Function FormatDate(pattern As String, loc As Locale) As String
+        If loc Is Nil Then Throw New InvalidArgumentException("Date formatting requires a locale")
+        Return mValue.ToString(pattern, loc)
+    End Function
+
+    Public ReadOnly Property ShortDate As String
+        Get
+            Return FormatDate(DateTime.Formats.Short, DateTime.Formats.None, DataDateLocale())
+        End Get
+    End Property
+    Public ReadOnly Property LongDate As String
+        Get
+            Return FormatDate(DateTime.Formats.Long, DateTime.Formats.None, DataDateLocale())
+        End Get
+    End Property
+    Public ReadOnly Property ShortTime As String
+        Get
+            Return FormatDate(DateTime.Formats.None, DateTime.Formats.Short, DataDateLocale())
+        End Get
+    End Property
+    Public ReadOnly Property LongTime As String
+        Get
+            Return FormatDate(DateTime.Formats.None, DateTime.Formats.Long, DataDateLocale())
+        End Get
+    End Property
+
+    Public Function ToDateTime() As DateTime
+        Return mValue
+    End Function
+
+    Private Function OffsetZone(hours As Double) As TimeZone
+        If hours.IsInfinite() Or hours.IsNotANumber() Then Throw New InvalidArgumentException("Non-finite GMTOffset")
+        Dim seconds As Double = hours * 3600.0
+        If seconds < -64800.0 Or seconds > 64800.0 Then Throw New InvalidArgumentException("GMTOffset exceeds 18 hours")
+        If Math.Abs(seconds - Math.Round(seconds)) > 0.000001 Then Throw New InvalidArgumentException("GMTOffset must be whole seconds")
+        Dim wholeSeconds As Integer = Math.Round(seconds)
+        Return TimeZone.FromOffsetSeconds(wholeSeconds)
+    End Function
+
+    Private Sub CheckRange(dt As DateTime)
+        If dt.Year < 1601 Or dt.Year > 9999 Then Throw New InvalidArgumentException("ClassicDate supports years 1601 through 9999")
+    End Sub
+
+    ' Resolve civil time using candidate offsets on both sides of a transition.
+    ' Reject gaps and folds rather than accepting an OS-dependent DST guess.
+    Private Function Resolve(wall As DateTime, zone As TimeZone) As DateTime
+        CheckRange(wall)
+        Dim offsets As Array Of Integer = []
+        For stepDay As Integer = -2 To 2
+            Dim probe As DateTime = wall + TimeInterval.FromDays(stepDay)
+            Dim offset As Integer = zone.OffsetFromUtc(probe).TotalSeconds
+            If offsets.IndexOf(offset) < 0 Then offsets.Append(offset)
+        Next
+        Dim found As DateTime = Nil
+        For Each offset As Integer In offsets
+            Dim candidate As DateTime = DateTime.FromSecondsFrom1970(wall.SecondsFrom1970 - offset, zone)
+            If candidate.Year = wall.Year And candidate.Month = wall.Month And candidate.Day = wall.Day And candidate.Hour = wall.Hour And candidate.Minute = wall.Minute And candidate.Second = wall.Second And candidate.Millisecond = wall.Millisecond Then
+                If found <> Nil Then Throw New InvalidArgumentException("Ambiguous local time during DST fold; use explicit GMTOffset")
+                found = candidate
+            End If
+        Next
+        If found = Nil Then Throw New InvalidArgumentException("Nonexistent local time during DST gap")
+        Return found
+    End Function
+
+    Private Function Normalize(year As Integer, month As Integer, day As Integer, hour As Integer, minute As Integer, second As Integer, zone As TimeZone) As DateTime
+        ' Bound arithmetic before multiplying; still permits broad rollovers.
+        If year < 1601 Or year > 9999 Or month < -120000 Or month > 120000 Or day < -3660000 Or day > 3660000 Or hour < -24000000 Or hour > 24000000 Or minute < -1440000000 Or minute > 1440000000 Or second < -86400000000 Or second > 86400000000 Then
+            Throw New InvalidArgumentException("Date components exceed normalization limits")
+        End If
+        Dim monthIndex As Integer = month - 1
+        Dim yearDelta As Integer = Math.Floor(monthIndex / 12.0)
+        Dim y As Integer = year + yearDelta
+        Dim mo As Integer = monthIndex - yearDelta * 12 + 1
+        If y < 1601 Or y > 9999 Then Throw New InvalidArgumentException("Normalized year outside range")
+        Dim start As DateTime = DateTime.FromComponents(y, mo, 1)
+        Dim seconds As Integer = (day - 1) * 86400 + hour * 3600 + minute * 60 + second
+        Dim wall As DateTime = start + TimeInterval.FromSeconds(seconds)
+        Return Resolve(wall, zone)
+    End Function
+
+    Public Property Year As Integer
+        Get
+            Return mValue.Year
+        End Get
+        Set
+            mValue = Normalize(value, mValue.Month, mValue.Day, mValue.Hour, mValue.Minute, mValue.Second, mValue.TimeZone)
+        End Set
+    End Property
+
+    Public Property Month As Integer
+        Get
+            Return mValue.Month
+        End Get
+        Set
+            mValue = Normalize(mValue.Year, value, mValue.Day, mValue.Hour, mValue.Minute, mValue.Second, mValue.TimeZone)
+        End Set
+    End Property
+
+    Public Property Day As Integer
+        Get
+            Return mValue.Day
+        End Get
+        Set
+            mValue = Normalize(mValue.Year, mValue.Month, value, mValue.Hour, mValue.Minute, mValue.Second, mValue.TimeZone)
+        End Set
+    End Property
+
+    Public Property Hour As Integer
+        Get
+            Return mValue.Hour
+        End Get
+        Set
+            mValue = Normalize(mValue.Year, mValue.Month, mValue.Day, value, mValue.Minute, mValue.Second, mValue.TimeZone)
+        End Set
+    End Property
+
+    Public Property Minute As Integer
+        Get
+            Return mValue.Minute
+        End Get
+        Set
+            mValue = Normalize(mValue.Year, mValue.Month, mValue.Day, mValue.Hour, value, mValue.Second, mValue.TimeZone)
+        End Set
+    End Property
+
+    Public Property Second As Integer
+        Get
+            Return mValue.Second
+        End Get
+        Set
+            mValue = Normalize(mValue.Year, mValue.Month, mValue.Day, mValue.Hour, mValue.Minute, value, mValue.TimeZone)
+        End Set
+    End Property
+
+    Public ReadOnly Property DayOfWeek As Integer
+        Get
+            Return mValue.DayOfWeek
+        End Get
+    End Property
+
+    Public ReadOnly Property DayOfYear As Integer
+        Get
+            Return mValue.DayOfYear
+        End Get
+    End Property
+
+    Public ReadOnly Property WeekOfYear As Integer
+        Get
+            Dim jan1 As DateTime = DateTime.FromComponents(Year, 1, 1)
+            Return (DayOfYear + jan1.DayOfWeek - 2) \ 7 + 1
+        End Get
+    End Property
+
+    Public ReadOnly Property IsDaylightSavingsTime As Boolean
+        Get
+            Return mValue.IsDst
+        End Get
+    End Property
+
+    Public Property GMTOffset As Double
+        Get
+            Return mValue.TimeZone.OffsetFromUtc(mValue).TotalHours
+        End Get
+        Set
+            Dim converted As DateTime = mValue.ToTimeZone(OffsetZone(value))
+            CheckRange(converted)
+            mValue = converted
+        End Set
+    End Property
+
+    ' Legacy documented local-civil 1904 epoch, not the Unix UTC timestamp.
+    Public Property TotalSeconds As Double
+        Get
+            Return mValue.SecondsFrom1970 + mValue.TimeZone.OffsetFromUtc(mValue).TotalSeconds + 2082844800.0
+        End Get
+        Set
+            If value.IsInfinite() Or value.IsNotANumber() Or value < -9561628800.0 Or value >= 255485145600.0 Then Throw New InvalidArgumentException("TotalSeconds outside supported calendar")
+            Dim wall As DateTime = DateTime.FromSecondsFrom1970(value - 2082844800.0, TimeZone.Utc)
+            mValue = Resolve(wall, mValue.TimeZone)
+        End Set
+    End Property
+
+    Private Function Pad(n As Integer, width As Integer) As String
+        Dim convertedValue As String = String.From(n)
+        While convertedValue.Len() < width
+            convertedValue = "0" + convertedValue
+        End While
+        Return convertedValue
+    End Function
+
+    Public Property SQLDate As String
+        Get
+            Return Pad(Year, 4) + "-" + Pad(Month, 2) + "-" + Pad(Day, 2)
+        End Get
+        Set
+            SetSQL(value, False)
+        End Set
+    End Property
+
+    Public Property SQLDateTime As String
+        Get
+            Return SQLDate + " " + Pad(Hour, 2) + ":" + Pad(Minute, 2) + ":" + Pad(Second, 2)
+        End Get
+        Set
+            SetSQL(value, True)
+        End Set
+    End Property
+
+    Private Sub SetSQL(text As String, includeTime As Boolean)
+        Dim expected As Integer = 10
+        If includeTime Then expected = 19
+        If text.Len() <> expected Then Throw New UnsupportedFormatException("Expected SQL date format")
+        For i As Integer = 0 To expected - 1
+            Dim ch As String = text.Substring(i, 1)
+            Select Case i
+                Case 4, 7
+                    If ch <> "-" Then Throw New UnsupportedFormatException("Expected date separator")
+                Case 10
+                    If ch <> " " Then Throw New UnsupportedFormatException("Expected time separator")
+                Case 13, 16
+                    If ch <> ":" Then Throw New UnsupportedFormatException("Expected time separator")
+                Case Else
+                    If ch < "0" Or ch > "9" Then Throw New UnsupportedFormatException("Expected date digit")
+            End Select
+        Next
+        Dim y As Integer = DataIntegerText(text.Substring(0, 4))
+        Dim mo As Integer = DataIntegerText(text.Substring(5, 2))
+        Dim d As Integer = DataIntegerText(text.Substring(8, 2))
+        Dim h As Integer = Hour
+        Dim mi As Integer = Minute
+        Dim sec As Integer = Second
+        If includeTime Then
+            h = DataIntegerText(text.Substring(11, 2))
+            mi = DataIntegerText(text.Substring(14, 2))
+            sec = DataIntegerText(text.Substring(17, 2))
+        End If
+        Try
+            ' SQL input is strict, unlike component setters.
+            Dim wall As DateTime = DateTime.FromComponents(y, mo, d, h, mi, sec)
+            mValue = Resolve(wall, mValue.TimeZone)
+        Catch e As InvalidArgumentException
+            Throw New UnsupportedFormatException(e.Message)
+        End Try
+    End Sub
+End Class

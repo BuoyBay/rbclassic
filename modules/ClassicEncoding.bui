@@ -1,0 +1,114 @@
+' Strict, byte-oriented historical codecs. No Nil-encoded String emulation.
+Import RBFoundation
+
+Public Class ClassicEncoding
+    Private Property mTable As Array Of Integer
+    Public Sub Constructor(encodingName As String)
+        If String.Compare(encodingName, "MacRoman", True) = 0 Then
+            ' https://www.unicode.org/Public/MAPPINGS/VENDORS/APPLE/ROMAN.TXT
+            ' Source SHA256 18e571645be895e9553ed5c842ea8f65f9c5d3c9ccb43e66e0c33a132ed0d721
+            Me.mTable = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 196, 197, 199, 201, 209, 214, 220, 225, 224, 226, 228, 227, 229, 231, 233, 232, 234, 235, 237, 236, 238, 239, 241, 243, 242, 244, 246, 245, 250, 249, 251, 252, 8224, 176, 162, 163, 167, 8226, 182, 223, 174, 169, 8482, 180, 168, 8800, 198, 216, 8734, 177, 8804, 8805, 165, 181, 8706, 8721, 8719, 960, 8747, 170, 186, 937, 230, 248, 191, 161, 172, 8730, 402, 8776, 8710, 171, 187, 8230, 160, 192, 195, 213, 338, 339, 8211, 8212, 8220, 8221, 8216, 8217, 247, 9674, 255, 376, 8260, 8364, 8249, 8250, 64257, 64258, 8225, 183, 8218, 8222, 8240, 194, 202, 193, 203, 200, 205, 206, 207, 204, 211, 212, 63743, 210, 218, 219, 217, 305, 710, 732, 175, 728, 729, 730, 184, 733, 731, 711]
+        ElseIf String.Compare(encodingName, "ISOLatin2", True) = 0 Then
+            ' https://www.unicode.org/Public/MAPPINGS/ISO8859/8859-2.TXT
+            ' Source SHA256 020946e114335b17e7d29fe8a8449786cffed714cf409b11d0b3a375197188d1
+            Me.mTable = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 260, 728, 321, 164, 317, 346, 167, 168, 352, 350, 356, 377, 173, 381, 379, 176, 261, 731, 322, 180, 318, 347, 711, 184, 353, 351, 357, 378, 733, 382, 380, 340, 193, 194, 258, 196, 313, 262, 199, 268, 201, 280, 203, 282, 205, 206, 270, 272, 323, 327, 211, 212, 336, 214, 215, 344, 366, 218, 368, 220, 221, 354, 223, 341, 225, 226, 259, 228, 314, 263, 231, 269, 233, 281, 235, 283, 237, 238, 271, 273, 324, 328, 243, 244, 337, 246, 247, 345, 367, 250, 369, 252, 253, 355, 729]
+        ElseIf String.Compare(encodingName, "DOSLatinUS", True) = 0 Then
+            ' https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP437.TXT
+            ' Source SHA256 6bad4dabcdf5940227c7d81fab130dcb18a77850b5d79de28b5dc4e047b0aaac
+            Me.mTable = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 199, 252, 233, 226, 228, 224, 229, 231, 234, 235, 232, 239, 238, 236, 196, 197, 201, 230, 198, 244, 246, 242, 251, 249, 255, 214, 220, 162, 163, 165, 8359, 402, 225, 237, 243, 250, 241, 209, 170, 186, 191, 8976, 172, 189, 188, 161, 171, 187, 9617, 9618, 9619, 9474, 9508, 9569, 9570, 9558, 9557, 9571, 9553, 9559, 9565, 9564, 9563, 9488, 9492, 9524, 9516, 9500, 9472, 9532, 9566, 9567, 9562, 9556, 9577, 9574, 9568, 9552, 9580, 9575, 9576, 9572, 9573, 9561, 9560, 9554, 9555, 9579, 9578, 9496, 9484, 9608, 9604, 9612, 9616, 9600, 945, 223, 915, 960, 931, 963, 181, 964, 934, 920, 937, 948, 8734, 966, 949, 8745, 8801, 177, 8805, 8804, 8992, 8993, 247, 8776, 176, 8729, 183, 8730, 8319, 178, 9632, 160]
+        Else
+            Throw New UnsupportedFormatException("Unsupported historical encoding: " + encodingName)
+        End If
+    End Sub
+
+    ' Decodes to UTF-8 Bytes; preserves U+0000 without constructing a String.
+    Public Function DecodeBytes(raw As Bytes) As Bytes
+        If raw = Nil Then Throw New NilObjectException("Encoding bytes are Nil")
+        Dim output As New Bytes
+        For i As Integer = 0 To raw.Count - 1
+            Dim cp As Integer = Me.mTable(raw.Item(i))
+            If cp < 128 Then
+                output.Append(cp)
+            ElseIf cp < 2048 Then
+                output.Append(192 + cp \ 64)
+                output.Append(128 + cp Mod 64)
+            Else
+                output.Append(224 + cp \ 4096)
+                output.Append(128 + (cp \ 64) Mod 64)
+                output.Append(128 + cp Mod 64)
+            End If
+        Next
+        Return output
+    End Function
+
+    Public Function Decode(raw As Bytes) As String
+        Dim utf8 As Bytes = Me.DecodeBytes(raw)
+        For i As Integer = 0 To utf8.Count - 1
+            If utf8.Item(i) = 0 Then Throw New UnsupportedFormatException("U+0000 cannot be preserved by String; use DecodeBytes")
+        Next
+        Return utf8.ToString(Text.Encodings.UTF8)
+    End Function
+
+    ' Strict UTF-8 input, including embedded NUL. No substitution or normalization.
+    Public Function EncodeBytes(utf8 As Bytes) As Bytes
+        If utf8 = Nil Then Throw New NilObjectException("Encoding bytes are Nil")
+        Dim output As New Bytes
+        Dim i As Integer = 0
+        While i < utf8.Count
+            Dim cp As Integer = utf8.Item(i)
+            Dim width As Integer = 1
+            Dim minimum As Integer = 0
+            If cp >= 194 And cp <= 223 Then
+                cp = cp - 192
+                width = 2
+                minimum = 128
+            ElseIf cp >= 224 And cp <= 239 Then
+                cp = cp - 224
+                width = 3
+                minimum = 2048
+            ElseIf cp >= 240 And cp <= 244 Then
+                cp = cp - 240
+                width = 4
+                minimum = 65536
+            ElseIf cp >= 128 Then
+                Throw New EncodingException("Invalid UTF-8 lead byte")
+            End If
+            If i + width > utf8.Count Then Throw New EncodingException("Incomplete UTF-8 sequence")
+            For offset As Integer = 1 To width - 1
+                Dim tail As Integer = utf8.Item(i + offset)
+                If tail < 128 Or tail > 191 Then Throw New EncodingException("Invalid UTF-8 continuation")
+                cp = cp * 64 + tail - 128
+            Next
+            If cp < minimum Or cp > 1114111 Or (cp >= 55296 And cp <= 57343) Then
+                Throw New EncodingException("Invalid UTF-8 scalar")
+            End If
+            Dim found As Integer = -1
+            For index As Integer = 0 To 255
+                If Me.mTable(index) = cp Then
+                    found = index
+                    Exit For
+                End If
+            Next
+            If found < 0 Then Throw New EncodingException("Character is not representable in historical encoding")
+            output.Append(found)
+            i = i + width
+        End While
+        Return output
+    End Function
+
+    Public Function Encode(value As String) As Bytes
+        Return Me.EncodeBytes(Bytes.FromString(value, Text.Encodings.UTF8))
+    End Function
+End Class
+
+Public Class ClassicEncodings
+    Public Shared Function MacRoman() As ClassicEncoding
+        Return New ClassicEncoding("MacRoman")
+    End Function
+    Public Shared Function ISOLatin2() As ClassicEncoding
+        Return New ClassicEncoding("ISOLatin2")
+    End Function
+    Public Shared Function DOSLatinUS() As ClassicEncoding
+        Return New ClassicEncoding("DOSLatinUS")
+    End Function
+End Class
