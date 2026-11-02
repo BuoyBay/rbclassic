@@ -2,6 +2,6 @@
   "schema": 1,
   "name": "rbclassic",
   "version": "0.1.0",
-  "description": "REALbasic-compatible API 1 adapters and readable aliases over Buoy",
+  "description": "Use REALbasic-compatible adapters including ClassicCanvas and View-based containers",
   "libraries": []
 }
