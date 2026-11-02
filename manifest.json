@@ -2,6 +2,6 @@
   "schema": 1,
   "name": "rbclassic",
   "version": "0.1.0",
-  "description": "REALbasic adapters \u2014 ClassicCanvas, View containers",
+  "description": "ClassicCanvas and RB adapters",
   "libraries": []
 }
