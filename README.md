@@ -1,4 +1,4 @@
-# Use REALbasic-compatible adapters including ClassicCanvas and View-based containers
+# REALbasic adapters — ClassicCanvas, View containers
 
 RBClassic helps port legacy RB desktop code. It adds
 classic member names and checked behavior over ClassicCanvas, View-based ClassicContainerControl, existing native controls, and ProcessKit. It is a supported subset with
