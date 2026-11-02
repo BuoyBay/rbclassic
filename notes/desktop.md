@@ -2,8 +2,7 @@
 
 Module: `modules/ClassicDesktop.bui`. It imports `Xojo` for
 the shim foundation and `ClassicListNative`, which imports only `Xojo`, so there is no
-cycle. That second import exists for the focused-list key routing below. Test:
-`tests/classic_desktop_test.bui`, run on Linux by `tests/classic_desktop_verify.py`.
+cycle. That second import exists for the focused-list key routing below.
 
 ## Source rewrite
 
@@ -35,7 +34,7 @@ Globals need a selective import. The full list for the entry module:
 Public Import ClassicDesktop.{ ClassicQuit, ClassicCloseWindowsForQuit, ClassicExitCode, ClassicAddPage, ClassicAddTab, ClassicRegisterPanelPage, ClassicSetCallbackErrorHandler, ClassicHasFocus, ClassicEditCommandEnabled, ClassicPerformEditCommand, ClassicAddEditMenuItems, ClassicOpenDocuments, ClassicDefaultButtonCount, ClassicPanelPageCount }
 ```
 
-New this wave: `ClassicExitCode`, `ClassicSetCallbackErrorHandler`, `ClassicHasFocus`,
+Additional APIs: `ClassicExitCode`, `ClassicSetCallbackErrorHandler`, `ClassicHasFocus`,
 `ClassicEditCommandEnabled`, `ClassicPerformEditCommand`, `ClassicAddEditMenuItems`,
 `ClassicOpenDocuments`, `ClassicDefaultButtonCount`, `ClassicPanelPageCount`.
 `ClassicQuit` gained an optional `exitCode` parameter; existing `ClassicQuit()` calls
@@ -53,15 +52,13 @@ Extension names, which can collide with other modules:
 - `TextField` and `TextArea`: `SelStart`, `SelLength`, `SelText` (each get and set), `SelectAll`, `Copy`, `Paste`, `Cut` (new).
 
 No native libraries are staged. Every binding is a `Declare`/`Optional Declare` to
-system libraries (GTK 4, user32/kernel32/imm32, AppKit/objc). The test needs only
-the Xojo package and its bundled dependencies in `packages/`.
+system libraries (GTK 4, user32/kernel32/imm32, AppKit/objc). Stage the Xojo package and its bundled dependencies in `packages/`.
 
 ## What works, by platform
 
-"Verified" means the behavior test ran on that platform. The **current** suite
-(128 checks) was executed this wave only on Linux x86_64. The Windows and macOS
-entries below come from the earlier 65-check suite, which predates this wave's
-changes. The parent coordinates the foreign reruns.
+The table distinguishes native behavior observed on Linux from older or
+unverified Windows/macOS implementations. Validate the intended host application,
+especially focus, input-method and menu interactions.
 
 | Feature | Linux | Windows | macOS |
 |---|---|---|---|
@@ -84,10 +81,6 @@ changes. The parent coordinates the foreign reruns.
 | `ClassicQuit` / `ClassicCloseWindowsForQuit` | verified | verified earlier | verified earlier |
 | `ClassicQuit(code)` exit code through `Main` | verified (exit 7) | not delivered (see limitations) | implemented, not run |
 | `ClassicOpenDocuments` | verified (synthetic arguments and a real launch argument) | implemented, not run | launch arguments only |
-
-The arm64 Linux, x86_64 Windows and arm64 Windows builds of the current test
-link. They were not run. Both darwin targets were checked with `--check` only;
-this Linux host has no macOS SDK.
 
 Details:
 
@@ -174,9 +167,6 @@ Details:
 11. **CWD-002 (new candidate).** `Window.FocusedControl`, `ClearFocus` and `SetContentView` are documented but missing. The probe reports four errors: the three members plus a follow-on assignment error.
 12. Adding a view that already has a parent with `AddSubview` does not throw. GTK reports `gtk_fixed_put: assertion … failed`, and the view stays where it was.
 
-Candidate repros and evidence: `upstream-issues/classic-wave2-desktop/`. The parent
-reconciles the central index. Independent review is pending.
-
 Core gaps worth adding: `Window` as a drop target and `SetContentView`; window-level
 `ConstructContextualMenu`/`MenuNeedsUpdate` on GTK; an app-level quit veto,
 quit-on-last-window flag and exit code; open-document events; native window
@@ -184,33 +174,3 @@ minimized/maximized events; selection APIs on `TextField`/`TextArea`;
 `FocusedControl` and subview enumeration; a page-by-index accessor on
 `PagePanel`/`TabView`; subview removal; event dispatch that confines exceptions at
 native signal boundaries.
-
-## Checks
-
-- `buoy ClassicDesktop.bui --check --diagnostic-format json`: exit 0 and no errors on all six targets (x86_64/arm64 × linux/darwin/windows). The only warning comes from the installed Xojo package (`XojoDesktop.bui:160`).
-- `tests/classic_desktop_test.bui`: same result on all six targets. Builds link for x86_64-linux, arm64-linux, x86_64-windows and arm64-windows. Darwin cannot link on this host.
-- Linux behavior run, from an isolated temp directory holding the module, test, verifier and `packages/` (the installed Xojo-1.0.0 and its dependency `.buipkg`s):
-
-  ```
-  buoy classic_desktop_test.bui -o test
-  docker run --rm --network none --entrypoint sh -v DIR:/w -w /w buoy:0.72.0-gui \
-    -c "dbus-run-session -- xvfb-run -a -s '-screen 0 1280x1024x24' python3 classic_desktop_verify.py ./test"
-  ```
-
-  The verifier starts Openbox and pins `GTK_IM_MODULE=gtk-im-context-simple`. It runs three processes:
-  1. The contract with a real launch document argument. It must print `PASSED: 128 checks` and exit 7.
-  2. `--callback-abort`: the Minimize exception reaches `UnhandledException` through the deferred rethrow.
-  3. `--action-abort`: the Action exception reaches `UnhandledException` in place, with no crash and no GLib emission error.
-
-  Result: all three passed. All 81 original checks are retained among the 128; the five list-ordering checks are new since the 123-check run.
-- Mutation controls, run on Linux:
-  - Removing the focused-list pass-through fails all five list-ordering checks; removing only the declined-key handler fails the three "declined" checks.
-  - Removing the IME and popover guards fails exactly the two IME checks; the dropdown checks still pass (see "Open dropdowns").
-  - Making the three registries strong fails all five lifetime checks.
-  - Removing the parent precheck is still caught by the post-attach verification and rollback.
-- `ClassicListNative.bui` was checked clean on all six targets. Its own suites were rerun with the gtklifecycle guard linked, as the parent's runner does:
-  - `classic_list_native_verify.py` passed (14 real-input steps);
-  - `classic_controls_test` passed.
-
-  Without the guard, the original and the modified ListNative fail identically (the BUI-007/BUI-103 lifecycle issue).
-- Not done this wave: Windows and macOS execution of the current suite, no GUI work on the shared desktops. Independent review with `buoy-code-reviewer` was not run by this sub-agent, because no subagents were allowed. The parent owns that review.

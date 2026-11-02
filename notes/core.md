@@ -22,9 +22,3 @@ targets unchanged. Its distinct name avoids the native replace-all collision.
 current locale, or an explicitly supplied non-Nil locale. It retains that
 implementation's mask subset and exceptions. It does not replace the existing
 invariant `Xojo.Format`, or claim to fix `CStr`'s precision and locale behavior.
-
-The behavior test covers Unicode positions, search sentinels, first-only
-replacement, empty arrays, element preservation, inclusive bounds and overflow,
-and explicit-locale numeric masks. The module and test passed all six compiler
-targets and Linux execution. The sealed integration test additionally verifies
-generic extensions and ordinary globals through `Import rbclassic`.

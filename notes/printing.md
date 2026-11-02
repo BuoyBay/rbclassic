@@ -1,11 +1,9 @@
 # ClassicPrinting implementation notes
 
-Owned files:
-
 - `modules/ClassicPrinting.bui`
-- `tests/classic_printing_test.bui` and `tests/classic_printing_verify.py`, at the repo root
+- at the repo root
 - this note
-- `upstream-issues/classic-wave2-printing/`
+- the runtime compatibility boundary
 
 ClassicPrinting draws pages as vector PDF through the bundled `pdf` package. A finished document goes to one of three destinations: an in-memory PDF, a CUPS queue (Linux), or a GTK 4 printer chosen in the native print dialog (Linux). The module never reports PDF output as a physical print job.
 
@@ -27,7 +25,7 @@ The only public functions are the three named above.
 
 Dependencies:
 
-- **Package.** `pdf` 2.4.6 ships `libpdf` for all six targets. Every program that imports the module therefore links `libpdf`. That is the parent's decision for the `RBClassic` entry.
+- **Package.** `pdf` 2.4.6 ships `libpdf` for all six targets. Every program that imports the module therefore links `libpdf`. This dependency applies to the `RBClassic` entry.
 - **Native libraries.** None are added at build time. Linux libraries are loaded at run time through `Optional Declare`:
   - `libcups.so.2`
   - `libgtk-4.so.1`
@@ -36,7 +34,7 @@ Dependencies:
   - libc
 - **Missing libraries.** A missing library raises `LibraryUnavailableException` only when that path is used. PDF jobs need none of them.
 - **Source and payload.** The module is source-only, with no owned native payload.
-- **Exported libpdf symbols.** The module also binds symbols from `Lib "pdf"` (see CW2-PRINT-001 below). These are pinned to the pdf 2.4.6 shim names, so a pdf package upgrade must rerun the verifier.
+- **Exported libpdf symbols.** The module also binds symbols from `Lib "pdf"`. These are pinned to the pdf 2.4.6 shim names, so verify symbol compatibility when upgrading the pdf package.
 
 ## Source rewrites
 
@@ -146,93 +144,13 @@ The class is named `ClassicPrinterSetup` so that it cannot collide with the sepa
 
 The page setup dialog also fills its paper list asynchronously. ClassicPrinting therefore reapplies the setup after the dialog is presented and passes the named GTK paper (for example `na_letter`) when its size matches. Without this, an untouched accept returned the locale default (`iso_a4`) with A4 default margins.
 
-## Upstream candidate
-
-**CW2-PRINT-001** in `upstream-issues/classic-wave2-printing/` is an author observation; independent review is pending.
+## Runtime boundary
 
 - **Defect.** pdf 2.4.6 `PDFGraphics.FillPath`/`StrokePath` always fail with libharu 4177 (0x1051).
 - **Hypothesis.** The package sets colour and width after the path is built.
 - **Broader impact.** After the failure the path stays open, so later `FillRect`/`DrawString` calls on that page also fail. A new page still works.
 - **Workaround.** Pages are created with `HPDF_AddPage` plus the size shims and wrapped with the public `PDFGraphics` constructor. Polygons and pen sweeps are filled through the same exported symbols, with the colour set first; no stroke path is used.
 - **Removal rule.** Once every line of `repro.bui` prints `ok`, `FillPolygon` may return to `FillPath`.
-
-## Verification (2026-10-31, Buoy 0.72.0, Linux x86_64 host)
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-**Setup.**
-
-- The script stages the module, `ClassicGraphics.bui`, the test and copies of `/usr/share/buoy/packages` in a private temporary directory.
-- It runs `buoy --check --diagnostic-format json` for the module and the test on all six targets (x86_64/arm64 × linux/darwin/windows). That is 12 checks, each with 0 errors; the only warning is the known upstream `XojoDesktop.bui:160`.
-- It builds x86_64 Linux and runs everything in `buoy-pdf-test:local` with `--network none`, a unique container name, private `dbus-run-session` + `xvfb-run` and Openbox. That image is the local GUI runtime plus poppler-utils.
-
-**Modes.** All nine passed.
-
-- **pdf.** Unit assertions cover these areas:
-  - setup geometry at 72 and 300 dpi
-  - landscape swap
-  - validation that leaves state unchanged
-  - `SetupString` round trip
-  - StringWidth against the AFM widths
-  - every rejection listed above
-  - finish, cancel and state errors
-
-  It also covers NaN/Inf rejection for rects, lines, polygons, pictures, text and ovals, TextSize > 600, `-1` resolution, malformed JSON, and the atomic landscape rejection.
-
-  The verifier then independently inspects the PDFs:
-  - 3 pages, each 842×595 (A4 landscape)
-  - one page's text per page, no cross-page leakage
-  - Helvetica and Times-Bold fonts
-  - pixels rasterized at 144 dpi at the expected physical positions, checking:
-    - the margin origin and 300-dpi scaling
-    - the red fill
-    - natural-size and cropped pictures
-    - the filled triangle
-    - the inside-pen stroke
-
-  A second file checks the 72-dpi Letter portrait origin.
-
-  **Text files (1200/48, 600/73, 9600/12, 300×150/48).** `pdftotext -bbox` gives the word origin at 90 pt and the width as 1.112 em of the point size. Pixels are checked inside the first Helvetica I stem, between stems, above cap height and below the baseline.
-
-  **lines.pdf (pen 8).** Rasters check:
-  - the line start and the pen-hang end (101.5 and 206.5 black; 98.5 and 209.5 white)
-  - the top and bottom of the line
-  - the zero-length dot
-  - the diagonal start/end pen corners and points off the line
-  - a filled 8-wide `DrawRect` and a filled 8×8 `DrawOval`
-  - polygon edges, a vertex pen corner and the apex, with the interior left unfilled
-- **cups-unreachable.** With `CUPS_SERVER=127.0.0.1:9`, `OpenPrinter` raises `IOException`.
-- **cups-none.** A mock IPP server with no queues returns Nil for the default and for a named queue, and no job is created.
-- **cups-submit.** The mock queue records exactly two jobs over real libcups:
-  - an explicit 3-page job, re-inspected with the same PDF checks
-  - a 1-page job submitted by the destructor on scope exit
-
-  It also checks:
-  - titles
-  - `application/pdf` format
-  - the reported job ID matching the server's
-  - that the cancelled job never reached the server
-- **cups-fail.** The mock rejects Send-Document. The test sees `IOException`, the job is not reported as printed, resubmission is rejected, and the mock receives Cancel-Job for exactly that job. An empty title is rejected before submission.
-- **dialog-cancel / setup-cancel.** Escape through XTEST input on the real GTK dialogs returns Nil/False, leaves the setup unchanged, and creates no output and no stray spool file.
-- **setup-accept.** Alt+A accepts. Letter (`na_letter`) and the custom 30/20/40/50 margins survive.
-- **dialog-print.** A landscape setup with margins 10/20/30/40 and "Print to File" preselected is accepted with Return. All four margins come back unchanged, along with the 752×552 printable area.
-  - GTK's file backend writes a 2-page 792×612 PDF with the expected text, through the real `GtkPrintJob`.
-  - The test also checks the landscape geometry, the default copies/range and spool-file cleanup.
-
-**Not verified.** No physical printer, real cupsd, CUPS forwarding of copies/collate, avahi printers, or HiDPI pictures. macOS, Windows and arm64 Linux were checked by the compiler only. GUI tests used Xvfb, not a real desktop.
-
-## Independent recheck and final validation fixes
-
-Fresh Opus recheck confirmed the high-resolution text transforms, pen-hang
-geometry, margin pairing, settings validation and scoped PDF path workaround.
-It found a remaining infinite-pen validation gap. Pen validation now rejects
-non-finite dimensions before comparison or geometry; Transparency rejects NaN
-as well. Regressions cover infinite pens on lines/polygons/rectangles/ovals, NaN
-pen dimensions and unchanged transparency after a rejected NaN assignment.
-Parent revalidation passed 12 six-target checks and all nine isolated modes.
-Physical-printer rotation/copies/collation and native foreign execution remain
-unverified. Dialog-returned paper bounds, optional settings field types and
-self-intersecting polygon fill-rule differences remain review advisories.
 
 ## Roadmap items
 

@@ -1,6 +1,6 @@
 # ClassicData implementation contracts
 
-Scope: `modules/ClassicData.bui`, `tests/classic_data_test.bui`, and this note. The module imports `Xojo`; it never imports the RBClassic entry or changes bundled sources. This wave expands the Variant/Date roadmap item; it does not complete general Variant emulation.
+Scope: `modules/ClassicData.bui`, this note. The module imports `Xojo`; it never imports the RBClassic entry or changes bundled sources. It provides a defined subset of Variant and Date behavior.
 
 ## Integration and exports
 
@@ -8,7 +8,7 @@ Keep `Public Import ClassicData` in the entry. It exports `ClassicDate`, the new
 
 `ClassicVariant` is a separate class, not a subclass or replacement for the sealed foundation `Variant`. Source migrations opt into its type and `ClassicVariant.From(...)` factories. All foundation scalar widths have exact factory overloads so an Integer cannot accidentally select the Single overload. `FromObject` explicitly boxes arbitrary objects. There are no new implicit incoming conversion operators.
 
-No additional native library or dependency staging is needed for ClassicData beyond the existing Xojo dependencies. Tests use real native Locale/DateTime services and require installed en-US/de-DE locale data. Linux fixture generation can remain private under `LOCPATH` (commands below).
+No additional native library or dependency staging is needed for ClassicData beyond the existing Xojo dependencies. Locale and DateTime operations require installed native locale data.
 
 ## Foundation Variant extensions
 
@@ -49,12 +49,8 @@ Year/Month/Day/Hour/Minute/Second setters retain rollover normalization. Strict 
 
 These styled properties use the available native Short/Long styles. They do not promise old Xojo's exact Windows/Mac preference-style mapping (in particular Mac LongDate's Full-style requirement), AbbreviatedDate, arbitrary preference overrides, localized date parsing, or a bundled named-zone database. No Medium style is invented where the runtime provides none. Historical rapid timezone transitions and foreign native formatting remain uncertified.
 
-## Primary references and evidence
+## Primary references
 
 - [Archived Date, 2022r4](https://documentation.xojo.com/versions/2022r4/api/deprecated/date.html): 1904 local epoch, constructor/copy, normalization, calendar readouts, SQL formats, comparison operators and Date Variant value storage.
 - [Archived Variant, 2023r4](https://documentation.xojo.com/versions/2023r4/api/data_types/variant.html): accessors, type tags and array metadata.
 - Installed `/usr/share/buoy/docs/documentation/{currency,single,datetime,locale,arrays,conversion-operators,operator-overloading}.md` and actual `.buoy/packages/Xojo/modules` supplied the native APIs. No compiler/runtime source, disassembly, installed cache changes or external issue publication was used.
-
-New candidates and full scoped verification are under `upstream-issues/classic-wave2-data/`. Candidates remain pending independent reproduction/challenge; the parent owns central queue reconciliation. No Xojo executable oracle was available locally. Policies not established by an old runtime are labeled above.
-
-Final commands/results and environment are recorded alongside [formatting notes](formatting.md). Existing integer/date tests are preserved and expanded rather than replaced.

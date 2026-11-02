@@ -30,7 +30,7 @@ Connects one Buoy ListBox's native widget to a ClassicListNativeClient. Every se
 
 `Public Sub Constructor(owner As Object)`
 
-`owner` must implement ClassicListNativeClient. It is passed as Object because CType(interfaceRef, Object) raises IllegalCastException in Buoy 0.72 (upstream-issues/classic-wave2-listbox LISTBOX-001).
+`owner` must implement ClassicListNativeClient. It is passed as Object because CType(interfaceRef, Object) raises IllegalCastException in Buoy 0.72.
 
 #### Parameters
 

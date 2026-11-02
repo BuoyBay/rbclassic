@@ -1,9 +1,4 @@
-# ClassicAsyncNet — networking wave
-
-Owned files: `modules/ClassicAsyncNet.bui`, `native/networking/classic_asyncnet.c`,
-`tests/classic_asyncnet_test.bui`, `tests/classic_asyncnet_verify.py`, and this note.
-ClassicSystem, package entry/manifest, central runner, roadmap and releases remain
-with their owners. This module never imports `rbclassic`.
+# ClassicAsyncNet — networking
 
 ## Exports and integration
 
@@ -162,14 +157,12 @@ claim. This class is not SSLSocket, Xojo.Net.HTTPSocket, or URLConnection.
 TCP Listen/Accept/server sockets, NetworkInterface binding, orderly half-close,
 ReadError/WriteError parity and complete legacy error mappings remain outside
 this client expansion. UDP remains the existing ClassicSystem/Xojo foundation;
-this wave adds no UDP DNS or invented completion event. Its IPv4 binary datagram
-compatibility is exercised against a Python peer by the new suite.
+the adapter adds no UDP DNS or invented completion event.
 
 ## Native staging and targets
 
-Linux x86_64 native execution is accepted below. Both Linux architectures and
-both Darwin architectures use this POSIX helper source; Darwin and Linux ARM
-native execution remain for parent coordination. **Windows is unsupported**:
+Linux x86_64 has native runtime coverage. Both Linux architectures and both
+Darwin architectures use this POSIX helper source; verify each target natively. **Windows is unsupported**:
 Connect throws UnsupportedOperationException and no Windows helper/import
 library is supplied. Six-target semantic checking is not native ABI/link or
 behavior acceptance; Windows consumers must not stage this as a supported native
@@ -189,59 +182,4 @@ The six-target package builder should stage the matching native payload for
 supported target slices, without mixing architectures. Keep the library beside
 the consumer source/output or pass `-L/TEMP/STAGE` when linking. Buoy's Declare
 library name is `ClassicAsyncNet`; the compiler copies the located native library
-beside its output and uses the loader-relative runtime search path. The owned
-verifier builds into its isolated output directory, then executes the copied
-library there. No installed toolchain/cache, shared package or distribution
-archive was changed by this scope.
-
-## Verification and roadmap handoff
-
-Fresh independent recheck after the review fixes found no remaining blockers.
-It verified HTTP field-name token checks, empty HEAD/204/304 completion despite
-trailing bytes or large representation lengths, and nested cancellation with
-exact `FIRSTNEW_BATCH` peer receipt and distinct aborted/successful completions.
-A fresh consumer of the real builder's sealed package linked without loose Classic
-modules or an extra helper path, received the byte-identical helper and passed
-19 offline runtime cases. The recheck recorded 47 compiler checks, the maintained
-peer suite and 32 independent cases. Evidence is retained in
-`/tmp/buoy-net-recheck-20261031-7oSI40/review-result.json`; temporary evidence is
-not a durable release receipt. Windows/TLS and foreign native execution remain
-outside the accepted surface.
-
-The verifier copies bundled package archives into a temporary packages directory,
-checks module and test separately with actual `--check --diagnostic-format json`
-for all six triples, builds the native helper with warnings-as-errors, compiles
-the test executable, and runs offline Python peers and Buoy together under a
-unique `docker --rm --network none` container using private dbus/Xvfb. Every
-subprocess has a timeout and the container is force-cleaned in Finally. It does
-not reseal or publish shared packages. The parent can run its fixture phase
-against an already linked executable with `--exercise /absolute/executable`.
-`--host` is an opt-in local Linux run requiring the runtime's GUI libraries.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-Assertions cover localhost DNS/fallback, resolver failure, refusal, real main-loop
-timer dispatch, a 4 MiB send with observed no-progress polls under kernel
-backpressure, exact SHA-256/length at the peer, both cancellation mechanisms and
-exact received cancellation prefixes, immediate close from a callback, callback
-exception recovery, pending DNS cancellation, disconnect/EOF ordering, retained
-input/partial reads after Close, same-instance reconnect, NUL/invalid-UTF8 read
-rejection, existing binary UDP and sender metadata, fragmented HTTP headers/body,
-Content-Length/EOF/HEAD/204/304/404/POST, request bytes/headers, and rejection cases.
-Review regressions additionally verify whitespace/non-token request names and a
-forged header provider fail before transmission, malformed response names fail
-without PageReceived, HEAD length 16777217 is accepted without a body, trailing
-HEAD/204/304 bytes never reach body/progress callbacks, and nested cancellation
-allows the peer to receive exact FIRSTNEW_BATCH with aborted-then-successful
-completion ordering.
-
-Roadmap progress: hostname resolution and genuine asynchronous TCP client
-connect/read/write/completion are implemented and Linux-tested. A distinct
-partial classic HTTP/1.0 adapter is implemented and tested. The broad roadmap
-networking item must retain Windows native support, foreign native acceptance,
-TLS, server sockets, complete binary writing and the HTTP features listed above.
-No new upstream defect candidate was needed; known String NUL and Catch/Finally
-boundaries are handled explicitly. Independent review supplied the three local
-blockers fixed above; the expanded regression suite passed after those fixes.
-No independent follow-up acceptance is claimed. This sub-agent did not spawn
-reviewers or modify the central queue.
+beside its output and uses the loader-relative runtime search path.

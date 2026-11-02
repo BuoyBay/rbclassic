@@ -1,7 +1,7 @@
 # ClassicControls — API 1 ListBox, PopupMenu, ComboBox and CheckBox
 
 Module: `modules/ClassicControls.bui` (`Import RBFoundation`). Test:
-`tests/classic_controls_test.bui`.
+.
 
 ## Exported globals
 
@@ -221,30 +221,3 @@ deprecated-member pages on documentation.xojo.com.
 5. macOS editable `ComboBox` raises SelectionChanged on programmatic sets
    (see xojo-shim-gaps). Synchronous raises are suppressed here; asynchronous
    ones would still reach `Change`. This is not verified on macOS or Windows.
-
-## Checks run
-
-- `buoy FILE --check --diagnostic-format json --target T` for
-  `ClassicControls.bui`, `ClassicListNative.bui`,
-  `tests/classic_controls_test.bui` and `tests/classic_list_native_test.bui`
-  on x86_64/arm64 linux, darwin and windows: exit 0, no errors, and no
-  warnings from these files (the bundled XojoDesktop `Show` warning is
-  pre-existing). This covers the `#If TargetLinux` and `#Else` branches.
-- `tests/classic_controls_test.bui`, built on the host and run in
-  `buoy:0.72.0-gui` (private D-Bus, Xvfb): `classic controls: ok`, exit 0.
-  The test makes GLib warnings and criticals fatal and needs the GTK
-  lifecycle guard (`--extra-obj`, Linux only). Without it, Buoy 0.72's
-  invalid window `focus-out` signal (BUI-007) aborts the run (exit 133).
-  With the guard, the run is clean (list-native.md has the commands).
-  The two former "unsupported" assertions (retitle after rows, shrinking
-  `ColumnCount`) now branch on `NativeListAvailable`.
-- `tests/classic_list_native_test.bui` and its real-X driver: see
-  list-native.md.
-- `tests/classic_package_test.bui` against a temp-sealed rbclassic archive
-  (with a ProcessKit Linux slice freshly built from the current
-  `native/bridge.c`, because the repository receipts are stale): six-target
-  checks clean, `RBClassic package integration passed` in the GUI image.
-  No package or dist was published.
-- Only GTK has been executed. macOS and Windows are type-checked only.
-
-Review regressions cover padding short ParamArray and split rows, fixed escape-hatch rows, foundation string-tag alignment after reshaping, and consistent Cell/CellTag column bounds. Out-of-range columns raise OutOfBoundsException; a whole-row assignment with too many fields is rejected before mutation.

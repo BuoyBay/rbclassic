@@ -1,7 +1,5 @@
 # ClassicFiles implementation notes
 
-File scope owns `modules/ClassicFiles.bui`, `tests/classic_files_test.bui`, and this note. Encoding scope is described separately in `encoding.md`. No dependency or toolchain files were changed. The installed XojoFiles module was read and compared byte-for-byte with `modules/XojoFiles.bui` inside `/usr/share/buoy/packages/Xojo-1.0.0.buipkg` before implementation.
-
 ## Integration
 
 The entry module needs `Public Import ClassicFiles` and selective public imports of these globals: `GetFolderItem`, `GetOpenFolderItem`, `GetSaveFolderItem`, `GetTemporaryFolderItem`, `SelectFolder`, `RegisterClassicFileType`, `ClearClassicFileTypes`, `ResolveClassicFileTypes`. The plain public import carries the extensions, including their overloads. Do not add duplicate encoding globals. This module imports only the installed Xojo foundation, with no dependencies on sibling Classic modules.
@@ -21,20 +19,16 @@ FolderItem and stream source types remain unchanged. Callers wanting legacy Dele
 - `ReadPString(TextEncoding)` and `Read(count, TextEncoding)` explicitly decode using the supplied encoding. Invalid encodings/byte sequences retain EncodingException behavior; negative Read counts raise InvalidArgumentException. No-argument/Nil-encoding PString reads, and Nil-encoding raw String reads, raise UnsupportedFormatException before consuming bytes. Buoy cannot represent Xojo's Nil-encoded binary strings; use Read(count) As Bytes or ReadPStringBytes instead. Decoding a U+0000 code unit also raises UnsupportedFormatException, after consuming the frame/read: the installed core otherwise silently truncates the resulting String. UTF-8, ASCII, Latin1, Windows1252, UTF16/LE/BE, UTF32 and Auto use the foundation encoding model and detection limits.
 - `BinaryStream.Write(String)` writes UTF-8 bytes without framing. Existing `Read(count)`/`Write(Bytes)` remain native Bytes APIs; no return-type-only replacement is attempted.
 
-## Verification and remaining core work
+## Remaining compatibility limits
 
-`buoy FILE --check --diagnostic-format json` was run on both assigned sources, and both were checked for x86_64-linux, arm64-linux, x86_64-darwin, arm64-darwin, x86_64-windows, and arm64-windows. All checks had empty errors; the only warning is the existing XojoDesktop Window.Show extension warning. Cross-target results are semantic checks, not cross-platform runtime validation.
+Linux folder confirmation can return a non-directory location; the adapter rejects
+that result with IOException. Successful folder confirmation is not guaranteed.
+Remaining gaps include Finder aliases/Windows shortcuts, listing error details,
+LastErrorCode beyond Delete, HFS and Windows short shell paths, IDE FileType
+registry discovery, atomic temporary creation and lossless Nil-encoded Strings.
+macOS bundle paths and Windows paths need native validation for each application.
 
-The test is isolated by copying ClassicFiles.bui and classic_files_test.bui to a temp directory and copying the current `.buoy/packages` directory into the temporary directory. Compile with `buoy classic_files_test.bui -o classic-files-test` there. A check directly from the repo needs `--module-dir modules`. On this host, running requires LD_LIBRARY_PATH entries `/usr/lib/buoy/runtime/x86_64-unknown-linux-gnu` and `/tmp/buoy-chatui-jpeg8/build` (the existing libjpeg.so.8 build).
-
-Host behavior tests cover application-directory-relative resolution when launched from `/`, temp naming and cleanup in Finally, one-based Item and Nil/error cases, text roundtrip/truncation/failures, escaped/URL UTF-8 paths, exact binary fixtures, signedness, 0/255-byte PStrings, overlength rejection without partial writes, arbitrary raw bytes, EOF/short frames, closed writes, explicit encoding failures, UTF16/32 decoding, and NUL rejection. `--dialogs` exercises five cancellation paths. `--dialog-files <fixture-directory>` verifies confirmed open/save selections against `open.txt` and `saved.txt`, including that save has not created the destination. `--folder-select <fixture-directory>` and combined `--dialog-select <fixture-directory>` retain the desired folder-confirmation regression assertions, which are currently BLOCKED by the native chooser returning a non-directory. `--folder-error <fixture-directory>` verifies that the adapter rejects that observed bad native result with IOException. GUI tests need native interaction; the implementation run used Xvfb plus XTest key events. GTK emitted existing native dialog warnings about missing transient parents/application registration and one g_variant_new_string UTF-8 diagnostic.
-
-Observed native blocker: with the real existing fixture directory pasted into a SelectFolderDialog location field and confirmed, the Linux chooser showed a folder-validation message and returned a file location (open.txt) instead. The adapter now raises IOException. Five cancellation tests and confirmed open/save tests pass; successful folder confirmation is not claimed. The error guard was exercised through the same native interaction. No toolchain patch was attempted.
-
-Core work still needed for full compatibility: reliable SelectFolderDialog confirmation; Finder aliases/Windows shortcuts and native listing error details; full LastErrorCode coverage for non-Delete operations; HFS paths and Windows short shell paths; automatic IDE FileType registry discovery; atomic temporary creation; byte-length-aware/Nil-encoded Strings, lossless embedded-NUL text decoding, and legacy text encoding/metadata behavior. The macOS bundle branch and Windows path branch require native runtime follow-up.
-
-
-## Wave 2 native file expansion
+## Native file operations
 
 `ClassicFolderItem Inherits FolderItem` adds synchronous `Delete()`, read-only
 `LastErrorCode`, and read-only `NativeErrorCode`. Delete removes a file, final
@@ -51,8 +45,7 @@ is POSIX errno rather than an invented Carbon error. These mappings follow the
 POSIX Delete uses libc remove. Windows uses strict UTF-8 to UTF-16 conversion,
 DeleteFileW, GetFileAttributesW and RemoveDirectoryW; it does not depend on the
 foundation's narrow-path IsFolder query for Unicode directory deletion. Long
-Windows paths still require OS-supported extended-path syntax/policy. Windows
-native execution remains delegated to the parent's final validation.
+Windows paths still require OS-supported extended-path syntax/policy. Validate Windows native operations on the target host.
 
 `FolderItem.ResolveSymbolicLinks()` uses public POSIX realpath, resolves dot
 components and complete existing symbolic-link chains, copies the returned UTF-8
@@ -73,24 +66,10 @@ getter reads whole seconds, even when the setter preserves milliseconds on disk.
 No new package/native payload is required: this module imports only Xojo and uses
 public libc/Win32 functions. Linux remove/realpath/utimensat use Optional Declare to
 resolve the actual host libc at runtime, avoiding the installed ordinary-declaration
-link/runtime gaps captured in `upstream-issues/classic-wave2-encoding`. macOS resolves remove/utimensat with public dlsym, following the maintained
+link/runtime gaps captured in the runtime compatibility boundary. macOS resolves remove/utimensat with public dlsym, following the maintained
 FileSystemKit approach, to avoid absent linker exports without modifying toolchain
 stubs. Other libc calls retain the existing runtime binding. Missing optional symbols throw the
 standard LibraryUnavailableException, rather than silently succeeding.
-
-The added non-GUI tests preserve the original file suite and assert registry
-resolution/replacement, UTF-8 filename deletion, missing-path errors, per-call
-error reset, empty/nonempty directory behavior, symbolic-link resolution/deletion,
-missing-link errno, and persisted modification time. `--timestamp <existing-file>`
-is an independent-driver mode: Python can assert `st_mtime_ns == 1234567890123000000`
-and unchanged `st_atime_ns`. `--dialogs` retains the original five cancellation
-assertions and adds named-registry open/save cancellation, for seven paths.
-
-Final scoped checks/results and commands are recorded in `encoding.md` and
-`upstream-issues/classic-wave2-encoding/evidence.json`. Foreign semantic checks
-establish neither the native Win32 ABI nor macOS runtime behavior. Earlier native
-folder-confirmation limitations remain unchanged; the current wave does not claim
-to fix that chooser.
 
 ## Primary references
 

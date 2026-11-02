@@ -4,10 +4,6 @@ Module: `modules/ClassicControlSets.bui`. It imports `Xojo` and the sibling
 modules `ClassicDesktop` (for `ClassicPushButton`) and `ClassicControls` (for
 `ClassicCheckBox`). It never imports `rbclassic`.
 
-Tests: `tests/classic_controlsets_test.bui` and
-`tests/classic_controlsets_verify.py`. Upstream candidate:
-`upstream-issues/classic-wave2-controlsets` (CS-001, unindexed).
-
 ## Exports
 
 The module exports only types, so `Public Import ClassicControlSets` is enough.
@@ -22,9 +18,7 @@ No selective `.{ … }` line is needed. The test names the
 Possible name collisions: each member class adds `Index`, `Close()` and the
 `ControlSet*` interface methods. `ClassicTextFieldMember` also shadows `Text`.
 
-To integrate, the parent adds `Public Import ClassicControlSets` to
-`RBClassic.bui`. A temporary copy of the current entry with that line checks
-clean on all six targets. That check staged ProcessKit for `ClassicSystem`.
+The entry module uses `Public Import ClassicControlSets`.
 
 ## Source rewrite
 
@@ -85,40 +79,6 @@ event handlers with Control Sets" topic.
 - **Lifetime.** A set holds its members strongly. Each member points back to its set weakly. A set nobody references is destroyed; its members stay on screen and route nothing. `Close()` on a member without a set still detaches it.
 - **TextChange.** API 1 raises `TextChange` for a programmatic change too. Buoy's `TextChanged` fires only for edits, which is documented in `ui/textfield.md`. So `ClassicTextFieldMember` shadows `Text` and routes `TextChange` once, when an assignment changes the text and the native event did not fire. Assigning through a plain `TextField` reference raises nothing.
 
-## Tests (Linux x86_64, Buoy 0.72.0)
-
-The tests were run in a temporary copy, never in shared folders. The copy held
-the current `modules/*.bui`, the two test files and a
-`packages/` directory containing `/usr/share/buoy/packages/*.buipkg` and
-`packages/processkit-0.1.0.buipkg` from the repository.
-
-```
-buoy ClassicControlSets.bui --check --diagnostic-format json --target T     # six targets
-buoy classic_controlsets_test.bui --check --diagnostic-format json --target T
-buoy classic_controlsets_test.bui -o cstest
-docker run --rm --network none --name UNIQUE -v DIR:/w -w /w --entrypoint sh buoy:0.72.0-gui \
-  -c 'dbus-run-session -- xvfb-run -a python3 -I classic_controlsets_verify.py ./cstest'
-```
-
-- **Compiler checks.** The module and the test check clean (no errors) on all six targets: x86_64/arm64 × linux/darwin/windows. The only warning is the installed `XojoDesktop.bui:160` one.
-  - The test links for arm64-linux, x86_64-windows and arm64-windows.
-  - The darwin targets were checked with `--check` only; this Linux host has no macOS SDK.
-- **Behavior.** `CLASSIC CONTROLSETS TEST PASSED: 57 checks, 0 skipped`, three runs in a row, against the current sibling modules. It runs under Openbox, started by the verifier, with real XTest pointer and key input. The checks cover:
-  - static sparse indexes and all the registration errors
-  - PerformClick dispatch, and real clicks on a created member, a static member and a reparented member
-  - a real click where a removed button used to be, which reaches nothing
-  - native parent and mapped state after removal, and callbacks after removal
-  - a Close handler exception, and Compact versus KeepHoles
-  - every typed set's NewMember and its event
-  - GotFocus from a real click, and TextChange from a real key and from a programmatic assignment
-  - set destruction, and a window resize after removal
-- **Native warnings.** The verifier rejects any GTK/GLib CRITICAL or WARNING between the native-stage markers. The only exception is the environment's GApplication D-Bus registration message, which also appears with no control-set code at all.
-- **Mutation checks.** Each mutant of the module failed the suite:
-  - hiding instead of detaching: 6 failures, plus native warnings
-  - routing by position instead of index: 5 failures
-  - Compact renumbering disabled: 4 failures
-- **Not run.** No native GUI run happened on Windows or macOS in this wave, as instructed; the parent coordinates foreign runs. The test runs the same logic checks there and reports SKIP for real input, but it was not executed. The buoy-code-reviewer agent review is also pending, because this assignment forbids spawning agents.
-
 ## Boundaries
 
 Independent Opus review found a case-only Text assignment was discarded; the
@@ -127,8 +87,7 @@ copy all four Lock flags. Successful Linux reparenting releases the temporary
 GObject reference used during detach; removed controls still retain theirs.
 The template's frame is relative to its own container: use a template in the
 set's host to avoid interpreting coordinates from a different container.
-Parent verification after the fixes passed 12 six-target checks and the expanded
-59-check Linux native suite with real input. Lock flags are copied after native
+ Lock flags are copied after native
 attachment and before Open, since attachment resets their earlier values.
 The default Compact policy remains an explicit API 1 choice; callers retaining
 indexes should select KeepHoles deliberately. The conflicting guide contracts

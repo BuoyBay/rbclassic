@@ -1,8 +1,6 @@
 # ClassicGraphics implementation notes
 
-Owned files: `modules/ClassicGraphics.bui`, `tests/classic_graphics_test.bui` and `tests/classic_mouse_verify.py` (repo root), and this note. The module uses a plain `Import RBFoundation` (the bundled shim) and no sibling Classic modules. It never imports `rbclassic`.
-
-## Integration requirements (parent)
+## Integration requirements
 
 - Exports are unchanged: `Public Import ClassicGraphics` exports the classes `ClassicPicture`, `ClassicRGBSurface`, `ClassicGraphics` and `ClassicCanvas`. The global color functions still need the selective line:
 
@@ -135,34 +133,7 @@ Semantics follow the archived docs.xojo.com pages (2014–2020) and the current 
   - `DoubleClick`, `KeyDown` and `KeyUp`
   - `Canvas.Graphics`
 
-## Verification (2026-10-31, Buoy 0.72.0)
-
-- **Compiler checks.** `buoy <file> --check --diagnostic-format json --target T` passed for `ClassicGraphics.bui` and `classic_graphics_test.bui` on x86_64/arm64 × linux/darwin/windows. Every run exited 0 with 0 errors. The only warning is the upstream `XojoDesktop.bui:160` extension `Show` warning. These checks are compile-only for darwin, windows and arm64-linux.
-- **Build environment.** The test was built on the Linux x86_64 host in a temp directory, with `packages/` copies of Xojo, sqlite3, postgres, xml, regex, crypto, zip and Variant from `/usr/share/buoy/packages`.
-  - Wrapper `/usr/local/bin/buoy` sha256 `7c9714fb…acd3`.
-  - Runtime `buoy_ui.so` sha256 `44ccfebe…7c50`, the known 0.72.0 runtime.
-- **Behavior run.** The binary ran in `buoy:0.72.0-gui` with `docker run --rm --network none`, a unique name, `--entrypoint /bin/bash`, `timeout 120 dbus-run-session -- xvfb-run -a ./classic_graphics_test`. Output: `16384 translucent pixel writes: 9 ms` / `classic_graphics: ok`.
-- **Container fixture.** libcairo2 1.18.0-3build1. `fc-match System` resolves to DejaVu Sans Book.
-- **Assertion coverage.** The assertions are independent of the implementation:
-  - fixed pixel values;
-  - ink rows checked against ascent and line height;
-  - wrapped and condensed output pixel-identical to hand-drawn lines;
-  - decomposed "é" kept together when wrapping;
-  - clip containment and nesting;
-  - polygon and pen bounds;
-  - single compositing of a translucent asymmetric rect;
-  - elliptical versus circular corner pixels;
-  - Transform and flood connectivity;
-  - mask, CopyMask and ApplyMask values;
-  - masked Backdrop through `RenderTo`;
-  - every new exception path.
-- **Mouse regression.** `xvfb-run -a python3 classic_mouse_verify.py ./classic_graphics_test` in the same container printed `ClassicCanvas real mouse capture passed`.
-- **Face check probe.** The Cairo face check was validated by a probe beforehand. For DejaVu Sans, Liberation Serif, "System" and an unknown family at 12, 13.5 and 20 pt, plain and bold, the runtime's width and height equalled the private Cairo context's ink extents for "Ag", "a", "Hello, wörld" and "ÅÉgj".
-- **Not run.** macOS, Windows and arm64 Linux were not executed this wave (no GUI runs on shared desktops). Off Linux, the test asserts the explicit `UnsupportedOperationException` for the metric members.
-
 ## Upstream
-
-No new defect was found, so this wave adds no record under `upstream-issues/classic-wave2-graphics`. Two existing records apply:
 
 - The runtime's ink-width `MeasureStringWidth` and toy text are covered by BUI-002.
 - The wrapper `NativeHandle` is covered by BUI-001.

@@ -2,13 +2,11 @@
 
 ## Integration
 
-Owned sources: `modules/ClassicDatabase.bui`, `tests/classic_database_test.bui`, `tests/classic_statements_test.bui`, this note and `notes/statements.md`. The tests live at the repository root. No separate ClassicStatements module is required.
-
 The entry module should `Public Import ClassicDatabase`. There are no exported global functions requiring selective imports. Exported classes are `ClassicSQLiteDatabase`, `ClassicDatabaseRecord`, `DatabaseField`, `RecordSet`, `ClassicSQLitePreparedStatement`, and `ClassicEditableRecord`. The module imports only `Xojo`, avoiding entry-module cycles. Internal row bridges are not exported.
 
 Rewrite legacy SQLiteDatabase and DatabaseRecord constructions/declarations to ClassicSQLiteDatabase and ClassicDatabaseRecord; the foundation already owns the original names. Rewrite SQLitePreparedStatement declarations/constants to ClassicSQLitePreparedStatement. PreparedSQLStatement interface substitution is not implemented. Foundation DatabaseRow, DatabaseColumn, Variant and FolderItem remain usable.
 
-Private explicit SQLite FFI uses the existing Xojo SQLite payload. No new native library or shim is needed. Stage sealed Xojo, Variant, sqlite3, postgres, crypto, regex, xml and zip archives in an isolated `packages/` directory when building outside the repository. Native runtime/linking must still be tested separately on each platform. No installed package, toolchain, shared archive or cache was edited.
+Private explicit SQLite FFI uses the existing Xojo SQLite payload. No new native library or shim is needed. Stage sealed Xojo, Variant, sqlite3, postgres, crypto, regex, xml and zip archives in an isolated `packages/` directory when building outside the repository. Native runtime/linking must still be tested separately on each platform.
 
 ## Connection and execution contracts
 
@@ -43,11 +41,6 @@ Arbitrary RecordSet.Edit/Update/DeleteRecord still throw; SELECT updatability is
 ClassicEditableRecord.Field returns the original read-only snapshot. SetValue stages named scalar/NULL changes; column lookup is checked and primary-key edits fail. Update and DeleteRecord revalidate the schema/identity inside a savepoint, quote all identifiers, bind values, require exactly one affected row and roll back failed changes while preserving the original error. The savepoint nests inside caller transactions. A successful change closes the session; a failed constraint permits correcting staged values and retrying. Close cancels staging. A closed/reopened connection cannot receive stale session writes.
 
 This is a single-thread, short-lived edit session, not optimistic concurrency control. It does not compare the original non-key values; another writer's scalar changes can be overwritten, and deletion/reinsertion with the same key denotes the current identity. Do not interleave schema changes or connection operations across threads. SQLite trigger effects retain SQLite's own semantics. Binary edits use parameterized prepared SQL rather than SetValue. Full mutable DatabaseField setters, arbitrary SELECT edits, composite identities and automatic edit-buffer refresh remain out of scope.
-
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
 
 ## Remaining limits
 

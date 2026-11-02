@@ -1,10 +1,8 @@
 # ClassicSystem
 
-Owned additions: `modules/ClassicSystem.bui`, `tests/classic_system_test.bui`, and this note. Foundation: `Import RBFoundation`. The 18 installed Xojo module files were byte-compared with `/usr/share/buoy/packages/Xojo-1.0.0.buipkg`; all matched. No dependency/toolchain sources were edited.
-
 ## Integration and supported behavior
 
-The entry module needs `Public Import ClassicSystem`. **No ordinary exported globals require selective `Public Import`.** Public extensions and classes flow through the plain import. Add/package the existing **processkit** dependency alongside Xojo and its dependencies (including zip). ProcessKit's installed module matched the repository module when inspected; the isolated test used `packages/processkit-0.1.0.buipkg`.
+The entry module needs `Public Import ClassicSystem`. **No ordinary exported globals require selective `Public Import`.** Public extensions and classes flow through the plain import. Add/package the existing **processkit** dependency alongside Xojo and its dependencies (including zip).
 
 - `Timer.Mode` reads/writes the existing RunMode state, validates 0..2, and maps `Timer.ModeOff = 0`, `Timer.ModeSingle = 1`, `Timer.ModeMultiple = 2`. Off stops, Single sets Count=1 and starts, Multiple sets Count=-1 and starts. RunMode/Enabled assignments share that state. Constants are zero-argument Shared extensions: rewrite instance constant access such as `timer1.ModeSingle` to `Timer.ModeSingle` (Buoy rejects instance access to the Shared extension even if an instance extension also exists).
 - **Plain Timer limitation:** Mode reports the last shim assignment, not actual running state. Native Start/Stop and automatic completion cannot be observed. Rewrite the source type to **ClassicTimer** to observe one-shot completion: its NotifyTick sets Off before calling the Action delegate. Configure it through Mode/RunMode/Enabled, and call Super.NotifyTick from further overrides. Direct Count changes, native Start/Stop, and manually calling PerformTick bypass native lifecycle semantics. Action remains Buoy's no-argument delegate property; this does not add a legacy Action event.
@@ -26,11 +24,6 @@ Symbol lookup is an exported-address availability test, not proof of a function 
 Logging requires `/usr/bin/logger`, incurs subprocess overhead, uses its default tag/metadata, and is best effort: successful exit does not prove durable journal delivery. Large messages may meet logger/OS size limits. A native logger adapter plus verified Xojo LogLevel values and a Windows Event Log implementation remain necessary for full compatibility.
 
 **Serial investigated, not implemented:** the bundled opt-in serialio package exposes SerialPort/SerialConnection, real data/error/closed events, DTR/RTS and byte pipes. Legacy Serial.Baud is an index (Baud9600=8, Baud115200=14), not the baud integer accepted by SerialConfig. Blind aliases would configure the wrong hardware. A faithful adapter needs explicit verified legacy option mappings, error-code translation, reset/reopen behavior, and real buffered LookAhead/BytesAvailable; native line-change notifications, CTS/DCD/DSR/RI, break/flush/XmitWait controls are not all exposed by Serialio. No stored-only Serial facade was added. Further work needs a PTY fixture and physical-line tests where applicable.
-
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
 
 ## Sources
 

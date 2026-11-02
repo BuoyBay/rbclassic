@@ -1,6 +1,6 @@
 # Reusable SQLite statements
 
-The implementation is included in ClassicDatabase.bui. Parent integration needs only `Public Import ClassicDatabase`, exporting ClassicSQLitePreparedStatement and ClassicEditableRecord alongside existing database classes. No global selective imports, separate statement module, new native dependency or entry-module import is needed. See database.md for staging and connection contracts.
+The implementation is included in ClassicDatabase.bui. The entry module needs only `Public Import ClassicDatabase`, exporting ClassicSQLitePreparedStatement and ClassicEditableRecord alongside existing database classes. No global selective imports, separate statement module, new native dependency or entry-module import is needed. See database.md for staging and connection contracts.
 
 ## Supported surface
 
@@ -24,18 +24,4 @@ Legacy SelectSQL/ExecuteSQL RowSet aliases, the PreparedSQLStatement interface, 
 - Binary and NUL-safe TEXT data bindings and buffered snapshots using Bytes and Ptr FFI.
 - Explicit single-column-primary-key editing with schema revalidation, identifier quoting, one-row checks, savepoint rollback, and connection identity guards.
 
-Arbitrary SELECT editing, composite/binary identities, legacy field-type codes and full schema-result parity remain open; these are not foundation/core changes hidden behind stored flags. Parent owns final roadmap reconciliation, entry exports, packaging and integrated tests.
-
-## Behavior tests and evidence
-
-`tests/classic_statements_test.bui` has independent assertions against literal fixtures, SQLite typeof results, exact errors and subsequent SQL reads. It covers:
-
-- Disconnected/invalid/multiple-statement preparation; missing/excess/negative binds; convenience counts and native repeated named markers.
-- Actual native TEXT/REAL/INTEGER/NULL/BLOB type changes, 64-bit and Boolean bindings, invalid type selections, invalid UTF8 rejection, Bytes/type mismatches and stale-bind prevention.
-- BLOB fixture `00ff610062c3a9`, UTF8/NUL TEXT fixture `61c3a90062`, empty TEXT/BLOB versus NULL, independent output copies and copied input buffers.
-- Repeated execution, constraint recovery and exact `UNIQUE constraint failed: payloads.label`, later-step integer-overflow errors, clear/retained bindings, snapshot survival across reuse and all native lifetimes, double Close, and destructor finalization.
-- Real table_info primary-key/type results, safe schema-name binding, table enumeration and empty-result field counts.
-- Parameterized updates, failed update atomicity, explicit transaction rollback, SQLSelect mutation rejection and BUSY-safe connection closure.
-- Explicit editable sessions: rejected wrong/composite keys, NULL/missing identities and views; main-schema isolation under temporary-table shadowing; rejected unknown/key edits; exact constraint error and atomic multi-column changes; retry inside outer transactions; quoted table/key/value identifiers; update/delete persistence; single-use success; removed rows, changed schema without mass mutation, and close/reopen identity protection.
-
-Compiler command/results and isolated package/build instructions are in database.md. Fresh final checks cover the module and both tests across all six target triples; native Linux builds/runs pass. Cross-target semantic checks do not certify foreign SQLite ABI execution. No new candidate upstream issue was necessary, and no external issue was published.
+Arbitrary SELECT editing, composite/binary identities, legacy field-type codes and full schema-result parity remain open; these are not foundation/core changes hidden behind stored flags.

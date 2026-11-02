@@ -1,4 +1,4 @@
-# Historical byte encodings — wave 2
+# Historical byte encodings
 
 `modules/ClassicEncoding.bui` imports Xojo without importing the RBClassic entry.
 The entry must publicly import this module to export `ClassicEncoding` and
@@ -46,67 +46,6 @@ carry Apple/Microsoft/Unicode attribution; Unicode mapping use terms are at
 [Unicode terms of use](https://www.unicode.org/copyright.html). Only numeric
 mapping data and independently encoded oracle bytes are included here.
 
-## Verification and integration handoff
-
-The source test `tests/classic_encoding_test.bui` contains three full 256-byte
-UTF-8 expected-output oracles derived from those mapping files, separate from the
-Buoy encoder/decoder implementation. It asserts decode and encode independently
-against those fixed expected values, plus representative text fixtures, empty/Nil,
-NUL, malformed UTF-8, unsupported codecs and unmappable supplementary text.
-This is 768 exact decoding values and 768 exact encoding values. Pure table
-roundtrip assertions alone would not detect a mutually incorrect map; the fixed
-oracles are therefore required.
-
-The final validation stages copies of both modules, both tests, all scoped repros
-and `.buoy/packages` under a fresh `/tmp/classic-wave2-files-*` directory. No shared
-package archive or cache is modified. Commands, compiler JSON arrays, source and
-compiler hashes, build outcomes and stdout are retained in
-`upstream-issues/classic-wave2-encoding/evidence.json`.
-
-Commands from that temporary workspace:
-
-```sh
-buoy FILE.bui --target TARGET --check --diagnostic-format json
-buoy classic_encoding_test.bui -o classic_encoding_test
-buoy classic_files_test.bui -o classic_files_test
-LD_LIBRARY_PATH=/usr/lib/buoy/runtime/x86_64-unknown-linux-gnu:/tmp/buoy-chatui-jpeg8/build ./classic_encoding_test
-LD_LIBRARY_PATH=/usr/lib/buoy/runtime/x86_64-unknown-linux-gnu:/tmp/buoy-chatui-jpeg8/build ./classic_files_test
-```
-
-Targets: x86_64-linux, arm64-linux, x86_64-darwin, arm64-darwin,
-x86_64-windows, arm64-windows. All authored `.bui` files must have empty errors;
-the inherited XojoDesktop Show warning is advisory. Cross-target semantic checks
-are not foreign native execution. Linux behavior tests run from the temporary
-workspace and `/` to preserve application-directory path-mode assertions.
-
-Completed roadmap scope: MacRoman plus ISO Latin 2 and DOS CP437 raw-byte codecs;
-explicit named FileType registry; real Delete error state on a separate wrapper;
-opt-in POSIX symbolic-link resolution; POSIX modification-time setting. Remaining:
-Finder alias/Windows shortcut resolution, Windows timestamp setting, creation-time
-mutation, SaveInfo/bookmarks, implicit legacy default text encodings and Nil-encoded
-String semantics. Parent owns aggregate exports, manifest, roadmap and releases.
-
-## Independent review
-
-Independent review rechecked all 768 mappings and the test oracles against the
-primary Unicode files, and reproduced two case-sensitivity contract defects.
-The constructor now uses explicit case-sensitive comparisons; regression tests
-reject lowercase/uppercase variants. FileType registry comparisons received the
-same correction, with distinct-name and exact-replacement assertions. Original
-scope evidence predates these fixes and does not certify the revised source hashes.
-Parent validation after the fixes passed 24 six-target checks (both modules and
-tests) and both Linux behavior suites. Runtime execution used a private Docker
-display with current host Buoy runtime libraries mounted read-only, because the
-GUI image alone lacked `libbuoy_picture.so` required by the current compiler.
-
-The review also independently reproduced both unpublished native-binding
-candidates. CFE-001 is an installed Linux SDK export-coverage gap for ordinary
-`remove`/`utimensat` bindings. CFE-002 narrows to allocated-output `realpath`:
-ordinary binding fails while a caller buffer and optional binding succeed.
-Native symbol-version controls reproduce the old glibc compatibility behavior;
-compiler-internal causation remains unproven. Neither candidate has been published
-or promoted into the central issue queue. See the scoped evidence directory.
-
 ## Unicode data license
 
 Retained from [Unicode license.txt](https://www.unicode.org/license.txt) for the derived mapping tables and test oracles. Apple mapping attribution: Copyright (c) 1994–2002, 2005 Apple Computer, Inc. Microsoft table attribution: Shawn Steele, Microsoft, 1996.
@@ -152,26 +91,3 @@ not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
-
-## Final resumed validation result
-
-After checkpoint 6b7b8685, all seven authored sources (two modules, two tests,
-three candidate repros) were freshly checked on all six targets: **42/42 semantic
-checks passed** with empty errors. Both Linux x86_64 behavior executables passed;
-the file executable also passed from `/`. Python os.stat verified exact on-disk
-mtime **1234567890123000000 ns** with access time unchanged at
-**987654321098765432 ns**. The isolated network-disabled Docker/dbus/Xvfb run passed
-all **seven** real native cancellation paths, including named FileType filters.
-Windows x86_64 and ARM64 file-test cross-links passed. Both macOS cross-links remain
-blocked by the local SDK's absent Security/CoreFoundation frameworks and libc++;
-the file-scope remove/utimensat missing exports are resolved by the local adapter.
-No Windows/macOS runtime result is claimed in this scope.
-
-The source-to-oracle review checked strict UTF-8 validation, exact reverse-table
-lookup, NUL policy, integer division and per-instance native error reset. Independent
-agent review remains pending because this assignment prohibits spawning agents.
-No new upstream record is marked ready and no issue was published.
-
-Distribution handoff: preserve this note's Unicode data license and source mapping
-attributions when packaging the codec tables or the derived test oracles. No extra
-native payload, package reseal, or cache publication was performed here.

@@ -1,6 +1,6 @@
 # Classic migration diagnostic CLI — implementation notes
 
-`python3 tools/rb/classic_lint.py SOURCE_OR_DIRECTORY ...` scans UTF-8
+The migration diagnostic scans UTF-8
 legacy RB text sources without modifying them. Use `-` for stdin and
 `--format json` for tooling. There is no rewrite option. Python 3.10+ and its
 standard library are sufficient; the linter does not import compatibility
@@ -103,42 +103,3 @@ not establish compatibility. Backslashes in source strings also need manual
 conversion even when no doubled quotes occur. Strings are not rewritten.
 There is no claim to validate GUI behavior, arbitrary event signatures, native
 bindings or database backend availability.
-
-## Evidence and verification
-
-Read `AGENTS.md`, the installed Xojo modules and relevant local docs under
-`/usr/share/buoy/docs/documentation/` (`color.md`, `picture.md`, `arrays.md`,
-`strings.md`, `exceptions.md`, `events.md`). All 18 installed Xojo module files
-were compared byte-for-byte with the bundled
-`/usr/share/buoy/packages/Xojo-1.0.0.buipkg` before implementation. Neither the
-installed toolchain nor `.buoy` dependencies were modified.
-
-Primary Xojo references consulted:
-
-- [Archived Picture (2023r1)](https://documentation.xojo.com/versions/2023r1/api/graphics/picture.html): depth constructor and mask/alpha distinctions.
-- [Archived Replace (2022r1)](https://documentation.xojo.com/versions/2022r1/api/deprecated/replace.html): first occurrence, case-insensitive matching and unchanged empty search.
-- [Color](https://docs.xojo.com/api/data_types/color.html): byte channels and alpha transparency.
-- [Arrays](https://docs.xojo.com/api/language/arrays.html): inclusive sizing, resize bounds and dimension numbering.
-- [Deprecated ListBox](https://docs.xojo.com/api/deprecated/listbox.html) and [CheckBox](https://docs.xojo.com/api/deprecated/checkbox.html): legacy member/event surfaces.
-- [Moving to API 2.0](https://docs.xojo.com/topics/api_design/moving_to_api_2.0.html): zero-based index transitions, database Boolean/error-state example and event renaming.
-
-Behavior verification: 20 unittest cases execute the lexer/rules and real CLI
-subprocesses, covering every rule family, nested/multiline calls, comments,
-source quote escaping, Unicode/newlines, malformed inputs, JSON/text output,
-exit thresholds, scan filtering, deduplication, and byte/mtime preservation.
-No `.bui` files were created or edited in this scope; compiler and six-target
-checks therefore do not apply. No compiler-only behavior claims are made.
-
-Exported Buoy globals requiring selective `Public Import`: **none** from this
-scope. Python public entry points are `lint_source(source, path)` returning
-`Diagnostic` objects and `main(argv)` returning the process exit status.
-
-Remaining core/integration work: the parent owns the package entry module,
-build/test runner, distribution and integrated documentation. The linter cannot
-fix native-name collisions, alpha factory overloads, exception hierarchy,
-stream overloads or runtime/compiler semantics; those need explicit adapters,
-source rewrites or upstream work. No implementation blocker remains for this
-standalone CLI. This assigned migration note also serves as this scope's notes;
-no additional unassigned `NOTES.md` was created.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

@@ -1,8 +1,7 @@
-# Use REALbasic-compatible adapters and API aliases
+# Use REALbasic-compatible adapters including ClassicCanvas and View-based containers
 
-RBClassic helps port legacy RB desktop code to Buoy. It adds
-classic member names and checked behavior over the installed compatibility
-foundation, existing native controls, and ProcessKit. It is a supported subset with
+RBClassic helps port legacy RB desktop code. It adds
+classic member names and checked behavior over ClassicCanvas, View-based ClassicContainerControl, existing native controls, and ProcessKit. It is a supported subset with
 explicit source rewrites, rather than a drop-in implementation of the entire
 historical framework.
 
@@ -45,8 +44,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

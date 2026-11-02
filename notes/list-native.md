@@ -3,8 +3,7 @@
 Module: `modules/ClassicListNative.bui` (`Import RBFoundation` only; it does not
 import `ClassicControls` or the entry module). Consumer:
 `ClassicListBox` in `ClassicControls.bui`. Tests:
-`tests/classic_list_native_test.bui` and
-`tests/classic_list_native_verify.py`.
+.
 
 ## Exports
 
@@ -13,7 +12,7 @@ import `ClassicControls` or the entry module). Consumer:
   `ClassicListNativeSelection`, `ClassicListNativeResized`.
   `ClassicListBox` implements it, so these appear as public members of
   `ClassicListBox`. They are bridge entry points, not API 1 members; the
-  native-state test calls two of them to stand in for GTK.
+  application routes them from native GTK signals.
 - `Public Class ClassicListNativeBridge`: `Attach(nativeWidget)`, column
   title/width/visibility/resizable/clickable setters and getters, the sort
   indicator, header visibility, `SetMultiple`, `SelectedRows`, `SelectRows`
@@ -51,84 +50,9 @@ Lifetime: the bridge registers in a key→weak-reference table and passes the
 key as signal user data, so callbacks after the ListBox is gone are no-ops.
 `ClassicListNativeBridge` holds its client as `Weak Object` because `Weak`
 accepts only classes and `CType(interfaceRef, Object)` aborts in 0.72
-(candidate LISTBOX-001, `upstream-issues/classic-wave2-listbox`). It retains
+(a runtime compatibility boundary). It retains
 the single-selection model and its multi-selection model, and releases both
 in its destructor.
-
-## Tests and results (Buoy 0.72.0, x86_64 Linux, `buoy:0.72.0-gui`)
-
-Work in an isolated temp directory with the installed packages copied to
-`packages/` and the module/test sources copied in. Both GUI tests (this one and
-`classic_controls_test.bui`) make every GLib warning and critical fatal
-(`g_log_set_always_fatal`), so they must be linked with the GTK lifecycle
-guard. Buoy 0.72's window bridge connects an invalid `focus-out` signal on
-every Window (BUI-007, already in the queue), and an unguarded build aborts on
-that critical:
-
-```sh
-OBJ=$(python3 tools/build_gtklifecycle.py)   # or compile the guard into temp
-buoy classic_list_native_test.bui -o classic_list_native_test --extra-obj="$OBJ"
-docker run --rm --name lbn-$RANDOM --network none -v "$PWD:$PWD" -w "$PWD" \
-  --entrypoint dbus-run-session buoy:0.72.0-gui -- timeout 90 xvfb-run -a \
-  ./classic_list_native_test
-docker run --rm --name lbn-$RANDOM --network none -v "$PWD:$PWD" -w "$PWD" \
-  --entrypoint dbus-run-session buoy:0.72.0-gui -- timeout 90 xvfb-run -a \
-  python3 classic_list_native_verify.py ./classic_list_native_test
-```
-
-`--extra-obj` applies to Linux builds only. The verifier starts the probe with
-`GTK_A11Y=none`. Under `dbus-run-session -- xvfb-run`, the D-Bus-activated
-AT-SPI services start without X authorization ("Authorization required",
-"AT-SPI: Cannot open default display") and exit. GApplication then logs
-`Gtk-CRITICAL: Unable to register the application: ... NoReply` when
-`Application.Run` starts. A minimal Window + `Application.Run` program
-reproduces it; with `GTK_A11Y=none` it is clean. This is the container
-harness, not Buoy or the list code, and was previously hidden in stderr.
-The native-state mode never calls `Application.Run` and needs no such
-setting.
-
-Results with the guard linked and GLib diagnostics fatal: both modes pass,
-and the real-X mode passed in each of the final runs. Without the guard,
-both tests and the real-X probe abort (exit 133, SIGTRAP) on the BUI-007
-critical, as intended. So the list bridge itself (column-view controllers,
-sorters, model swaps, column and header changes) emits no GLib warnings or
-criticals.
-
-- Native-state mode: `classic list native: ok`. The test reads GTK state
-  through its own Declares, not the bridge: header visibility for an empty
-  list, after rows and after reload; native titles after retitling; hidden,
-  reused and new columns with their data; fixed widths for `50,25%,*` →
-  50/100/250 and `2*,*,100` → 200/100/100 over 400 pt; `WidthActual`; the
-  resizable flag; the sorter's primary column/order through Sort,
-  PressHeader, header clicks, HeaderPressed and SortColumn cancellation, and
-  SortNone; the view model's GType and `gtk_selection_model_is_selected` for
-  multiple selection through Selected, AddRow (reload), Sort, RemoveRow,
-  ListIndex and the switch back to single; and KeyDown key codes,
-  type-to-select and modifier filtering.
-- Real-X mode: `ClassicListBox real X input passed (14 steps)` in each of the
-  final runs, under Openbox with xdotool: double-click a row (DoubleClick,
-  ListIndex), Down (KeyDown 31 and native navigation), Return (KeyDown 13,
-  no DoubleClick), typed `ap` (type-select), a consumed key, two header
-  clicks (ascending then descending, indicator read from GTK), a cancelled
-  header click (indicator restored), a header-edge drag on a resizable column
-  (100 → 160 pt, read back natively), a click and a Ctrl+click in multiple
-  mode (native set 2 rows, one Change each), a double-click in multiple mode,
-  and a list resize that recomputes `100,*` from 300 to 200 pt.
-- Mutation checks, each run in a temp copy, each failing as expected: no
-  keyboard-activation filter (step 2: DoubleClick 2); no indicator restore
-  after a cancelled header click (real-X step 7: indicator `1:0`); no
-  multi-selection re-apply after reload; no initial header hide; percent
-  widths ignored; no resize recomputation (real-X step 13). An unmodified copy passed the
-  native-state mode.
-- The driver waits 0.3 s before each action. Without it, GTK under Xvfb
-  dropped a click sent right after the pointer motion, and sometimes a key
-  sent right after other input. The probe's own assertions are unchanged.
-- Six-target `--check` (x86_64/arm64 linux, darwin, windows): clean for the
-  module and both tests.
-
-Not run: macOS and Windows execution (type-checked only), arm64 Linux
-execution, HiDPI/scaled displays, a real keyboard layout other than the Xvfb
-default, and screen readers.
 
 ## Exact unsupported boundary
 

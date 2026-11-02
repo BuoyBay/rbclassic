@@ -26,5 +26,3 @@ Do not mix strict `Package Variant` and Xojo Variant in one namespace or assume
 one can box arbitrary Buoy structures. JSON numbers through the installed Xojo
 shim remain Double-based and can lose large integer IDs; transport exact IDs as
 strings when using that serializer. These helpers do not change JSON semantics.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.

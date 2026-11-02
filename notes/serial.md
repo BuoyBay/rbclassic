@@ -2,7 +2,7 @@
 
 `modules/ClassicSerial.bui` exports the `Serial` class over installed
 `serialio` 1.0.0's public `SerialConnection` API. It imports `Xojo` and
-`Serialio.Serial`, never the RBClassic entry. The parent can export it with
+`Serialio.Serial`, never the RBClassic entry. The entry module exports it with
 `Public Import ClassicSerial`; there are no global functions needing a selective
 import. Callers constructing/enumerating native port descriptors should also
 `Import Serialio.Serial` and use `SerialPort.GetPorts()`.
@@ -82,7 +82,7 @@ Poll, Reset, Flush, SetBreak/ClearBreak, LeaveDTROnClose, XmitWait,
 BytesLeftToSend, Handle, CTS/DSR/DCD/RI status, or DTR flow control. Those need
 additional backend support; no flags or zero-status substitutes are stored.
 
-## Dependency staging and parent integration
+## Dependency staging
 
 New opt-in dependency: `/usr/share/buoy/packages/serialio-1.0.0.buipkg`, staged
 unchanged beside RBClassic in the consuming project's temporary `packages/`.
@@ -90,20 +90,3 @@ Its archive provides native serial runtime slices for all six target platforms,
 plus Windows import libraries. No new native bridge, external library install,
 or installed-package/cache edit is required. The compiler extracts/stages its
 matching native payload when compiling a consumer.
-
-The verifier also copies the installed foundation dependencies: Xojo-1.0.0,
-sqlite3-3.53.2, postgres-18.4.0, xml-1.0.0, regex-1.0.0, crypto-1.0.0 and
-zip-4.0.7 archives. These are required by Import RBFoundation, not newly introduced Serial
-features. The verifier copies only its two owned sources into a temporary
-workspace; no shared archive is sealed or replaced.
-
-The parent owns entry exports, manifests, combined runner/README/ROADMAP,
-package staging and releases. A no-argument execution of `classic_serial_test`
-runs configuration/error tests only. The PTY integration **must** be run through
-the Python verifier; invoking the Buoy test alone does not test byte flow.
-
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-

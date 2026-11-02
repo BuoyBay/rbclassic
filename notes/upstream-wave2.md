@@ -1,12 +1,6 @@
-# Wave 2 upstream handoff
+# Runtime compatibility boundaries
 
-These twelve local candidates have independent reproduction or challenge evidence.
-They remain unpublished and outside the central numbered queue. Reproduction is
-not a claim that every observation violates a documented contract. Check upstream
-duplicates and reconcile scope before preparing reports. No installed toolchain
-or extracted package was patched.
-
-| Candidate | Independent outcome | Disposition and local boundary |
+| Reference | Observed behavior | Adapter boundary |
 | --- | --- | --- |
 | DATA-001 | Scientific masks add a sign and produce incorrect fractional precision. | Retain both observed symptoms; a shared root cause is unproven. ClassicFormatMask avoids the foundation mask path. |
 | DATA-002 | Currency.Parse rejects the exact maximum; minimum parsing and maximum minor-unit construction succeed. | Exact ClassicData decimal accumulation avoids the rejected boundary. |
@@ -21,9 +15,6 @@ or extracted package was patched.
 | CWD-002 | Three documented window members are missing on every semantic target, producing four diagnostics including a follow-on assignment error. | Documentation/compiler surface mismatch; no guessed replacement API is supplied. |
 | LISTBOX-001 | An interface-typed reference cannot target Object through CType/TryCast/IsA, while concrete/base-class targets work. | Object-target RTTI/conversion candidate. The bridge stores a weak Object reference directly and casts to its client interface. |
 
-Repros, original author evidence, references and workaround-removal rules remain
-in the scoped directories:
-
 - Data/formatting
 - Native files
 - Clipboard
@@ -31,11 +22,3 @@ in the scoped directories:
 - Printing
 - Desktop
 - ListBox
-
-Review probes also exercised cleanup, lifetime and negative controls. Temporary
-review workspaces are supporting evidence, not durable release receipts. The
-module notes distinguish foreign semantic checks, cross-linking, emulation and
-native execution. No native Windows/macOS or physical-printer acceptance follows
-from these Linux reproductions.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

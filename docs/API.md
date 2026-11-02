@@ -8,49 +8,19 @@ historical framework.
 
 Use `Import rbclassic` after placing the sealed package and its dependencies
 in the consumer's `packages/` directory. The entry module re-exports the installed compatibility foundation's types and extensions. Legacy global routines are forwarded explicitly, including numeric, encoding, JSON, desktop and scheduling helpers; no second framework import is needed.
-The sealed consumer test is a complete,
-compiler-checked example of combining the adapters.
 
-## Build and verify
+## Build
 
-From the repository root:
+Use the [devtools RBClassic builder](https://github.com/BuoyBay/devtools/blob/main/tools/build_rbclassic.py)
+from the assembled [BuoyBay workspace](https://github.com/BuoyBay/workspace-tools).
+It stages ProcessKit and the installed foundation dependencies, including
+`serialio` for serial I/O and `pdf` for printing. Set `BUOY` for the compiler and
+`BUOY_PACKAGES_DIR` for an alternate installed-package directory.
 
-```sh
-python3 tools/build_rbclassic.py --test
-```
-
-The runner seals fresh sources and dependencies into an isolated directory,
-checks every module and consumer on six targets, runs behavior tests, and only
-then writes `packages/rbclassic-0.1.0.buipkg`. It also runs the Python migration
-diagnostic tests. `--host-only` shortens development checks; `--no-publish`
-leaves the distribution untouched. Neither option establishes foreign native
-runtime compatibility.
-
-The compiler is `BUOY` or `buoy`. Bundled dependency archives come from
-`BUOY_PACKAGES_DIR`, `/usr/share/buoy/packages`, or `/Applications/Buoy/packages`.
-ProcessKit is sealed from the maintained `libraries/processkit` source and its
-existing native payloads; stale native slices are excluded by their build receipts. The
-runner does not modify installed or extracted toolchain dependencies.
-
-Use repeated `--processkit-slice-receipt PATH` arguments to overlay independently
-built ARM64 payloads into the temporary ProcessKit package. Each receipt must
-match current sources and artifact hashes. See [ARM64 staging](../notes/processkit-slices.md)
-for build commands and runtime limits; Linux requires glibc 2.32+, and Windows
-ARM64 execution remains unverified. Serial uses the bundled `serialio` archive;
-Linux verification also runs an independent PTY driver for all 16 baud ordinals.
-The builder compiles the networking helper for its current Linux/macOS host and
-stages that slice inside the temporary RBClassic archive. Other POSIX targets
-require their own builds. Windows networking and TLS are unsupported; see the
-[networking contract](../notes/networking.md).
-The entry also imports the bundled `pdf` package for printing. Linux controls
-and native ListBox tests link the repository's GTK lifecycle guard for BUI-007;
-their GLib warnings remain fatal. This is an explicit test/build workaround,
-not a claim that the installed runtime defect is fixed.
-
-Linux GUI/image tests use the local Docker image `buoy:0.72.0-gui`, Xvfb,
-a private D-Bus session and no container network. Set `BUOY_GUI_IMAGE` or `--gui-image` to change the
-image. Use `--gui-image ''` with the native GUI libraries and Xvfb installed
-to execute those tests on the host. The image is not downloaded by the runner.
+The builder compiles the networking helper for its Linux/macOS host. Other POSIX
+targets require a matching native build; Windows networking and TLS are
+unsupported. See the [networking contract](../notes/networking.md) and
+[ProcessKit target requirements](../notes/processkit-slices.md).
 
 ## Supported areas
 
@@ -101,20 +71,11 @@ not translate projects or prove compatibility. See [migration notes](../notes/mi
 
 ## Platform and compatibility boundaries
 
-Six-target checks cover parsing and semantics for x86_64/arm64 on Linux, macOS
-and Windows. Linux behavior and GUI tests provide runtime evidence. The initial desktop
-implementation additionally passed native Windows and macOS behavior tests;
-three focus-sensitive macOS checks remain pending an unlocked GUI session. Review
-fixes have Linux runtime and six-target compiler checks; the revised desktop code
-and the other modules still need native macOS/Windows regression execution. Shell programs require a
-ProcessKit native payload matching its maintained source; excluded or missing
-foreign slices must be rebuilt on the appropriate platform. Semantic checks
-alone do not establish that shell programs can link on a foreign target.
-
-The tests are authored behavior contracts based on historical references and
-existing examples. They do not constitute a census of historical REALbasic apps.
-The existing 261-project desktop import audit measures structural import and
-source projection, separately from compilation, GUI behavior and API 1 parity.
+Compiler checks cover x86_64/arm64 Linux, macOS and Windows. Most adapter runtime
+coverage is Linux; individual module notes describe narrower native limits.
+Shell programs require a ProcessKit native payload matching its maintained
+source. Build and exercise each intended host: semantic checks alone do not
+establish native linking or behavior.
 
 Unsupported behavior is documented per module and generally omitted or rejected.
 Particularly important limits include foreign native ListBox bridges and
@@ -177,8 +138,7 @@ The [adapter mapping](../resources/buoy-docs/legacy-api-map.md) and
 [foundation mapping](../resources/buoy-docs/foundation-api-map.md) inventory every
 declared public type, member and global in the supported surface. The complete
 [machine-readable map](../notes/legacy-api-map.json) records source modules,
-signatures and direct native-call evidence. Regenerate it with
-`python3 generate_mapping.py` after API changes.
+signatures and direct native calls. Keep the maps consistent with API changes.
 
 Buoy has no general source type-alias declaration. Native names such as
 `Window`, `ListBox`, `Picture`, `Timer`, `Shell` and `SQLiteDatabase` cannot be
@@ -186,4 +146,6 @@ silently replaced with different compatibility behavior. Use the explicit
 `Classic*` types in the source-rewrite table. These are real implementations,
 not placeholders. Unsupported historical areas remain documented as unsupported.
 
-Test suites and fixtures are maintainer-local and are not part of this public repository.
+Builder context: run shared `tools/` commands from the assembled
+[BuoyBay workspace](https://github.com/BuoyBay/workspace-tools). The scripts live
+in [devtools](https://github.com/BuoyBay/devtools), alongside the shared build inputs.
